@@ -1,0 +1,7 @@
+node_modules/
+.npm-cache/
+.scratch/
+dist/
+*.log
+.DS_Store
+tests/browser/out/

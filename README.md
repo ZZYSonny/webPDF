@@ -1,0 +1,289 @@
+# webpdf
+
+Render PDF pages to SVG where **the text is real text** — selectable, searchable,
+hintable, and tiny — instead of thousands of glyph outlines.
+
+```ts
+import { createViewer } from 'webpdf';
+
+const viewer = await createViewer({ container: '#viewer', source: file });
+viewer.setZoom('fit-width');
+```
+
+![the demo, showing a LaTeX paper rendered as SVG with its real fonts](docs/demo.png)
+
+---
+
+## The problem
+
+MuPDF can already emit SVG two ways, and neither is what a document viewer wants:
+
+| mode | output | problem |
+| --- | --- | --- |
+| `text=text` | `<text font-family="…">` with the characters | only correct if the *browser* has that font. It almost never does: PDFs embed subsets, and a browser cannot use a Type 1 (PFB/PFA) font at all. Get it wrong and the page reflows into the wrong typeface. |
+| `text=path` | `<use>` per glyph, referencing outlines in `<defs>` | always correct, but a single page becomes ~400 KB of paths with no selectable text. |
+
+The previous project solved this by bundling a fixed set of fonts and patching
+MuPDF to emit text only for those. That does not generalise: every LaTeX paper
+embeds a different subset, and `/FontFile`-style Type 1 fonts — which pdfTeX
+emits constantly — are not usable as web fonts in the first place.
+
+## The approach
+
+**Render outlines, then upgrade them back to text.** One pass produces a
+guaranteed-correct baseline; a second pass replaces exactly the glyphs we can
+prove we have a font for.
+
+```
+PDF page
+   │
+   │  MuPDF SVG writer, text=path  ───────────►  outline SVG   (always correct)
+   │
+   ├─ <path id="font_1_53" d="M.38 .6C…"/>        outlines, in em units, y-up
+   └─ <use data-text="P" href="#font_1_53"
+           transform="matrix(11.9 0 0 -11.9 124.6 81.9)"/>
+                                                  ↑ MuPDF hands us the character
+   │
+   │  per font: build a web font
+   │    outlines → cubic→quadratic → TrueType → WOFF → @font-face
+   │
+   │  rewrite: <use> runs ─────────────────────►  <text> runs
+   │
+   ▼
+SVG with real text, plus outlines kept for whatever could not be converted
+```
+
+### Why this works
+
+* **No font parsing.** The PDF's embedded font program is never touched. MuPDF
+  (through FreeType) has already resolved every font — embedded CFF, raw Type 1
+  PFB/PFA, TrueType, substituted base-14 faces, CJK — into normalised outlines.
+  Re-emitting those outlines as a `glyf`-free CFF/OpenType font means the
+  browser draws *exactly* the shape MuPDF would have drawn as a path. The
+  verification suite measures this: **100.00% of the reference ink is
+  reproduced**, within a one-pixel neighbourhood.
+* **Type 1 is not a special case.** A PFB is simply a font whose outlines MuPDF
+  read for us. The demo's sample PDF embeds five `/FontFile` Type 1 fonts and
+  converts all of them.
+* **Positioning comes from MuPDF.** MuPDF writes one `x` (and `y`) value per
+  character, so the browser never has to agree with us about advances, kerning
+  or shaping. The transform maths is exact:
+
+  ```
+  <use transform="matrix(a b c d e f)">          outlines are y-up, em units
+  <text transform="matrix(A B C D 0 0)" font-size="K">   text space is y-down
+
+  K = sqrt(|ad − bc|)   A = a/K   B = b/K   C = −c/K   D = −d/K
+  (x, y) = [A C; B D]⁻¹ (e, f)                   per-character baseline origin
+  ```
+
+### Character mapping
+
+Each glyph is reachable under a real Unicode value where MuPDF recorded one
+(`data-text`), so copy, search and screen readers work. Glyphs that have no
+Unicode of their own — ligatures such as `fi`, which is one glyph standing for
+two characters — get a code point from the BMP Private Use Area instead
+(`U+E000…U+F8FF`). Both cases produce a `cmap` entry pointing at the right
+outline, so nothing renders blank.
+
+### Falling back
+
+Anything not provably safe stays an outline, glyph by glyph:
+
+| situation | behaviour |
+| --- | --- |
+| Type 3 font, bitmap-only glyph | `<use>` outline kept (MuPDF emits a `<g>`) |
+| glyph with no outline in `<defs>` | `<use>` outline kept |
+| stroked text (`stroke` attribute) | `<use>` outline kept |
+| right-to-left or complex-shaping scripts | `<use>` outline kept (see limitations) |
+| more than 6400 unicode-less glyphs in one font | the excess stays outlines |
+| `textMode: 'paths'` | the whole page stays outlines |
+
+There is no configuration in which the output is *wrong*; the worst case is the
+older, larger, still-correct representation.
+
+---
+
+## Results
+
+Measured on the bundled samples, page 1:
+
+| document | outline SVG | with real text | glyphs as text | fonts (WOFF) |
+| --- | --- | --- | --- | --- |
+| LaTeX paper, 1 page (6 Type 1/PFB fonts) | 373 KB | 65 KB (**17%**) | 2464 / 2464 | 21 KB |
+| LaTeX paper, 3 pages | 1255 KB | 424 KB (**34%**) | 7626 / 7626 | 51 KB |
+| Manual, 3 pages, non-embedded base-14 | 454 KB | 68 KB (**15%**) | 3045 / 3045 | 27 KB |
+
+Ink coverage of the text render against MuPDF's own outline render: **100.000%**
+(page 1 of the LaTeX sample), 99.5–99.9% across the other pages tested. The
+residue is antialiasing and stem darkening, not missing or misplaced glyphs.
+
+---
+
+## Usage
+
+### A viewer
+
+```ts
+import { createViewer } from 'webpdf';
+
+const viewer = await createViewer({
+  container: document.querySelector('#viewer')!,
+  source: fileOrUrlOrArrayBuffer,
+  zoom: 'fit-width',
+  shadowDom: true,
+  onEvent: (e) => { if (e.type === 'page-change') console.log(e.page); },
+});
+
+viewer.goToPage(12);
+viewer.setZoom(2);
+viewer.destroy();
+```
+
+Only the pages touching the viewport, plus one on each side, are ever in the DOM.
+Everyone else is an absolutely positioned box whose geometry was computed up
+front, so zooming restyles boxes and never re-renders a page.
+
+### Headless rendering
+
+```ts
+import { PdfEngine, renderDocument } from 'webpdf';
+
+// one page at a time, no DOM
+const engine = new PdfEngine();
+await engine.open(bytes);
+const page = await engine.renderPage(0, { embedFonts: true, responsive: false });
+console.log(page.svg, page.stats);
+
+// or stream a whole document to standalone SVG files
+for await (const page of renderDocument(bytes, { embedFonts: true })) {
+  writeFileSync(`page-${page.index}.svg`, page.svg);
+}
+```
+
+`embedFonts: true` puts the `@font-face` rules inside the SVG, which is what
+makes an exported file self-contained — required for `<img src="…svg">`, for a
+downloaded file, or for a CSS background.
+
+### Browser extension notes
+
+The library was written with content scripts in mind:
+
+* **No globals.** The only optional one is a debug flag (`globalThis.__wpdfDebug`)
+  and the `window.webpdf` handle the demo installs for itself.
+* **Shadow DOM** (`shadowDom: true`) keeps a host page's CSS from touching the
+  viewer, and vice versa.
+* **Fonts are registered on the document**, through a *constructed stylesheet*
+  where available. Two reasons: Chromium does not load `@font-face` rules
+  declared inside a shadow root, and a constructed stylesheet is not subject to
+  a page's `style-src` policy.
+* **Sanitised sources.** `File`, `Blob`, `ArrayBuffer`, `Uint8Array`, a URL
+  string or `{ url, headers }` all work.
+* **Nothing is assumed about the DOM.** The viewer mounts into whatever element
+  you give it and cleans up fully in `destroy()`.
+* **Rendering runs in a worker by default**, and falls back to the main thread
+  automatically if a worker cannot be created or does not answer within 15 s -
+  so opting in can never leave you with a viewer that does not render. Pass
+  `worker: false` to force inline rendering. The prebuilt library resolves its
+  worker relative to `dist/webpdf.js`; if you move `assets/` somewhere else (an
+  extension must often vendor it), pass `workerUrl` explicitly.
+* The MuPDF wasm binary is fetched relative to the module URL. If your extension
+  needs to control that (for `web_accessible_resources`), set it explicitly
+  before importing:
+
+  ```ts
+  globalThis.$libmupdf_wasm_Module = {
+    locateFile: (p: string) => chrome.runtime.getURL(`vendor/${p}`),
+  };
+  ```
+
+`PdfEngineLike` is exported, and `WorkerEngine` is the reference implementation
+of it, so a different transport (an extension's offscreen document, a shared
+worker, a remote renderer) only needs `open` / `renderPage` / `drainNewFonts` /
+`close`.
+
+---
+
+## Layout
+
+```
+src/
+  api.ts                    createViewer, renderDocument, public types
+  core/
+    engine.ts               MuPDF document + page rendering (DOM-free)
+    debug.ts                opt-in pipeline tracing
+    svg/
+      glyphs.ts             scanner for MuPDF's SVG (outlines + <use>)
+      text-upgrade.ts       <use> runs → <text> runs
+      package.ts            id namespacing, root rewriting, font embedding
+    font/
+      svg-path.ts           SVG path data parser (M/L/H/V/C/Z + implicit repeats)
+      quadratic.ts          cubic → quadratic conversion
+      build.ts              outlines + cmap → TrueType
+      woff.ts               TrueType → WOFF (zlib via CompressionStream)
+      registry.ts           per-page planning, caching, @font-face rules
+  worker/
+    pdf.worker.ts           engine host; installs onmessage before awaiting wasm
+    client.ts               WorkerEngine: a PdfEngineLike that proxies to it
+  viewer/
+    layout.ts               page geometry + visible-range maths
+    viewer.ts               virtualised scrolling viewer
+demo/                       the demo application
+tests/
+  *.test.ts                 Node tests (real PDFs through the real wasm)
+  browser/                  headless-Chromium verification over CDP
+```
+
+Rendering never touches the DOM, which is why the same `PdfEngine` runs inline,
+inside the worker, and under Node in the tests.
+
+## Development
+
+```sh
+npm install
+npm run dev          # demo on http://127.0.0.1:5173
+npm test             # Node tests: font pipeline over real PDFs
+npm run test:browser # builds the demo, serves it, verifies in headless Chromium
+npm run verify       # typecheck + both test suites
+```
+
+The browser suite is the interesting one. It renders each page twice — once as
+MuPDF outlines, once through the text upgrade — rasterises both, and reports how
+much of the reference ink the text render covers. It needs a Chromium binary;
+set `$CHROMIUM` if it is not at `/usr/bin/chromium`.
+
+`tests/browser/diff.mjs` produces a red/green difference map for human eyes:
+overlapping ink is yellow, so any systematic offset or missing glyph is obvious.
+
+---
+
+## Limitations
+
+* **Complex scripts stay as outlines.** Arabic, Hebrew, Indic and South-East
+  Asian scripts are detected by code point range and left as glyph outlines. The
+  text would otherwise be reordered by the bidi algorithm or reshaped, undoing
+  MuPDF's already-resolved per-glyph positioning. Latin, Greek, Cyrillic, CJK
+  and punctuation are all emitted as text.
+* **Fonts are subset per page.** Each page builds its own subsets, roughly
+  10–25 KB of WOFF per page. Correct and lazy (a page you never open costs
+  nothing), but a document-wide pass would share tables between pages and cut
+  that substantially — the obvious next optimisation.
+* **Fonts are not hinted.** Outlines are re-emitted from MuPDF's, so the
+  original bytecode hints are gone. This is mostly irrelevant for SVG at
+  arbitrary zoom, but it is a real difference from embedding the original font.
+* **Synthetic bold/italic is not reproduced.** When a PDF has no bold face and
+  the producer relies on stroke-based faux bold, outline mode and text mode
+  differ slightly.
+* **WOFF, not WOFF2.** WOFF2 would be roughly a third smaller, but every
+  JS/wasm encoder tried either did not work in the browser or added a
+  multi-megabyte dependency for a few hundred bytes per page.
+* **Per-page text is emitted by span, not by paragraph.** Line breaking is
+  whatever the PDF says; the SVG carries positioned runs, not flowing text.
+* **The worker path is verified in Chromium only.** It relies on module workers
+  and `CompressionStream`, both of which are widely available, but the fallback
+  exists precisely because worker startup can be blocked by a host's CSP.
+
+## Licence
+
+MuPDF.js is AGPL-3.0-or-later, and this project links it, so the same licence
+applies. See [LICENSE](LICENSE).
