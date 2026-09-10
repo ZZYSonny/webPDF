@@ -144,6 +144,46 @@ Only the pages touching the viewport, plus one on each side, are ever in the DOM
 Everyone else is an absolutely positioned box whose geometry was computed up
 front, so zooming restyles boxes and never re-renders a page.
 
+#### Who owns the zoom
+
+Zoom is split by gesture, because the two gestures have completely different
+cost profiles:
+
+* **A touch pinch belongs to the browser.** It changes the page scale, which the
+  compositor applies without any layout or script at all, and Chromium re-rasters
+  the vector content at the new scale, so the pages stay crisp. The viewer never
+  resizes or rescales anything while a pinch is in flight.
+* **Ctrl+= / Ctrl+- / Ctrl+0 walk a ladder of layout zoom settings**
+  (50%, 75%, 100%, fit-width, fit-page by default - configure with `zoomSteps`).
+  These are discrete and not animated, so one re-layout per press is fine, and
+  they deliberately *override* the browser's own zoom shortcuts: browser zoom
+  scales the whole app, chrome included, and would put the layout scale out of
+  step with what is on screen.
+* **Ctrl+wheel is left to the browser** (a trackpad pinch on desktop) and does no
+  layout work here.
+
+Two consequences of letting the browser own the pinch:
+
+* The **host element must be in the flow of the root scroller**. Panning while
+  zoomed only chains into the root scroller - a nested `overflow:auto` ancestor
+  traps the zoomed page inside one layout viewport. The document, not the viewer,
+  is the scroller.
+* Everything in the document is magnified together, so **chrome next to the
+  pages is magnified too** and can pan out of view. `zoom-change` carries
+  `zoomed` so a host can hide its chrome; the demo fades it with an opacity
+  toggle (no layout involved).
+
+Measured in this repository's Chromium (1440x900, three real LaTeX pages, one
+page rendered either side of the viewport):
+
+| gesture | layout | layout ms | frames p50/p95 |
+|---|---|---|---|
+| touch pinch, page scale 1 -> 10 | 8 trivial | **0.0** | 16.7 / 16.7 |
+| pinch + chained pan + virtualisation | 29 | 10 | 16.7 / 16.7 |
+| browser zoom (device pixel ratio 1 -> 1.5) | 0 | **0.0** | - |
+| Ctrl+= (one ladder step, re-layout) | 3 | 30-90 | - |
+| the previous design: JS resize of every page box per zoom step | 1/step | **~17.5/step** | 16.7 / 16.8 |
+
 ### Headless rendering
 
 ```ts
@@ -172,7 +212,13 @@ The library was written with content scripts in mind:
 * **No globals.** The only optional one is a debug flag (`globalThis.__wpdfDebug`)
   and the `window.webpdf` handle the demo installs for itself.
 * **Shadow DOM** (`shadowDom: true`) keeps a host page's CSS from touching the
-  viewer, and vice versa.
+  viewer, and vice versa. The pages themselves are ordinary blocks in the host
+  document (there is no content iframe: a frame cannot own the pinch, and a
+  frame's own scroller would not receive a zoomed pan), so the shadow root is
+  what keeps host CSS away from them.
+* **Give it the root scroller.** The viewer sets the container's height to the
+  full layout height and expects the document to scroll; do not put it inside an
+  `overflow:auto` wrapper, or a zoomed page cannot be panned past one viewport.
 * **Fonts are registered on the document**, through a *constructed stylesheet*
   where available. Two reasons: Chromium does not load `@font-face` rules
   declared inside a shadow root, and a constructed stylesheet is not subject to
@@ -227,7 +273,7 @@ src/
     client.ts               WorkerEngine: a PdfEngineLike that proxies to it
   viewer/
     layout.ts               page geometry + visible-range maths
-    viewer.ts               virtualised scrolling viewer
+    viewer.ts               virtualised scrolling viewer (browser-owned pinch)
 demo/                       the demo application
 tests/
   *.test.ts                 Node tests (real PDFs through the real wasm)

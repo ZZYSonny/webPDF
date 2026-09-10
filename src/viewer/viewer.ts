@@ -1,10 +1,32 @@
 /**
  * A virtualised, continuously scrolling PDF viewer.
  *
- * Only the pages touching the viewport plus a small neighbourhood are ever in
- * the DOM; everything else is represented by an absolutely positioned box whose
- * geometry was computed up front. Because the renderer emits resolution
- * independent SVG, zooming never re-renders a page - it only restyles boxes.
+ * Zoom comes in two flavours, and they do not fight each other:
+ *
+ *  - A touch pinch is left entirely to the browser. It is a compositor-only
+ *    page-scale change owned by the top-level document (measured: zero layout,
+ *    zero script, and the browser re-rasters the vector content so it stays
+ *    crisp), and panning while zoomed chains into the root scroller - which is
+ *    also what keeps the virtualisation window correct.
+ *  - Ctrl +/- and Ctrl+0 are *overridden* to walk a ladder of layout zoom
+ *    settings (50%, 75%, 100%, fit-width, fit-page by default) instead of the
+ *    browser's own zoom. A key press is discrete and not animated, so paying one
+ *    re-layout for it is fine - and it keeps the document geometry, the page
+ *    boxes and the zoom indicator consistent, which browser zoom does not.
+ *
+ * Nothing here resizes or rescales anything while a pinch is in flight, and a
+ * pinch never triggers layout at all. Browser zoom (a trackpad pinch on desktop)
+ * also deliberately does *not* re-fit: the pages are laid out in CSS pixels, so
+ * they keep their size and the browser re-rasters them crisply.
+ *
+ * Two consequences worth knowing:
+ *
+ *  - The host element must be in the flow of the *root* scroller. A nested
+ *    `overflow:auto` ancestor traps a zoomed page inside one layout viewport,
+ *    because the browser only chains a zoomed pan into the root scroller.
+ *  - Because the browser scales the whole document, chrome drawn next to the
+ *    pages is magnified too (and can pan out of view). Hosts that want fixed
+ *    chrome should hide it while `zoomed` is true on `zoom-change` events.
  */
 
 import type { DocumentInfo, PdfEngineLike, PdfSource, RenderOptions } from '../core/engine.ts';
@@ -21,7 +43,16 @@ import {
 export type ViewerEvent =
   | { type: 'document-loaded'; info: DocumentInfo }
   | { type: 'page-change'; page: number; pageCount: number }
-  | { type: 'zoom-change'; scale: number; mode: ZoomMode }
+  | {
+      type: 'zoom-change';
+      /** Effective zoom: the layout scale multiplied by the browser's page scale. */
+      scale: number;
+      mode: ZoomMode;
+      /** The browser's own pinch/zoom factor, 1 when the page is not magnified. */
+      pageScale: number;
+      /** True while the browser is magnifying the page. */
+      zoomed: boolean;
+    }
   | { type: 'render'; page: number; ms: number; asText: number; asOutlines: number }
   | { type: 'error'; error: unknown; page?: number }
   | { type: 'drop-accepted'; name: string };
@@ -30,6 +61,12 @@ export interface PdfViewerOptions {
   container: HTMLElement;
   engine: PdfEngineLike;
   zoom?: number | 'fit-width' | 'fit-page';
+  /**
+   * The ladder Ctrl+= / Ctrl+- (and `zoomIn` / `zoomOut`) walk. Defaults to the
+   * usual viewer presets; hosts with their own zoom UI can pass the same list
+   * they render.
+   */
+  zoomSteps?: readonly (number | 'fit-width' | 'fit-page')[];
   gap?: number;
   padding?: number;
   columns?: 1 | 2;
@@ -65,11 +102,22 @@ interface QueueEntry {
 
 const DEFAULT_KEEP = 1;
 
+/** Zoom presets, low to high: Ctrl+= and Ctrl+- walk this list. */
+const DEFAULT_ZOOM_STEPS: readonly (number | 'fit-width' | 'fit-page')[] = [
+  0.5,
+  0.75,
+  1,
+  'fit-width',
+  'fit-page',
+];
+
 export class PdfViewer {
   private readonly opt: Required<Omit<PdfViewerOptions, 'onEvent'>> & { onEvent?: (e: ViewerEvent) => void };
   private readonly engine: PdfEngineLike;
+  /** The host element; its height is set to the full layout height. */
+  private readonly host: HTMLElement;
   private readonly root: HTMLElement;
-  private readonly scroller: HTMLDivElement;
+  private readonly surface: HTMLDivElement;
   private readonly pagesEl: HTMLDivElement;
   /**
    * Font faces are registered on the *document*, never inside the shadow root:
@@ -86,13 +134,21 @@ export class PdfViewer {
   private info: DocumentInfo | null = null;
   private geometry: PageGeometry[] = [];
   private layout: PageLayout;
-  private zoomMode: ZoomMode = 'custom';
+  /** Zoom baked into the layout, in CSS pixels per page unit. */
   private scale = 1;
+  /** The browser's page scale (a touch pinch), which this class never sets. */
+  private pageScale = 1;
+  private zoomMode: ZoomMode = 'custom';
+  /** What Ctrl+0 goes back to. */
+  private readonly homeZoom: number | 'fit-width' | 'fit-page';
   private seq = 0;
-  private frame = 0;
+  private frameRequest = 0;
+  private zoomFrame = 0;
   private destroyed = false;
   private currentPage = 1;
   private resizeObserver: ResizeObserver | null = null;
+  private lastWidth = 0;
+  private lastDpr = 1;
 
   private constructor(opts: PdfViewerOptions) {
     this.engine = opts.engine;
@@ -100,6 +156,7 @@ export class PdfViewer {
       container: opts.container,
       engine: opts.engine,
       zoom: opts.zoom ?? 'fit-width',
+      zoomSteps: opts.zoomSteps ?? DEFAULT_ZOOM_STEPS,
       gap: opts.gap ?? 14,
       padding: opts.padding ?? 16,
       columns: opts.columns ?? 1,
@@ -112,6 +169,7 @@ export class PdfViewer {
     };
 
     const host = opts.container;
+    this.host = host;
     host.classList.add('wpdf-host');
     if (this.opt.className) host.classList.add(this.opt.className);
 
@@ -121,56 +179,54 @@ export class PdfViewer {
       const existing = host.shadowRoot;
       const shadow = existing ?? host.attachShadow({ mode: 'open' });
       shadow.innerHTML = '';
-      const style = document.createElement('style');
-      style.textContent = VIEWER_CSS;
-      shadow.appendChild(style);
-      const surface = document.createElement('div');
-      surface.className = 'wpdf-surface';
-      shadow.appendChild(surface);
-      mount = surface;
-    } else {
-      const style = document.createElement('style');
-      style.textContent = VIEWER_CSS;
-      host.appendChild(style);
+      mount = shadow as unknown as HTMLElement;
     }
+    const style = document.createElement('style');
+    style.textContent = VIEWER_CSS;
+    mount.appendChild(style);
+
+    this.root = mount;
+    this.surface = document.createElement('div');
+    this.surface.className = 'wpdf-surface';
+    this.pagesEl = document.createElement('div');
+    this.pagesEl.className = 'wpdf-pages';
+    this.surface.appendChild(this.pagesEl);
+    this.root.appendChild(this.surface);
 
     // Prefer a constructed stylesheet: it is not affected by a host page's
     // `style-src` policy, which matters inside browser extensions.
     const constructed =
-      typeof CSSStyleSheet !== 'undefined' && 'adoptedStyleSheets' in doc && 'replaceSync' in CSSStyleSheet.prototype
-        ? new CSSStyleSheet()
-        : null;
+      typeof CSSStyleSheet !== 'undefined' && 'adoptedStyleSheets' in doc && 'replaceSync' in CSSStyleSheet.prototype;
     if (constructed) {
-      this.fontSheet = constructed;
+      const sheet = new CSSStyleSheet();
+      doc.adoptedStyleSheets = [...doc.adoptedStyleSheets, sheet];
+      this.fontSheet = sheet;
       this.fontStyleEl = null;
-      doc.adoptedStyleSheets = [...doc.adoptedStyleSheets, constructed];
     } else {
-      this.fontSheet = null;
       const el = doc.createElement('style');
       el.dataset.wpdf = 'fonts';
       doc.head?.appendChild(el);
       this.fontStyleEl = el;
+      this.fontSheet = null;
     }
 
-    this.root = mount;
-    this.scroller = document.createElement('div');
-    this.scroller.className = 'wpdf-scroller';
-    this.scroller.tabIndex = 0;
-    this.pagesEl = document.createElement('div');
-    this.pagesEl.className = 'wpdf-pages';
-    this.scroller.appendChild(this.pagesEl);
-    this.root.appendChild(this.scroller);
-
+    this.homeZoom = this.opt.zoom;
     this.layout = new PageLayout([], {});
-    this.scroller.addEventListener('scroll', this.onScroll, { passive: true });
-    this.scroller.addEventListener('keydown', this.onKeyDown);
-    this.scroller.addEventListener('wheel', this.onWheel, { passive: false });
+    host.style.height = '0px';
+
+    // Capture phase, so a scroll inside any ancestor scroller is seen too.
+    document.addEventListener('scroll', this.onScroll, { capture: true, passive: true });
+    window.addEventListener('resize', this.onResize);
+    window.visualViewport?.addEventListener('resize', this.onPageScale);
+    window.visualViewport?.addEventListener('scroll', this.onPageScale);
+    document.addEventListener('keydown', this.onKeyDown);
     if (this.opt.acceptDrop) this.installDropTarget();
 
     if (typeof ResizeObserver !== 'undefined') {
-      this.resizeObserver = new ResizeObserver(() => this.onResize());
-      this.resizeObserver.observe(this.scroller);
+      this.resizeObserver = new ResizeObserver(() => this.onContainerResize());
+      this.resizeObserver.observe(host);
     }
+    this.lastDpr = window.devicePixelRatio || 1;
   }
 
   static create(opts: PdfViewerOptions): PdfViewer {
@@ -195,10 +251,10 @@ export class PdfViewer {
     this.clearSlots();
     this.scale = this.resolveScale();
     this.rebuildLayout();
-    this.scroller.scrollTop = 0;
+    this.scrollToOffset(0);
     this.currentPage = 1;
     this.emit({ type: 'document-loaded', info });
-    this.emit({ type: 'zoom-change', scale: this.scale, mode: this.zoomMode });
+    this.emitZoom();
     this.update();
   }
 
@@ -210,8 +266,19 @@ export class PdfViewer {
     return this.info?.pageCount ?? 0;
   }
 
+  /** Zoom baked into the layout. The browser's pinch multiplies this. */
   get zoom(): number {
     return this.scale;
+  }
+
+  /** The browser's page scale, or 1 when the page is not magnified. */
+  get pageScaleFactor(): number {
+    return this.pageScale;
+  }
+
+  /** What the user actually sees: layout scale times the browser's page scale. */
+  get effectiveZoom(): number {
+    return this.scale * this.pageScale;
   }
 
   /** Whether rendering happens off the main thread. */
@@ -221,10 +288,15 @@ export class PdfViewer {
 
   /* ---------------------------------------------------------------- zoom */
 
+  /**
+   * Set the layout scale. This re-lays-out the pages, so it is deliberately not
+   * wired to wheel or pinch gestures: pinch belongs to the browser, and a wheel
+   * handler would fight it. Use it for explicit zoom controls.
+   */
   setZoom(value: number | 'fit-width' | 'fit-page'): void {
     const anchorPage = Math.max(0, this.currentPage - 1);
     const before = this.layout.offsetOf(anchorPage);
-    const delta = this.scroller.scrollTop - before;
+    const delta = this.scrollOffset() - before;
 
     if (typeof value === 'number') {
       this.zoomMode = 'custom';
@@ -234,17 +306,52 @@ export class PdfViewer {
       this.scale = this.resolveScale();
     }
     this.rebuildLayout();
-    this.scroller.scrollTop = this.layout.offsetOf(anchorPage) + delta;
-    this.emit({ type: 'zoom-change', scale: this.scale, mode: this.zoomMode });
+    this.scrollToOffset(this.layout.offsetOf(anchorPage) + delta);
+    this.emitZoom();
     this.update();
   }
 
-  zoomIn(step = 1.2): void {
-    this.setZoom(this.scale * step);
+  /** One rung up the zoom ladder. Pass a factor for a multiplicative zoom. */
+  zoomIn(step?: number): void {
+    if (step === undefined) this.stepZoom(1);
+    else this.setZoom(this.scale * step);
   }
 
-  zoomOut(step = 1.2): void {
-    this.setZoom(this.scale / step);
+  /** One rung down the zoom ladder. Pass a factor for a multiplicative zoom. */
+  zoomOut(step?: number): void {
+    if (step === undefined) this.stepZoom(-1);
+    else this.setZoom(this.scale / step);
+  }
+
+  /**
+   * Move one rung up or down the zoom ladder, starting from whichever rung is
+   * closest to the current layout scale. This is what Ctrl+= / Ctrl+- and the
+   * toolbar buttons use.
+   */
+  stepZoom(direction: 1 | -1): void {
+    // Resolve and sort by what each rung means *right now*: fit-page is usually
+    // smaller than fit-width, and both move with the window, so the ladder
+    // cannot be ordered statically.
+    const rungs = this.opt.zoomSteps
+      .map((step) => ({ step, scale: this.scaleForMode(step) }))
+      .sort((a, b) => a.scale - b.scale)
+      .filter((rung, i, all) => i === 0 || rung.scale - all[i - 1].scale > 1e-3);
+    if (rungs.length === 0) return;
+    let nearest = 0;
+    for (let i = 1; i < rungs.length; i++) {
+      if (Math.abs(rungs[i].scale - this.scale) < Math.abs(rungs[nearest].scale - this.scale)) nearest = i;
+    }
+    // Already on a rung? Move off it; otherwise snap onto the closest one first.
+    const onRung = Math.abs(rungs[nearest].scale - this.scale) < 1e-3;
+    const index = onRung ? nearest + direction : nearest;
+    this.setZoom(rungs[Math.min(rungs.length - 1, Math.max(0, index))].step);
+  }
+
+  /** What a fit mode would resolve to right now, without applying it. */
+  private scaleForMode(mode: number | 'fit-width' | 'fit-page'): number {
+    if (typeof mode === 'number') return mode;
+    if (!this.info || this.geometry.length === 0) return 1;
+    return computeFitScale(this.geometry, this.host.clientWidth, window.innerHeight, this.layoutOptions(), mode);
   }
 
   private resolveScale(): number {
@@ -254,7 +361,7 @@ export class PdfViewer {
     if (mode === 'custom' || mode === undefined) {
       return typeof this.opt.zoom === 'number' ? this.opt.zoom : 1;
     }
-    return computeFitScale(this.geometry, this.scroller.clientWidth, this.scroller.clientHeight, this.layoutOptions(), mode);
+    return computeFitScale(this.geometry, this.host.clientWidth, window.innerHeight, this.layoutOptions(), mode);
   }
 
   private layoutOptions(): LayoutOptions {
@@ -268,15 +375,18 @@ export class PdfViewer {
 
   private rebuildLayout(): void {
     this.layout = new PageLayout(this.geometry, this.layoutOptions());
-    this.pagesEl.style.height = `${this.layout.height}px`;
+    // The host element carries the full document height: it is what gives the
+    // surrounding scroller - normally the document itself - its scrollbar.
+    this.host.style.height = `${this.layout.height}px`;
     this.pagesEl.style.width = `${this.layout.width}px`;
+    this.pagesEl.style.height = `${this.layout.height}px`;
   }
 
   /* ----------------------------------------------------------- navigation */
 
   goToPage(page: number): void {
     const index = Math.max(0, Math.min((this.info?.pageCount ?? 1) - 1, Math.round(page) - 1));
-    this.scroller.scrollTop = this.layout.offsetOf(index);
+    this.scrollToOffset(this.layout.offsetOf(index));
     this.update();
   }
 
@@ -303,6 +413,18 @@ export class PdfViewer {
       className: 'wpdf-page-svg',
     });
     return rendered.svg;
+  }
+
+  /* ------------------------------------------------------- scroll mapping */
+
+  /** Offset of the viewport's top edge within the laid-out pages. */
+  private scrollOffset(): number {
+    return -this.host.getBoundingClientRect().top;
+  }
+
+  private scrollToOffset(offset: number): void {
+    const top = this.host.getBoundingClientRect().top + window.scrollY + offset;
+    window.scrollTo({ top: Math.max(0, top), behavior: 'auto' });
   }
 
   /* ------------------------------------------------------------- internals */
@@ -347,23 +469,55 @@ export class PdfViewer {
   }
 
   private onScroll = (): void => {
-    if (this.frame) return;
-    this.frame = requestAnimationFrame(() => {
-      this.frame = 0;
+    if (this.frameRequest) return;
+    this.frameRequest = requestAnimationFrame(() => {
+      this.frameRequest = 0;
       this.tick();
     });
   };
 
+  /** The browser magnified (or un-magnified) the page. Cheap: no layout here. */
+  private onPageScale = (): void => {
+    if (this.zoomFrame) return;
+    this.zoomFrame = requestAnimationFrame(() => {
+      this.zoomFrame = 0;
+      const next = window.visualViewport?.scale ?? 1;
+      if (Math.abs(next - this.pageScale) < 1e-4) return;
+      this.pageScale = next;
+      this.emitZoom();
+    });
+  };
+
   private onResize(): void {
-    if (this.zoomMode === 'fit-width' || this.zoomMode === 'fit-page') {
-      const next = this.resolveScale();
-      if (Math.abs(next - this.scale) > 1e-4) {
-        this.scale = next;
-        this.rebuildLayout();
-        this.emit({ type: 'zoom-change', scale: this.scale, mode: this.zoomMode });
-      }
+    // Only the virtualisation window depends on the viewport here; the layout
+    // scale is the container's business (see onContainerResize).
+    this.update();
+  }
+
+  /** Re-derive the layout scale from the container width, if the mode wants it. */
+  private refit(): void {
+    if (this.zoomMode !== 'fit-width' && this.zoomMode !== 'fit-page') return;
+    const next = this.resolveScale();
+    if (Math.abs(next - this.scale) > 1e-4) {
+      this.scale = next;
+      this.rebuildLayout();
+      this.emitZoom();
     }
-    this.tick();
+  }
+
+  private onContainerResize(): void {
+    const dpr = window.devicePixelRatio || 1;
+    const width = this.host.clientWidth;
+    const dprChanged = Math.abs(dpr - this.lastDpr) > 1e-6;
+    if (width === this.lastWidth && !dprChanged) return;
+    this.lastDpr = dpr;
+    this.lastWidth = width;
+    // Browser zoom changes the CSS pixel width *and* the device pixel ratio. The
+    // pages are laid out in CSS pixels and the browser re-rasters them, so
+    // re-fitting here would undo the user's zoom and re-lay-out on every step of
+    // it. A genuine host resize changes the width with the ratio untouched.
+    if (!dprChanged && (this.zoomMode === 'fit-width' || this.zoomMode === 'fit-page')) this.refit();
+    this.update();
   }
 
   /** Synchronous entry point: recompute the window and refresh the DOM. */
@@ -373,9 +527,9 @@ export class PdfViewer {
 
   private tick(): void {
     if (this.destroyed || !this.info) return;
-    const scrollTop = this.scroller.scrollTop;
-    const viewportHeight = this.scroller.clientHeight || 1;
-    const visible = this.layout.visibleRange(scrollTop, viewportHeight, 0);
+    const offset = this.scrollOffset();
+    const viewportHeight = window.innerHeight || 1;
+    const visible = this.layout.visibleRange(offset, viewportHeight, 0);
     const keep = this.opt.keepPages;
 
     const wanted = new Map<number, number>(); // index -> priority
@@ -401,7 +555,7 @@ export class PdfViewer {
 
     this.engine.trimCaches?.([...wanted.keys()]);
 
-    const page = this.layout.currentPage(scrollTop, viewportHeight) + 1;
+    const page = this.layout.currentPage(offset, viewportHeight) + 1;
     if (page !== this.currentPage) {
       this.currentPage = page;
       this.emit({ type: 'page-change', page, pageCount: this.geometry.length });
@@ -502,28 +656,31 @@ export class PdfViewer {
 
   /* ------------------------------------------------------------- gestures */
 
-  private onWheel = (event: WheelEvent): void => {
-    if (!event.ctrlKey && !event.metaKey) return;
-    event.preventDefault();
-    const factor = Math.exp(-event.deltaY / 320);
-    this.setZoom(this.scale * factor);
-  };
-
   private onKeyDown = (event: KeyboardEvent): void => {
-    const height = this.scroller.clientHeight;
+    const mod = event.ctrlKey || event.metaKey;
+    if (mod && !event.altKey) {
+      // Take the browser's zoom shortcuts over: they would scale the whole app,
+      // chrome included, and would leave the layout scale out of step with it.
+      switch (event.key) {
+        case '+':
+        case '=':
+          this.stepZoom(1);
+          break;
+        case '-':
+        case '_':
+          this.stepZoom(-1);
+          break;
+        case '0':
+          this.setZoom(this.homeZoom);
+          break;
+        default:
+          return;
+      }
+      event.preventDefault();
+      return;
+    }
+    if (mod || event.altKey) return;
     switch (event.key) {
-      case 'PageDown':
-        this.scroller.scrollTop += height * 0.9;
-        break;
-      case 'PageUp':
-        this.scroller.scrollTop -= height * 0.9;
-        break;
-      case 'ArrowDown':
-        this.scroller.scrollTop += 60;
-        break;
-      case 'ArrowUp':
-        this.scroller.scrollTop -= 60;
-        break;
       case 'Home':
         this.goToPage(1);
         break;
@@ -538,6 +695,7 @@ export class PdfViewer {
         this.zoomOut();
         break;
       default:
+        // Arrows, space and PageUp/PageDown scroll the document natively.
         return;
     }
     event.preventDefault();
@@ -568,18 +726,36 @@ export class PdfViewer {
     });
   }
 
+  private emitZoom(): void {
+    this.emit({
+      type: 'zoom-change',
+      scale: this.effectiveZoom,
+      mode: this.zoomMode,
+      pageScale: this.pageScale,
+      zoomed: this.pageScale > 1.001,
+    });
+  }
+
   private emit(event: ViewerEvent): void {
     this.opt.onEvent?.(event);
   }
 
   destroy(): void {
     this.destroyed = true;
-    if (this.frame) cancelAnimationFrame(this.frame);
-    this.frame = 0;
+    if (this.frameRequest) cancelAnimationFrame(this.frameRequest);
+    if (this.zoomFrame) cancelAnimationFrame(this.zoomFrame);
+    this.frameRequest = 0;
+    this.zoomFrame = 0;
     this.resizeObserver?.disconnect();
     this.resizeObserver = null;
+    document.removeEventListener('scroll', this.onScroll, { capture: true });
+    window.removeEventListener('resize', this.onResize);
+    window.visualViewport?.removeEventListener('resize', this.onPageScale);
+    window.visualViewport?.removeEventListener('scroll', this.onPageScale);
+    document.removeEventListener('keydown', this.onKeyDown);
     this.clearSlots();
-    this.scroller.remove();
+    this.surface.remove();
+    this.host.style.height = '';
     this.fontStyleEl?.remove();
     if (this.fontSheet) {
       const doc = this.opt.container.ownerDocument;
@@ -590,8 +766,7 @@ export class PdfViewer {
 }
 
 const VIEWER_CSS = `
-.wpdf-surface,.wpdf-scroller{width:100%;height:100%}
-.wpdf-scroller{overflow:auto;position:relative;outline:none;background:var(--wpdf-bg,#f3f4f6)}
+.wpdf-surface{position:relative;width:100%;height:100%;background:var(--wpdf-bg,#f3f4f6)}
 .wpdf-pages{position:relative;margin:0 auto}
 .wpdf-page{position:absolute;background:#fff;box-shadow:0 1px 3px rgba(0,0,0,.22);overflow:hidden;contain:strict}
 .wpdf-page-svg{display:block;width:100%;height:100%}

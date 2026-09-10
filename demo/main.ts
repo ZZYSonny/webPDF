@@ -81,8 +81,14 @@ function onViewerEvent(event: ViewerEvent): void {
       highlightOutline(event.page);
       break;
     case 'zoom-change':
+      // `scale` is the effective zoom: what the layout was built at, times the
+      // browser's own page scale. The select reflects the layout part only,
+      // because the page scale is the browser's and cannot be set from script.
       els.zoomLabel.textContent = `${Math.round(event.scale * 100)}%`;
       els.zoomMode.value = event.mode === 'custom' ? nearestZoomOption(event.scale) : event.mode;
+      // Chrome and content are magnified together by the browser's pinch, so the
+      // chrome is faded out instead of pretending it stays put.
+      document.body.classList.toggle('wpdf-zoomed', event.zoomed);
       break;
     case 'render':
       els.stats.textContent =
@@ -278,6 +284,20 @@ window.addEventListener('keydown', (event) => {
     els.file.click();
   }
 });
+
+/**
+ * The sticky chrome offsets need to know how tall the topbar actually is (it
+ * wraps on narrow windows). Kept in CSS pixels and updated on resize only.
+ */
+const topbar = document.querySelector<HTMLElement>('.topbar');
+if (topbar) {
+  const measure = (): void => {
+    document.documentElement.style.setProperty('--topbar-h', `${topbar.offsetHeight}px`);
+  };
+  measure();
+  if (typeof ResizeObserver !== 'undefined') new ResizeObserver(measure).observe(topbar);
+  else window.addEventListener('resize', measure);
+}
 
 // A debug handle is genuinely useful when embedding (and when driving the demo
 // from an automated test); there is no other global state in the library.

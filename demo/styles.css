@@ -21,19 +21,25 @@
   display: none !important;
 }
 
-html,
-body {
-  height: 100%;
+html {
   margin: 0;
 }
 
+/**
+ * The *document* is the scroller. Browser pinch-zoom pans by moving the visual
+ * viewport and only chains into the root scroller, so a nested overflow
+ * container would trap a zoomed page inside one viewport. The viewer's host is
+ * therefore an ordinary full-height block, and the chrome around it is sticky:
+ * it takes part in the same scroll, which is why it is faded while zoomed.
+ */
 body {
+  margin: 0;
+  min-height: 100vh;
   display: flex;
   flex-direction: column;
   background: var(--bg);
   color: var(--text);
   font: 13px/1.45 -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
-  overflow: hidden;
 }
 
 .mono {
@@ -52,6 +58,9 @@ body {
 /* ---------------------------------------------------------------- topbar */
 
 .topbar {
+  position: sticky;
+  top: 0;
+  z-index: 10;
   display: flex;
   align-items: center;
   gap: 14px;
@@ -172,7 +181,9 @@ select.btn {
   flex-direction: column;
   background: var(--bg-elevated);
   border-right: 1px solid var(--border);
-  min-height: 0;
+  position: sticky;
+  top: var(--topbar-h, 44px);
+  max-height: calc(100vh - var(--topbar-h, 44px));
 }
 
 .toc-head {
@@ -231,12 +242,14 @@ select.btn {
   position: relative;
   flex: 1;
   min-width: 0;
+  min-height: calc(100vh - var(--topbar-h, 44px) - 27px);
   background: var(--stage);
 }
 
+/* the viewer host: height is managed by PdfViewer (it is the scroll content) */
 .viewer {
-  position: absolute;
-  inset: 0;
+  position: relative;
+  width: 100%;
 }
 
 .empty {
@@ -301,6 +314,9 @@ select.btn {
 /* ------------------------------------------------------------- statusbar */
 
 .statusbar {
+  position: sticky;
+  bottom: 0;
+  z-index: 10;
   display: flex;
   align-items: center;
   gap: 12px;
@@ -315,4 +331,22 @@ select.btn {
 
 .viewer {
   --wpdf-bg: var(--stage);
+}
+
+/* --------------------------------------------------- chrome while zoomed */
+
+/**
+ * The browser's pinch magnifies the whole document, chrome included, and the
+ * visual viewport can pan chrome out of view. Fading it keeps the zoomed view
+ * clean; only opacity changes, so nothing re-lays-out during a gesture.
+ */
+.topbar,
+.statusbar {
+  transition: opacity 140ms ease-out;
+}
+
+body.wpdf-zoomed .topbar,
+body.wpdf-zoomed .statusbar {
+  opacity: 0;
+  pointer-events: none;
 }
