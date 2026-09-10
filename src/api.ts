@@ -20,7 +20,7 @@ import {
   type RenderedPage,
   type EngineOptions,
 } from './core/engine.ts';
-import { PdfViewer, type PdfViewerOptions, type ViewerEvent } from './viewer/viewer.ts';
+import { DEFAULT_ZOOM_STEPS, PdfViewer, type PdfViewerOptions, type ViewerEvent } from './viewer/viewer.ts';
 import { createWorkerEngine } from './worker/client.ts';
 
 export interface CreateViewerOptions extends Omit<PdfViewerOptions, 'container' | 'engine'> {
@@ -107,7 +107,7 @@ export async function* renderDocument(
 }
 
 export type { DocumentInfo, PdfSource, RenderedPage, ViewerEvent };
-export { PdfEngine, PdfViewer };
+export { PdfEngine, PdfViewer, DEFAULT_ZOOM_STEPS };
 export { WorkerEngine, createWorkerEngine } from './worker/client.ts';
 export { DocumentNotOpenError, PasswordRequiredError } from './core/engine.ts';
 export type { PdfEngineLike, RenderOptions, RenderStats, OutlineNode, PageGeometry, TextMode } from './core/engine.ts';
@@ -118,3 +118,4 @@ export { buildFontFromOutlines } from './core/font/build.ts';
 export { upgradeGlyphsToText } from './core/svg/text-upgrade.ts';
 export { scanGlyphOutlines, scanGlyphPlacements } from './core/svg/glyphs.ts';
 export { PageLayout, computeFitScale } from './viewer/layout.ts';
+export type { ZoomMode } from './viewer/layout.ts';

@@ -10,7 +10,7 @@ const viewer = await createViewer({ container: '#viewer', source: file });
 viewer.setZoom('fit-width');
 ```
 
-![the demo, showing a LaTeX paper rendered as SVG with its real fonts](docs/demo.png)
+![the demo: a LaTeX paper rendered as SVG with its real fonts, its outline floating on the left, and a search hit highlighted](docs/demo.png)
 
 ---
 
@@ -154,11 +154,15 @@ cost profiles:
   the vector content at the new scale, so the pages stay crisp. The viewer never
   resizes or rescales anything while a pinch is in flight.
 * **Ctrl+= / Ctrl+- / Ctrl+0 walk a ladder of layout zoom settings**
-  (50%, 75%, 100%, fit-width, fit-page by default - configure with `zoomSteps`).
-  These are discrete and not animated, so one re-layout per press is fine, and
-  they deliberately *override* the browser's own zoom shortcuts: browser zoom
-  scales the whole app, chrome included, and would put the layout scale out of
-  step with what is on screen.
+  (25%, 50%, 75%, 100%, 125%, 150%, 200%, 300%, 400%, fit-width, fit-page by
+  default - pass `zoomSteps`, or import `DEFAULT_ZOOM_STEPS` to render the same
+  list in a control of your own). The rungs are sorted by what they resolve to at
+  the moment the key is pressed, because the fit modes move with the window:
+  stepping up from "fit width (229%)" goes to the next *larger* level, not to a
+  fixed one. These are discrete and not animated, so one re-layout per press is
+  fine, and they deliberately *override* the browser's own zoom shortcuts:
+  browser zoom scales the whole app, chrome included, and would put the layout
+  scale out of step with what is on screen.
 * **Ctrl+wheel is left to the browser** (a trackpad pinch on desktop) and does no
   layout work here.
 
@@ -173,6 +177,11 @@ Two consequences of letting the browser own the pinch:
   `zoomed` so a host can hide its chrome; the demo fades it with an opacity
   toggle (no layout involved).
 
+The same event carries `layoutScale`, `mode` and `pageScale`, so a zoom control
+can show the level the *layout* is at without re-deriving it from the effective
+zoom - the browser's page scale is not a layout zoom and is not settable from
+script.
+
 Measured in this repository's Chromium (1440x900, three real LaTeX pages, one
 page rendered either side of the viewport):
 
@@ -183,6 +192,38 @@ page rendered either side of the viewport):
 | browser zoom (device pixel ratio 1 -> 1.5) | 0 | **0.0** | - |
 | Ctrl+= (one ladder step, re-layout) | 3 | 30-90 | - |
 | the previous design: JS resize of every page box per zoom step | 1/step | **~17.5/step** | 16.7 / 16.8 |
+
+### The demo app
+
+`npm run dev` serves the demo, which is this library plus a toolbar. The toolbar
+is deliberately thin, because everything about the pages' zoom belongs to the
+viewer:
+
+* **One bar, no status bar.** Messages float in a toast instead, so the pages own
+  every pixel below the bar and there is no chrome pretending to stay put while
+  the browser magnifies the document.
+* **The zoom box holds a bare number.** `%` is the control's unit and nobody types
+  it; the levels - including the fit modes, listed as the percentage they resolve
+  to (`229% (fit width)`) - live in the dropdown, and `+`/`-` and Ctrl +/- step
+  that same ladder with the box left free for typing `150` or `1.5`. A document
+  opens one rung *below* fit-width (200% at the sizes above): fit-width is the
+  widest level that still shows the page in full, and starting there leaves the
+  paper touching both edges of the window. Ctrl+0 still means fit width.
+* **The outline floats** over the pages rather than taking a column. A column
+  would change the viewer's width every time it opened, and a fit-width layout
+  would re-fit - visibly re-zooming the document - for a navigation panel.
+* **Search behaves like the browser's find bar.** Typing boxes every match on the
+  pages in front of you and jumps straight to the first one - no Enter needed -
+  while the background index fills in from page one, so the count and the boxes
+  settle as the rest of the document is read. `Enter` / `Shift+Enter` (and the
+  arrows) walk the matches from there, `Esc` clears them. The viewer only keeps
+  the pages near the viewport, so any page that is not on screen is rendered once
+  and kept as text. A hit is painted as a `<rect>` measured from a `Range` over
+  the matched characters and mapped back through the page's own matrix, so it
+  lands on the word - and the page's markup is never restyled.
+* **Search ignores whitespace on both sides.** Runs are one positioned string
+  each and a space glyph has no outline to build a font from, so a page's text can
+  read `AttentionIsAllYouNeed` (see the limitations).
 
 ### Headless rendering
 
@@ -324,7 +365,11 @@ overlapping ink is yellow, so any systematic offset or missing glyph is obvious.
   JS/wasm encoder tried either did not work in the browser or added a
   multi-megabyte dependency for a few hundred bytes per page.
 * **Per-page text is emitted by span, not by paragraph.** Line breaking is
-  whatever the PDF says; the SVG carries positioned runs, not flowing text.
+  whatever the PDF says; the SVG carries positioned runs, not flowing text. A
+  space glyph has no outline to rebuild a font from, so runs break at word
+  boundaries and the space between them is dropped: copy-paste (and naive search)
+  sees `AttentionIsAllYouNeed`. Emitting U+0020 from the PDF's advance widths
+  would fix it; the demo's search strips whitespace from both sides instead.
 * **The worker path is verified in Chromium only.** It relies on module workers
   and `CompressionStream`, both of which are widely available, but the fallback
   exists precisely because worker startup can be blocked by a host's CSP.

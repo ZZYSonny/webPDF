@@ -9,7 +9,7 @@
  *    crisp), and panning while zoomed chains into the root scroller - which is
  *    also what keeps the virtualisation window correct.
  *  - Ctrl +/- and Ctrl+0 are *overridden* to walk a ladder of layout zoom
- *    settings (50%, 75%, 100%, fit-width, fit-page by default) instead of the
+ *    settings (25%…400%, fit-width, fit-page by default) instead of the
  *    browser's own zoom. A key press is discrete and not animated, so paying one
  *    re-layout for it is fine - and it keeps the document geometry, the page
  *    boxes and the zoom indicator consistent, which browser zoom does not.
@@ -47,6 +47,8 @@ export type ViewerEvent =
       type: 'zoom-change';
       /** Effective zoom: the layout scale multiplied by the browser's page scale. */
       scale: number;
+      /** The zoom baked into the layout, before the browser's page scale. */
+      layoutScale: number;
       mode: ZoomMode;
       /** The browser's own pinch/zoom factor, 1 when the page is not magnified. */
       pageScale: number;
@@ -102,14 +104,33 @@ interface QueueEntry {
 
 const DEFAULT_KEEP = 1;
 
-/** Zoom presets, low to high: Ctrl+= and Ctrl+- walk this list. */
-const DEFAULT_ZOOM_STEPS: readonly (number | 'fit-width' | 'fit-page')[] = [
+/**
+ * Zoom presets: Ctrl+= and Ctrl+- walk this list, and hosts that render their own
+ * zoom control can list the same rungs. It is *not* ordered low to high, because
+ * the fit modes move with the window: `stepZoom` sorts by what each rung resolves
+ * to at the moment it is used.
+ */
+export const DEFAULT_ZOOM_STEPS: readonly (number | 'fit-width' | 'fit-page')[] = [
+  0.25,
   0.5,
   0.75,
   1,
+  1.25,
+  1.5,
+  2,
+  3,
+  4,
   'fit-width',
   'fit-page',
 ];
+
+/** True for a target that consumes keystrokes as text. */
+function isEditable(target: EventTarget | null): boolean {
+  const el = target as HTMLElement | null;
+  if (!el || typeof el.tagName !== 'string') return false;
+  const tag = el.tagName.toUpperCase();
+  return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || el.isContentEditable === true;
+}
 
 export class PdfViewer {
   private readonly opt: Required<Omit<PdfViewerOptions, 'onEvent'>> & { onEvent?: (e: ViewerEvent) => void };
@@ -138,7 +159,7 @@ export class PdfViewer {
   private scale = 1;
   /** The browser's page scale (a touch pinch), which this class never sets. */
   private pageScale = 1;
-  private zoomMode: ZoomMode = 'custom';
+  private mode: ZoomMode = 'custom';
   /** What Ctrl+0 goes back to. */
   private readonly homeZoom: number | 'fit-width' | 'fit-page';
   private seq = 0;
@@ -211,6 +232,10 @@ export class PdfViewer {
     }
 
     this.homeZoom = this.opt.zoom;
+    // The starting scale comes from that same option, so the mode is only
+    // "custom" when it was a factor: `zoom: 'fit-width'` *is* a fit-width layout,
+    // and `zoomMode`/`zoom-change` have to say so.
+    this.mode = typeof this.opt.zoom === 'string' ? this.opt.zoom : 'custom';
     this.layout = new PageLayout([], {});
     host.style.height = '0px';
 
@@ -249,6 +274,10 @@ export class PdfViewer {
     this.info = info;
     this.geometry = info.pages.map((p) => ({ width: p.width, height: p.height }));
     this.clearSlots();
+    // A newly opened document starts at the level the `zoom` option asks for,
+    // whatever the previous document was left at - and the mode has to say so, or
+    // a fit level would stop re-fitting on a container resize.
+    this.mode = typeof this.homeZoom === 'string' ? this.homeZoom : 'custom';
     this.scale = this.resolveScale();
     this.rebuildLayout();
     this.scrollToOffset(0);
@@ -269,6 +298,15 @@ export class PdfViewer {
   /** Zoom baked into the layout. The browser's pinch multiplies this. */
   get zoom(): number {
     return this.scale;
+  }
+
+  /**
+   * How the current layout scale was chosen: a fixed factor, or one of the fit
+   * modes. Hosts that render a zoom control need it to label the current level
+   * (and to know which way +/- should step from here).
+   */
+  get zoomMode(): ZoomMode {
+    return this.mode;
   }
 
   /** The browser's page scale, or 1 when the page is not magnified. */
@@ -299,10 +337,10 @@ export class PdfViewer {
     const delta = this.scrollOffset() - before;
 
     if (typeof value === 'number') {
-      this.zoomMode = 'custom';
+      this.mode = 'custom';
       this.scale = Math.min(12, Math.max(0.05, value));
     } else {
-      this.zoomMode = value;
+      this.mode = value;
       this.scale = this.resolveScale();
     }
     this.rebuildLayout();
@@ -333,7 +371,7 @@ export class PdfViewer {
     // smaller than fit-width, and both move with the window, so the ladder
     // cannot be ordered statically.
     const rungs = this.opt.zoomSteps
-      .map((step) => ({ step, scale: this.scaleForMode(step) }))
+      .map((step) => ({ step, scale: this.resolveZoom(step) }))
       .sort((a, b) => a.scale - b.scale)
       .filter((rung, i, all) => i === 0 || rung.scale - all[i - 1].scale > 1e-3);
     if (rungs.length === 0) return;
@@ -347,21 +385,26 @@ export class PdfViewer {
     this.setZoom(rungs[Math.min(rungs.length - 1, Math.max(0, index))].step);
   }
 
-  /** What a fit mode would resolve to right now, without applying it. */
-  private scaleForMode(mode: number | 'fit-width' | 'fit-page'): number {
-    if (typeof mode === 'number') return mode;
+  /**
+   * What a zoom level means right now, without applying it: the factor itself, or
+   * the scale a fit mode currently resolves to. A host that renders its own zoom
+   * control needs this to label the fit modes, which move with the container -
+   * "fit width" is a different percentage in every window.
+   */
+  resolveZoom(level: number | 'fit-width' | 'fit-page'): number {
+    if (typeof level === 'number') return level;
     if (!this.info || this.geometry.length === 0) return 1;
-    return computeFitScale(this.geometry, this.host.clientWidth, window.innerHeight, this.layoutOptions(), mode);
+    return computeFitScale(this.geometry, this.host.clientWidth, window.innerHeight, this.layoutOptions(), level);
   }
 
   private resolveScale(): number {
     if (!this.info || this.geometry.length === 0) return 1;
-    if (this.zoomMode === 'custom' && typeof this.opt.zoom === 'number') return this.opt.zoom;
-    const mode = this.zoomMode === 'custom' && typeof this.opt.zoom === 'string' ? this.opt.zoom : this.zoomMode;
-    if (mode === 'custom' || mode === undefined) {
-      return typeof this.opt.zoom === 'number' ? this.opt.zoom : 1;
+    if (this.mode === 'fit-width' || this.mode === 'fit-page') {
+      return computeFitScale(this.geometry, this.host.clientWidth, window.innerHeight, this.layoutOptions(), this.mode);
     }
-    return computeFitScale(this.geometry, this.host.clientWidth, window.innerHeight, this.layoutOptions(), mode);
+    // A factor: the option is the seed, and `setZoom` is the only thing that
+    // changes it.
+    return typeof this.homeZoom === 'number' ? this.homeZoom : 1;
   }
 
   private layoutOptions(): LayoutOptions {
@@ -488,15 +531,16 @@ export class PdfViewer {
     });
   };
 
-  private onResize(): void {
+  /** An arrow property: it is used directly as a listener, so `this` must hold. */
+  private onResize = (): void => {
     // Only the virtualisation window depends on the viewport here; the layout
     // scale is the container's business (see onContainerResize).
     this.update();
-  }
+  };
 
   /** Re-derive the layout scale from the container width, if the mode wants it. */
   private refit(): void {
-    if (this.zoomMode !== 'fit-width' && this.zoomMode !== 'fit-page') return;
+    if (this.mode !== 'fit-width' && this.mode !== 'fit-page') return;
     const next = this.resolveScale();
     if (Math.abs(next - this.scale) > 1e-4) {
       this.scale = next;
@@ -516,7 +560,7 @@ export class PdfViewer {
     // pages are laid out in CSS pixels and the browser re-rasters them, so
     // re-fitting here would undo the user's zoom and re-lay-out on every step of
     // it. A genuine host resize changes the width with the ratio untouched.
-    if (!dprChanged && (this.zoomMode === 'fit-width' || this.zoomMode === 'fit-page')) this.refit();
+    if (!dprChanged && (this.mode === 'fit-width' || this.mode === 'fit-page')) this.refit();
     this.update();
   }
 
@@ -680,6 +724,9 @@ export class PdfViewer {
       return;
     }
     if (mod || event.altKey) return;
+    // Unmodified keys belong to whatever the user is typing into: a search box
+    // needs its '-' and its Home/End far more than the viewer needs the zoom.
+    if (isEditable(event.target)) return;
     switch (event.key) {
       case 'Home':
         this.goToPage(1);
@@ -730,7 +777,8 @@ export class PdfViewer {
     this.emit({
       type: 'zoom-change',
       scale: this.effectiveZoom,
-      mode: this.zoomMode,
+      layoutScale: this.scale,
+      mode: this.mode,
       pageScale: this.pageScale,
       zoomed: this.pageScale > 1.001,
     });

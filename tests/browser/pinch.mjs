@@ -38,12 +38,19 @@ const state = () =>
     const box = sr?.querySelector('.wpdf-page');
     const rect = box?.getBoundingClientRect();
     const vv = visualViewport;
+    const viewer = window.webpdf?.viewer?.();
     return {
       pageScale: +vv.scale.toFixed(3),
-      label: document.getElementById('zoom-label')?.textContent ?? '',
-      select: document.getElementById('zoom-mode')?.value ?? '',
+      // The box holds a bare number; the fit modes are named in the dropdown.
+      box: document.getElementById('zoom-value')?.value ?? '',
+      presets: [...document.querySelectorAll('#zoom-menu .zoom-option')].map((o) => o.textContent),
+      mode: viewer?.zoomMode ?? '',
+      scale: viewer ? +viewer.zoom.toFixed(4) : null,
+      statusBar: !!document.querySelector('.statusbar'),
       zoomedClass: document.body.classList.contains('wpdf-zoomed'),
       chromeOpacity: getComputedStyle(document.querySelector('.topbar')).opacity,
+      outlineOpacity: getComputedStyle(document.getElementById('toc')).opacity,
+      outlineOpen: document.getElementById('toc').hidden === false,
       scrollY: Math.round(window.scrollY),
       docH: document.scrollingElement.scrollHeight,
       innerHeight,
@@ -160,37 +167,135 @@ try {
   check('the document barely moved (gesture anchoring only)', drift < 40, `scrollY ${pinched.before.s.scrollY} -> ${pinched.after.s.scrollY} (${drift}px)`);
   check('no re-layout of the pages', pinched.layoutMs < 10, `${pinched.layoutCount} layouts, ${pinched.layoutMs} ms`);
   check('chrome is hidden while zoomed', pinched.after.s.zoomedClass && pinched.after.s.chromeOpacity === '0', `opacity ${pinched.after.s.chromeOpacity}`);
+  // The outline floats over the pages, so it is chrome too: magnified and panned
+  // out of view by a pinch exactly like the bar.
+  check('the floating outline fades with it', !pinched.after.s.outlineOpen || pinched.after.s.outlineOpacity === '0',
+    `open ${pinched.after.s.outlineOpen}, opacity ${pinched.after.s.outlineOpacity}`);
 
   console.log('\n— panning while zoomed chains into the document —');
   const panned = await measure(() => pan());
   check('the document scrolled', panned.after.s.scrollY > panned.before.s.scrollY + 100, `scrollY ${panned.before.s.scrollY} -> ${panned.after.s.scrollY}`);
   check('the virtualisation followed', panned.after.s.slots.length > 0, `slots ${JSON.stringify(panned.after.s.slots)}`);
   await resetScale();
+  const unzoomed = await state();
+  check('and the chrome comes back when the pinch is over', !unzoomed.zoomedClass && unzoomed.chromeOpacity === '1' && unzoomed.outlineOpacity === '1',
+    `bar ${unzoomed.chromeOpacity}, outline ${unzoomed.outlineOpacity}`);
 
-  console.log("\n— Ctrl +/- walk the layout zoom ladder, not the browser's —");
+  console.log('\n— Ctrl +/- walk the layout zoom ladder, not the browser\'s —');
   const dprBefore = (await state()).dpr;
+  check('the zoom box holds a bare number', /^\d+$/.test(start.box), `"${start.box}" (${start.mode})`);
+  check('the dropdown names the fit levels by percentage', start.presets.some((p) => /^\d+% \(fit width\)$/.test(p)) && start.presets.some((p) => /^\d+% \(fit page\)$/.test(p)),
+    start.presets.join(' · '));
   await chord('-', 'Minus', 189);
   const down = await state();
-  check('Ctrl+- changed the layout zoom', down.label !== start.label, `${start.label} -> ${down.label}`);
+  check('Ctrl+- stepped to the next level down', down.scale < start.scale, `${start.box} -> ${down.box} (${down.mode})`);
   check('Ctrl+- was not a browser zoom', down.dpr === dprBefore && down.innerHeight === start.innerHeight, `dpr ${down.dpr}, innerHeight ${down.innerHeight}`);
   await chord('=', 'Equal', 187);
   const up = await state();
-  check('Ctrl+= stepped back up', up.label === start.label || up.select === 'fit-width', `${down.label} -> ${up.label} (${up.select})`);
+  check('Ctrl+= stepped back up', up.mode === 'fit-width' || up.scale === start.scale, `${down.box} -> ${up.box} (${up.mode})`);
   await chord('-', 'Minus', 189);
   await chord('0', 'Digit0', 48);
   const home = await state();
-  check('Ctrl+0 returns to the fit mode', home.select === 'fit-width', `${home.label} (${home.select})`);
+  check('Ctrl+0 returns to the fit mode', home.mode === 'fit-width', `${home.box} (${home.mode})`);
 
   console.log('\n— the toolbar buttons walk the same ladder —');
   const buttons = await measure(async () => {
     await page.evaluate(() => document.getElementById('zoom-out').click());
   });
-  check('zoom-out steps the ladder', buttons.after.s.label !== home.label && buttons.after.s.select !== 'fit-width',
-    `${home.label} (${home.select}) -> ${buttons.after.s.label} (${buttons.after.s.select})`);
+  check('zoom-out steps the ladder', buttons.after.s.scale !== home.scale && buttons.after.s.mode !== 'fit-width',
+    `${home.box} (${home.mode}) -> ${buttons.after.s.box} (${buttons.after.s.mode})`);
   await page.evaluate(() => document.getElementById('zoom-in').click());
   await sleep(400);
   const back = await state();
-  check('zoom-in steps back up', back.select === 'fit-width', `${buttons.after.s.label} -> ${back.label} (${back.select})`);
+  check('zoom-in steps back up', back.mode === 'fit-width', `${buttons.after.s.box} -> ${back.box} (${back.mode})`);
+
+  console.log('\n— typing a level sets it, and the old status bar is gone —');
+  check('there is no status bar left to collide with the pages', !back.statusBar);
+  const typeLevel = async (text) => {
+    // `page.evaluate` takes an options object, not an argument, so the value goes
+    // into the expression.
+    await page.evaluate(`(() => {
+      const input = document.getElementById('zoom-value');
+      input.focus();
+      input.value = ${JSON.stringify(text)};
+      input.dispatchEvent(new Event('change', { bubbles: true }));
+      input.blur();
+    })()`);
+    await sleep(400);
+    return state();
+  };
+  const typed = await typeLevel('175');
+  check('a typed number is applied, with no percent sign to type', Math.abs(typed.scale - 1.75) < 0.001, `"175" -> ${typed.box} (${typed.mode})`);
+  check('the box reads back as a bare number', typed.box === '175', `"${typed.box}"`);
+  const tolerated = await typeLevel('150%');
+  check('a stray percent sign is tolerated, not required', Math.abs(tolerated.scale - 1.5) < 0.001, `"150%" -> ${tolerated.box}`);
+  const fitPage = await typeLevel('fit page');
+  check('a typed fit mode is applied', fitPage.mode === 'fit-page' && /^\d+$/.test(fitPage.box), `"${fitPage.box}" (${fitPage.mode})`);
+
+  console.log('\n— the dropdown lists every level, open and closed —');
+  await page.evaluate(() => document.getElementById('zoom-menu-btn').click());
+  await sleep(250);
+  const opened = await page.evaluate(`JSON.stringify({
+    open: document.getElementById('zoom-menu').hidden === false,
+    options: [...document.querySelectorAll('#zoom-menu .zoom-option')].map((o) => o.textContent),
+    selected: document.querySelector('#zoom-menu .zoom-option[aria-selected="true"]')?.textContent ?? '',
+  })`);
+  const menu = JSON.parse(opened);
+  check('the button opens the list', menu.open, `${menu.options.length} options`);
+  check('every level is offered, fit modes by percentage',
+    menu.options.length >= 9 && menu.options.some((o) => /^\d+% \(fit width\)$/.test(o)) && menu.options.some((o) => /^\d+% \(fit page\)$/.test(o)),
+    menu.options.join(' · '));
+  check('the list marks the level the viewer is on', /\(fit page\)$/.test(menu.selected), `"${menu.selected}"`);
+  await page.evaluate(`(() => {
+    const option = [...document.querySelectorAll('#zoom-menu .zoom-option')].find((o) => /\\(fit width\\)$/.test(o.textContent));
+    option.click();
+  })()`);
+  await sleep(500);
+  const picked = await page.evaluate(`JSON.stringify({
+    open: document.getElementById('zoom-menu').hidden === false,
+    box: document.getElementById('zoom-value').value,
+    mode: window.webpdf.viewer().zoomMode,
+  })`);
+  const chosen = JSON.parse(picked);
+  check('picking an entry applies it and closes the list', !chosen.open && chosen.mode === 'fit-width' && /^\d+$/.test(chosen.box),
+    `"${chosen.box}" (${chosen.mode})`);
+
+  console.log('\n— a click elsewhere closes the list —');
+  await page.evaluate(() => document.getElementById('zoom-menu-btn').click());
+  await sleep(200);
+  await page.evaluate(() => document.getElementById('viewer').dispatchEvent(new PointerEvent('pointerdown', { bubbles: true })));
+  await sleep(200);
+  const dismissed = await page.evaluate(() => document.getElementById('zoom-menu').hidden === false);
+  check('clicking outside dismisses it', !dismissed);
+
+  await chord('0', 'Digit0', 48);
+
+  console.log('\n— the keyboard drives the list too —');
+  const keyed = await page.evaluate(`JSON.stringify((() => {
+    const input = document.getElementById('zoom-value');
+    input.focus();
+    input.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true }));
+    const opened = document.getElementById('zoom-menu').hidden === false;
+    const start = document.querySelector('#zoom-menu .zoom-option.active')?.textContent ?? '';
+    input.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true }));
+    const moved = document.querySelector('#zoom-menu .zoom-option.active')?.textContent ?? '';
+    input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+    return {
+      opened,
+      start,
+      moved,
+      closed: document.getElementById('zoom-menu').hidden === true,
+      box: input.value,
+      mode: window.webpdf.viewer().zoomMode,
+    };
+  })())`);
+  const keys = JSON.parse(keyed);
+  await sleep(300);
+  check('ArrowDown opens the list on the current level', keys.opened && /\(fit width\)$/.test(keys.start), `"${keys.start}"`);
+  check('a second ArrowDown moves the cursor', keys.moved !== keys.start, `"${keys.start}" -> "${keys.moved}"`);
+  check('Enter takes the highlighted level and closes the list',
+    keys.closed && keys.mode === 'fit-page' && /^\d+$/.test(keys.box), `"${keys.box}" (${keys.mode})`);
+  await chord('0', 'Digit0', 48);
 
   console.log('\n— Ctrl+wheel belongs to the browser and must not re-lay-out —');
   const wheel = await measure(async () => {

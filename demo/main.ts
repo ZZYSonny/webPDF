@@ -4,9 +4,23 @@
  * Deliberately built only on the public API - no private reach-ins - so it
  * doubles as a test that the integration surface is sufficient for a real app
  * (and, by extension, for a browser extension content script).
+ *
+ * The chrome is one bar and nothing else: the document and its outline on the
+ * left, the layout zoom level in the middle, search and the last render cost on
+ * the right. There is no status bar - messages float in a toast - so the pages
+ * get every pixel below the bar, and the browser's own pinch is never competing
+ * with chrome that claims to be fixed.
  */
 
-import { createViewer, PdfViewer, type DocumentInfo, type ViewerEvent } from '../src/index.ts';
+import {
+  createViewer,
+  DEFAULT_ZOOM_STEPS,
+  PdfViewer,
+  type DocumentInfo,
+  type ViewerEvent,
+} from '../src/index.ts';
+import { createSearch, type SearchController, type SearchState } from './search.ts';
+import { isCurrentLevel, parseZoomInput, zoomLevels, zoomPercent, type ZoomLevel, type ZoomOption } from './zoom.ts';
 
 const $ = <T extends HTMLElement>(id: string): T => {
   const el = document.getElementById(id);
@@ -18,34 +32,42 @@ const els = {
   open: $<HTMLButtonElement>('open'),
   file: $<HTMLInputElement>('file'),
   sample: $<HTMLSelectElement>('sample'),
-  navGroup: $('nav-group'),
-  zoomGroup: $('zoom-group'),
-  viewGroup: $('view-group'),
-  prev: $<HTMLButtonElement>('prev'),
-  next: $<HTMLButtonElement>('next'),
-  pageno: $<HTMLInputElement>('pageno'),
-  pagecount: $('pagecount'),
-  zoomIn: $<HTMLButtonElement>('zoom-in'),
-  zoomOut: $<HTMLButtonElement>('zoom-out'),
-  zoomMode: $<HTMLSelectElement>('zoom-mode'),
-  zoomLabel: $('zoom-label'),
   tocToggle: $<HTMLButtonElement>('toc-toggle'),
   toc: $('toc'),
   tocBody: $('toc-body'),
   tocClose: $<HTMLButtonElement>('toc-close'),
-  exportBtn: $<HTMLButtonElement>('export'),
+  navGroup: $('nav-group'),
+  prev: $<HTMLButtonElement>('prev'),
+  next: $<HTMLButtonElement>('next'),
+  pageno: $<HTMLInputElement>('pageno'),
+  pagecount: $('pagecount'),
+  zoomGroup: $('zoom-group'),
+  zoomIn: $<HTMLButtonElement>('zoom-in'),
+  zoomOut: $<HTMLButtonElement>('zoom-out'),
+  zoomValue: $<HTMLInputElement>('zoom-value'),
+  zoomMenu: $('zoom-menu'),
+  zoomMenuBtn: $<HTMLButtonElement>('zoom-menu-btn'),
+  searchGroup: $('search-group'),
+  searchBox: $('search-box'),
+  search: $<HTMLInputElement>('search'),
+  searchCount: $('search-count'),
+  searchPrev: $<HTMLButtonElement>('search-prev'),
+  searchNext: $<HTMLButtonElement>('search-next'),
+  stats: $('stats'),
   viewer: $('viewer'),
   empty: $('empty'),
   emptyOpen: $<HTMLButtonElement>('empty-open'),
   emptySample: $<HTMLButtonElement>('empty-sample'),
   progress: $('progress'),
-  status: $('status'),
-  stats: $('stats'),
+  toast: $('toast'),
 };
 
 let viewer: PdfViewer | null = null;
+let search: SearchController | null = null;
 let info: DocumentInfo | null = null;
+let currentPage = 1;
 let busy = 0;
+let toastTimer = 0;
 
 /* ------------------------------------------------------------- bootstrap */
 
@@ -54,112 +76,209 @@ async function ensureViewer(): Promise<PdfViewer> {
   viewer = await createViewer({
     container: els.viewer,
     zoom: 'fit-width',
+    // The same ladder the zoom box lists, so the dropdown, the +/- buttons and
+    // Ctrl +/- all offer identical levels.
+    zoomSteps: DEFAULT_ZOOM_STEPS,
     gap: 16,
     padding: 18,
     keepPages: 1,
     shadowDom: true,
     onEvent: onViewerEvent,
   });
+  search = createSearch({ viewer, onChange: renderSearch });
   return viewer;
 }
 
 function onViewerEvent(event: ViewerEvent): void {
   switch (event.type) {
-    case 'document-loaded':
+    case 'document-loaded': {
       info = event.info;
+      search?.reset();
       els.empty.hidden = true;
+      // The sample picker is part of getting a document in, so it goes away once
+      // one is open; "Open PDF…" is the way to a different file from here.
+      els.sample.hidden = true;
       els.navGroup.hidden = false;
       els.zoomGroup.hidden = false;
-      els.viewGroup.hidden = false;
+      els.searchGroup.hidden = false;
       els.pagecount.textContent = String(event.info.pageCount);
       els.pageno.value = '1';
+      els.search.value = '';
+      els.stats.textContent = '';
       document.title = event.info.title || 'webpdf';
       renderOutline(event.info);
+      // The outline is a left-hand column, so a document that has one opens with
+      // it showing - on a window wide enough to afford the width.
+      if (event.info.outline.length > 0 && window.innerWidth >= 1024) setOutline(true);
+      // Open one level *below* fit-width rather than at it. Fit-width is the
+      // largest level that still shows the page's full width, and starting there
+      // leaves the paper touching both edges of the window. Ctrl+0 still means
+      // fit width; the ladder is resolved by scale, so this is the next rung down
+      // whatever the window size is.
+      viewer?.stepZoom(-1);
       break;
+    }
     case 'page-change':
+      currentPage = event.page;
       els.pageno.value = String(event.page);
       highlightOutline(event.page);
+      search?.refresh();
       break;
     case 'zoom-change':
-      // `scale` is the effective zoom: what the layout was built at, times the
-      // browser's own page scale. The select reflects the layout part only,
-      // because the page scale is the browser's and cannot be set from script.
-      els.zoomLabel.textContent = `${Math.round(event.scale * 100)}%`;
-      els.zoomMode.value = event.mode === 'custom' ? nearestZoomOption(event.scale) : event.mode;
-      // Chrome and content are magnified together by the browser's pinch, so the
-      // chrome is faded out instead of pretending it stays put.
+      // The box shows the *layout* zoom; a pinch is the browser's page scale and
+      // never reaches this value. While it has focus the text is the user's.
+      if (document.activeElement !== els.zoomValue) syncZoomBox();
+      refreshZoomMenu();
       document.body.classList.toggle('wpdf-zoomed', event.zoomed);
       break;
     case 'render':
-      els.stats.textContent =
-        `page ${event.page} · ${event.ms} ms · ` +
+      // Only the cost: everything else about a render is a debugging detail.
+      els.stats.textContent = `${Math.round(event.ms)} ms`;
+      els.stats.title =
+        `Page ${event.page}: ${event.ms} ms · ` +
         `${event.asText.toLocaleString()} glyphs as text` +
         (event.asOutlines ? ` · ${event.asOutlines.toLocaleString()} as outlines` : '');
+      search?.refresh();
       break;
     case 'drop-accepted':
-      setStatus(`Opening ${event.name}…`);
+      notify(`Opening ${event.name}…`);
       break;
     case 'error':
       console.error(event.error);
-      setStatus(`Error: ${String((event.error as Error)?.message ?? event.error)}`, true);
+      notify(`Error: ${String((event.error as Error)?.message ?? event.error)}`, 'error');
       break;
   }
 }
 
-function nearestZoomOption(scale: number): string {
-  const options = ['0.5', '0.75', '1', '1.5', '2', '3'];
-  let best = options[0];
-  let bestDelta = Infinity;
-  for (const o of options) {
-    const d = Math.abs(Number(o) - scale);
-    if (d < bestDelta) {
-      bestDelta = d;
-      best = o;
-    }
-  }
-  return bestDelta < 0.03 ? best : '';
+/* ------------------------------------------------------------------ toast */
+
+function notify(text: string, kind: 'info' | 'error' = 'info'): void {
+  els.toast.textContent = text;
+  els.toast.classList.toggle('error', kind === 'error');
+  els.toast.hidden = false;
+  clearTimeout(toastTimer);
+  toastTimer = window.setTimeout(() => {
+    els.toast.hidden = true;
+  }, kind === 'error' ? 8000 : 3500);
 }
 
-/* ------------------------------------------------------------------ load */
+/* ------------------------------------------------------------------- zoom */
 
-async function openSource(source: File | string): Promise<void> {
-  const label = typeof source === 'string' ? source : source.name;
-  busy++;
-  els.progress.hidden = false;
-  setStatus(`Opening ${label}…`);
-  try {
-    const v = await ensureViewer();
-    const loaded = await v.load(source);
-    setStatus(
-      `${loaded.title || label} — ${loaded.pageCount} page${loaded.pageCount === 1 ? '' : 's'}` +
-        (loaded.author ? ` · ${loaded.author}` : '') +
-        (v.rendersInWorker ? ' · rendering in a worker' : ' · rendering inline'),
-    );
-  } catch (error) {
-    if ((error as Error)?.name === 'PasswordRequiredError') {
-      const password = window.prompt('This document is password protected. Password:');
-      if (password) {
-        try {
-          const v = await ensureViewer();
-          await v.load(source, password);
-          setStatus('Opened protected document');
-        } catch (again) {
-          setStatus(`Error: ${String((again as Error).message)}`, true);
-        }
-      }
-    } else {
-      console.error(error);
-      setStatus(`Error: ${String((error as Error)?.message ?? error)}`, true);
-    }
-  } finally {
-    busy--;
-    if (busy <= 0) els.progress.hidden = true;
-  }
+/**
+ * The dropdown lists every rung of the ladder, and a fit mode is named by the
+ * percentage it resolves to *now* - so the list is rebuilt when those percentages
+ * move with the window. The rebuild is skipped unless they actually changed, so a
+ * pinch - which fires `zoom-change` on every frame and must stay layout-free -
+ * never touches it.
+ */
+let menuOptions: ZoomOption[] = [];
+let menuKey = '';
+let menuCursor = 0;
+
+function zoomOptionElement(option: ZoomOption, index: number): HTMLButtonElement {
+  const el = document.createElement('button');
+  el.type = 'button';
+  el.className = 'zoom-option';
+  el.setAttribute('role', 'option');
+  el.dataset.index = String(index);
+  el.textContent = option.label;
+  el.addEventListener('click', () => {
+    applyZoomLevel(option.level);
+    closeZoomMenu();
+    els.zoomValue.focus();
+  });
+  return el;
 }
 
-function setStatus(text: string, isError = false): void {
-  els.status.textContent = text;
-  els.status.style.color = isError ? '#ff8080' : '';
+function refreshZoomMenu(): void {
+  if (!viewer) return;
+  const fitWidth = zoomPercent(viewer.resolveZoom('fit-width'));
+  const fitPage = zoomPercent(viewer.resolveZoom('fit-page'));
+  const key = `${fitWidth}/${fitPage}`;
+  if (key !== menuKey) {
+    menuKey = key;
+    menuOptions = zoomLevels(DEFAULT_ZOOM_STEPS, (level) => viewer!.resolveZoom(level));
+    els.zoomMenu.replaceChildren(...menuOptions.map(zoomOptionElement));
+  }
+  markZoomMenu();
+}
+
+/** Show which rung the viewer is on now. */
+function markZoomMenu(): void {
+  if (!viewer || menuOptions.length === 0) return;
+  const current = menuOptions.findIndex((option) => isCurrentLevel(option.level, viewer!.zoom, viewer!.zoomMode));
+  els.zoomMenu.querySelectorAll<HTMLElement>('.zoom-option').forEach((el, index) => {
+    el.setAttribute('aria-selected', String(index === current));
+    el.classList.toggle('active', index === menuCursor);
+  });
+}
+
+function openZoomMenu(): void {
+  if (!viewer) return;
+  refreshZoomMenu();
+  const current = menuOptions.findIndex((option) => isCurrentLevel(option.level, viewer!.zoom, viewer!.zoomMode));
+  menuCursor = current >= 0 ? current : 0;
+  markZoomMenu();
+  els.zoomMenu.hidden = false;
+  els.zoomMenuBtn.setAttribute('aria-expanded', 'true');
+  els.zoomMenu.querySelectorAll<HTMLElement>('.zoom-option')[menuCursor]?.scrollIntoView({ block: 'nearest' });
+}
+
+function closeZoomMenu(): void {
+  els.zoomMenu.hidden = true;
+  els.zoomMenuBtn.setAttribute('aria-expanded', 'false');
+}
+
+function moveZoomMenu(delta: number): void {
+  if (menuOptions.length === 0) return;
+  menuCursor = Math.min(menuOptions.length - 1, Math.max(0, menuCursor + delta));
+  markZoomMenu();
+  els.zoomMenu.querySelectorAll<HTMLElement>('.zoom-option')[menuCursor]?.scrollIntoView({ block: 'nearest' });
+}
+
+function applyZoomLevel(level: ZoomLevel): void {
+  viewer?.setZoom(level);
+  syncZoomBox();
+}
+
+function syncZoomBox(): void {
+  // The number is the editable part; `%` is the control's own unit.
+  if (viewer) els.zoomValue.value = String(zoomPercent(viewer.zoom));
+}
+
+/** Commit whatever is in the box: a percentage, a ratio, or a fit mode. */
+function applyZoomInput(): void {
+  const level = parseZoomInput(els.zoomValue.value);
+  if (level !== null) viewer?.setZoom(level);
+  syncZoomBox();
+}
+
+/* ---------------------------------------------------------------- search */
+
+function renderSearch(state: SearchState): void {
+  const { query, hits, active, indexed, total, running, truncated } = state;
+  const navigable = hits.length > 0;
+  els.searchNext.hidden = !navigable;
+  els.searchPrev.hidden = !navigable;
+  if (!query) {
+    els.searchCount.textContent = '';
+    els.searchCount.title = '';
+    els.search.classList.remove('no-matches');
+    return;
+  }
+  if (!navigable) {
+    els.searchCount.textContent = running ? `${indexed}/${total}` : 'none';
+    els.searchCount.title = running ? `Searched ${indexed} of ${total} pages` : 'No match in this document';
+  } else {
+    // Before the first jump there is nothing selected, so the count is the
+    // total; after it, the position in the list.
+    const shown = active < 0 ? String(hits.length) : `${active + 1}/${hits.length}`;
+    els.searchCount.textContent = `${shown}${truncated ? '+' : ''}${running ? '…' : ''}`;
+    els.searchCount.title = truncated
+      ? `Showing the first ${hits.length} matches`
+      : `${hits.length} match${hits.length === 1 ? '' : 'es'} in ${new Set(hits.map((h) => h.page)).size} pages`;
+  }
+  els.search.classList.toggle('no-matches', !navigable && !running);
 }
 
 /* --------------------------------------------------------------- outline */
@@ -171,6 +290,12 @@ interface TocEntry {
 }
 
 const tocEntries: TocEntry[] = [];
+
+function setOutline(open: boolean): void {
+  els.toc.hidden = !open;
+  els.tocToggle.setAttribute('aria-expanded', String(open));
+  els.tocToggle.classList.toggle('active', open);
+}
 
 function renderOutline(doc: DocumentInfo): void {
   tocEntries.length = 0;
@@ -193,7 +318,7 @@ function renderOutline(doc: DocumentInfo): void {
       if (node.page > 0) {
         btn.addEventListener('click', () => {
           viewer?.goToPage(node.page);
-          if (window.innerWidth < 900) els.toc.hidden = true;
+          if (window.innerWidth < 1024) setOutline(false);
         });
       } else {
         btn.disabled = true;
@@ -214,6 +339,41 @@ function highlightOutline(page: number): void {
   }
   for (const entry of tocEntries) entry.el.classList.toggle('active', entry === match);
   match?.el.scrollIntoView({ block: 'nearest' });
+}
+
+/* ------------------------------------------------------------------ load */
+
+async function openSource(source: File | string): Promise<void> {
+  const label = typeof source === 'string' ? source : source.name;
+  busy++;
+  els.progress.hidden = false;
+  try {
+    const v = await ensureViewer();
+    const loaded = await v.load(source);
+    notify(
+      `${loaded.title || label} — ${loaded.pageCount} page${loaded.pageCount === 1 ? '' : 's'}` +
+        (loaded.author ? ` · ${loaded.author}` : '') +
+        (v.rendersInWorker ? ' · rendering in a worker' : ' · rendering inline'),
+    );
+  } catch (error) {
+    if ((error as Error)?.name === 'PasswordRequiredError') {
+      const password = window.prompt('This document is password protected. Password:');
+      if (password) {
+        try {
+          const v = await ensureViewer();
+          await v.load(source, password);
+        } catch (again) {
+          notify(`Error: ${String((again as Error).message)}`, 'error');
+        }
+      }
+    } else {
+      console.error(error);
+      notify(`Error: ${String((error as Error)?.message ?? error)}`, 'error');
+    }
+  } finally {
+    busy--;
+    if (busy <= 0) els.progress.hidden = true;
+  }
 }
 
 /* ---------------------------------------------------------------- events */
@@ -241,53 +401,90 @@ els.next.addEventListener('click', () => viewer?.nextPage());
 els.pageno.addEventListener('change', () => {
   const n = Number.parseInt(els.pageno.value, 10);
   if (Number.isFinite(n)) viewer?.goToPage(n);
+  else els.pageno.value = String(currentPage);
 });
 
 els.zoomIn.addEventListener('click', () => viewer?.zoomIn());
 els.zoomOut.addEventListener('click', () => viewer?.zoomOut());
-els.zoomMode.addEventListener('change', () => {
-  const value = els.zoomMode.value;
-  if (!value) return;
-  viewer?.setZoom(value === 'fit-width' || value === 'fit-page' ? value : Number(value));
-});
-
-els.tocToggle.addEventListener('click', () => {
-  els.toc.hidden = !els.toc.hidden;
-});
-els.tocClose.addEventListener('click', () => {
-  els.toc.hidden = true;
-});
-
-els.exportBtn.addEventListener('click', async () => {
-  if (!viewer) return;
-  const page = Number(els.pageno.value) || 1;
-  setStatus(`Rendering page ${page} for export…`);
-  try {
-    const svg = await viewer.exportSvg(page);
-    const blob = new Blob([svg], { type: 'image/svg+xml' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `page-${page}.svg`;
-    a.click();
-    URL.revokeObjectURL(url);
-    setStatus(`Exported page ${page} (${(blob.size / 1024).toFixed(0)} KiB, fonts embedded)`);
-  } catch (error) {
-    setStatus(`Export failed: ${String(error)}`, true);
+els.zoomValue.addEventListener('change', applyZoomInput);
+els.zoomValue.addEventListener('blur', syncZoomBox);
+els.zoomValue.addEventListener('keydown', (event) => {
+  if (event.key === 'Enter') {
+    event.preventDefault();
+    // With the list open, Enter takes the highlighted level.
+    if (els.zoomMenu.hidden) applyZoomInput();
+    else if (menuOptions[menuCursor]) applyZoomLevel(menuOptions[menuCursor].level);
+    closeZoomMenu();
+  } else if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+    event.preventDefault();
+    if (els.zoomMenu.hidden) openZoomMenu();
+    else moveZoomMenu(event.key === 'ArrowDown' ? 1 : -1);
+  } else if (event.key === 'Escape') {
+    event.preventDefault();
+    if (!els.zoomMenu.hidden) closeZoomMenu();
+    else {
+      syncZoomBox();
+      els.zoomValue.blur();
+    }
   }
 });
+els.zoomMenuBtn.addEventListener('click', () => {
+  if (els.zoomMenu.hidden) openZoomMenu();
+  else closeZoomMenu();
+});
+// A click anywhere else, or a resize that would move the anchor, closes the list.
+document.addEventListener('pointerdown', (event) => {
+  if (!els.zoomMenu.hidden && !(event.target as Element | null)?.closest?.('.zoom-field')) closeZoomMenu();
+});
+// A resize moves the fit levels; if the current level is a factor, no zoom event
+// fires, so ask for the rebuild directly.
+window.addEventListener('resize', () => {
+  closeZoomMenu();
+  refreshZoomMenu();
+});
+
+let searchTimer = 0;
+els.search.addEventListener('input', () => {
+  clearTimeout(searchTimer);
+  searchTimer = window.setTimeout(() => search?.setQuery(els.search.value), 160);
+});
+els.search.addEventListener('keydown', (event) => {
+  if (event.key === 'Enter') {
+    event.preventDefault();
+    clearTimeout(searchTimer);
+    search?.setQuery(els.search.value);
+    search?.step(event.shiftKey ? -1 : 1);
+  } else if (event.key === 'Escape') {
+    event.preventDefault();
+    clearTimeout(searchTimer);
+    els.search.value = '';
+    search?.clear();
+  }
+});
+els.searchNext.addEventListener('click', () => search?.step(1));
+els.searchPrev.addEventListener('click', () => search?.step(-1));
+
+els.tocToggle.addEventListener('click', () => setOutline(els.toc.hidden));
+els.tocClose.addEventListener('click', () => setOutline(false));
 
 window.addEventListener('keydown', (event) => {
-  if (!viewer || (event.target as HTMLElement)?.tagName === 'INPUT') return;
-  if (event.key === 'o' && (event.metaKey || event.ctrlKey)) {
+  if (!viewer) return;
+  const mod = event.metaKey || event.ctrlKey;
+  if (!mod) return;
+  const key = event.key.toLowerCase();
+  if (key === 'o') {
     event.preventDefault();
     els.file.click();
+  } else if (key === 'f') {
+    event.preventDefault();
+    els.search.focus();
+    els.search.select();
   }
 });
 
 /**
  * The sticky chrome offsets need to know how tall the topbar actually is (it
- * wraps on narrow windows). Kept in CSS pixels and updated on resize only.
+ * stacks on narrow windows). Kept in CSS pixels and updated on resize only.
  */
 const topbar = document.querySelector<HTMLElement>('.topbar');
 if (topbar) {
@@ -308,4 +505,4 @@ declare global {
 }
 window.webpdf = { viewer: () => viewer, info: () => info };
 
-setStatus('Ready — open a PDF to begin.');
+notify('Ready — open a PDF to begin.');
