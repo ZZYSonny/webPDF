@@ -13,11 +13,12 @@
       <div class="bar-left">
         <button id="open" class="btn primary" type="button">Open PDF…</button>
         <input id="file" type="file" accept="application/pdf,.pdf" hidden />
-        <select id="sample" class="btn" title="Load a sample document">
-          <option value="">Sample…</option>
-          <option value="/sample-latex.pdf">LaTeX paper — Type 1 (PFB) fonts</option>
-          <option value="/sample-truetype.pdf">TrueType embedded fonts</option>
-        </select>
+        <!--
+          The picker is filled in by the demo (see `demo/examples.ts`): the
+          documents it offers are fetched from public URLs, and which of them
+          this page can serve depends on where it is running.
+        -->
+        <select id="sample" class="btn" title="Load an example document"></select>
         <button id="toc-toggle" class="btn" type="button" aria-expanded="false" aria-controls="toc" title="Show or hide the outline">
           Outline
         </button>
@@ -111,7 +112,7 @@
             </p>
             <div class="empty-actions">
               <button id="empty-open" class="btn primary" type="button">Choose a file</button>
-              <button id="empty-sample" class="btn" type="button">Open a sample</button>
+              <button id="empty-sample" class="btn" type="button">Open the example paper</button>
             </div>
           </div>
         </div>

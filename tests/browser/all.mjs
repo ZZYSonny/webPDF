@@ -3,8 +3,11 @@
  *
  *   node tests/browser/all.mjs
  *
- * Builds the demo, serves it, checks that the text render reproduces MuPDF's
- * outlines pixel-for-pixel on the bundled samples, then drives the demo UI.
+ * Builds the demo, serves it (with `tests/fixtures` mounted by the Vite config,
+ * so the demo offers them as documents it can open locally), checks that the
+ * text render reproduces MuPDF's outlines pixel-for-pixel, then drives the demo
+ * UI - including a download of the public example, because that is what a
+ * published page loads.
  */
 
 import { spawn } from 'node:child_process';
@@ -52,9 +55,9 @@ try {
   if (!(await ready())) throw new Error('preview server never came up');
 
   const samples = fs
-    .readdirSync(path.join(root, 'demo', 'public'))
+    .readdirSync(path.join(root, 'tests', 'fixtures'))
     .filter((f) => f.endsWith('.pdf'))
-    .map((f) => path.join(root, 'demo', 'public', f));
+    .map((f) => path.join(root, 'tests', 'fixtures', f));
 
   for (const sample of samples) {
     console.log(`\n› outline-vs-text fidelity: ${path.basename(sample)}`);

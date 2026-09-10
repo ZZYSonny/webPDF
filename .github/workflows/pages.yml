@@ -1,0 +1,63 @@
+# Build the demo and publish it to GitHub Pages.
+#
+# Pages is configured to take its source from Actions (Settings -> Pages ->
+# Source: "GitHub Actions"), so this workflow is the only thing that writes to
+# the site: there is no `gh-pages` branch to keep in sync.
+#
+# It builds; it does not test. The suites - especially the browser one, which
+# downloads the example paper and rasterises pages - belong on a machine where a
+# flake costs nothing, not between a commit and the published site. Typechecking
+# stays, because a type error means the artifact would be built from source that
+# does not compile as written.
+#
+# The published site is the demo app plus the library it is built from, and it
+# carries no documents of its own: the example papers are fetched from their
+# public URLs, and the fixtures under tests/fixtures stay in the repository.
+
+name: Pages
+
+on:
+  push:
+    branches: [main]
+  # Lets a deploy be re-run from the Actions tab without pushing a commit.
+  workflow_dispatch:
+
+# `pages: write` and `id-token: write` are what `deploy-pages` needs; nothing
+# here needs write access to the repository itself.
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One deployment at a time, and never cancel one that is already publishing.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Build and deploy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - uses: actions/configure-pages@v6
+      # Typechecking is part of the build here: a type error means the artifact
+      # would be built from source that does not compile as written.
+      - run: npm run typecheck
+      - run: npm run build:pages
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: dist/demo
+          retention-days: 1
+      # The deployment environment, and its URL, come from this step: it is the
+      # only thing that knows where the site ended up.
+      - id: deployment
+        uses: actions/deploy-pages@v5
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}

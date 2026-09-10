@@ -137,11 +137,16 @@ try {
 
   await page.goto(url);
   await page.waitFor(() => typeof window.webpdf === 'object', { label: 'demo bootstrap', timeout: 90000 });
-  await page.evaluate(() => {
+  // The fixture the tests are written against, wherever this page can get it.
+  const document_ = await page.evaluate(() => {
     const sel = document.getElementById('sample');
-    sel.value = '/sample-latex.pdf';
+    const fixture = [...sel.options].find((o) => o.value === '/sample-latex.pdf');
+    const chosen = fixture?.value ?? [...sel.options].find((o) => o.value.startsWith('http'))?.value;
+    sel.value = chosen;
     sel.dispatchEvent(new Event('change'));
+    return chosen;
   });
+  console.log('document: ' + document_);
   await page.waitFor(
     () => {
       const sr = document.getElementById('viewer')?.shadowRoot;

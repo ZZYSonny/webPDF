@@ -20,6 +20,7 @@ import {
   type ViewerEvent,
 } from '../src/index.ts';
 import { createSearch, type SearchController, type SearchState } from './search.ts';
+import { defaultExample, exampleDocuments, type Example } from './examples.ts';
 import { isCurrentLevel, parseZoomInput, zoomLevels, zoomPercent, type ZoomLevel, type ZoomOption } from './zoom.ts';
 
 const $ = <T extends HTMLElement>(id: string): T => {
@@ -69,7 +70,45 @@ let currentPage = 1;
 let busy = 0;
 let toastTimer = 0;
 
+/* ---------------------------------------------------------------- sources */
+
+/**
+ * Where this page lives, so a fixture URL or an upload can be resolved against
+ * it rather than against a domain root: the built demo is published under a
+ * path ([user].github.io/<repo>/) that it has no other way of knowing.
+ */
+const BASE = (() => {
+  const src = document.querySelector<HTMLScriptElement>('script[type="module"][src]')?.src;
+  return src ? new URL('.', src).href : new URL('.', document.baseURI).href;
+})();
+
+const resolve = (url: string): string => new URL(url, BASE).href;
+
+/** Fetch a document from a URL, with the picker saying which one is loading. */
+async function openUrl(url: string): Promise<void> {
+  await openSource(resolve(url));
+}
+
+/** The document the empty tray opens - the first public example. */
+let example: Example | null = null;
+
+/** The picker lists whatever this page can actually open. */
+function fillSamplePicker(): void {
+  const list = exampleDocuments();
+  example = defaultExample() ?? list[0] ?? null;
+  els.sample.replaceChildren(
+    new Option('Example…', ''),
+    ...list.map((item) => new Option(`${item.label} · ${item.note}`, item.url)),
+  );
+  els.sample.value = '';
+  els.emptySample.hidden = example === null;
+}
+
 /* ------------------------------------------------------------- bootstrap */
+
+// The picker is populated before anything can be clicked, so the page never
+// offers a document it cannot fetch.
+fillSamplePicker();
 
 async function ensureViewer(): Promise<PdfViewer> {
   if (viewer) return viewer;
@@ -388,12 +427,12 @@ els.file.addEventListener('change', () => {
 
 els.sample.addEventListener('change', () => {
   const url = els.sample.value;
-  if (url) void openSource(url);
+  if (url) void openUrl(url);
   els.sample.value = '';
 });
 
 els.emptySample.addEventListener('click', () => {
-  void openSource('/sample-latex.pdf');
+  if (example) void openUrl(example.url);
 });
 
 els.prev.addEventListener('click', () => viewer?.prevPage());

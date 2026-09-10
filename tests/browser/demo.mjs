@@ -17,14 +17,64 @@ const url = process.argv[2] ?? 'http://127.0.0.1:5175/';
 const out = process.argv[3] ?? path.join(here, 'out', 'demo.png');
 fs.mkdirSync(path.dirname(out), { recursive: true });
 
-const browser = await launch();
-const page = await browser.newPage();
-await page.setViewport(1440, 900);
+/**
+ * The published demo ships no documents: every entry in its picker is a public
+ * URL. The evaluation copy additionally offers the test fixtures, and this test
+ * uses one of those so the numbers below are about this renderer rather than
+ * about whichever bytes arXiv is serving today. Where the fixtures are not
+ * being served, the public example is used instead and the fixture-only checks
+ * are skipped.
+ */
+const FIXTURE = '/sample-latex.pdf';
+const PUBLIC_EXAMPLE = 'https://arxiv.org/pdf/1706.03762v7';
 
 const fail = (msg) => {
   console.error('FAIL: ' + msg);
   process.exitCode = 1;
 };
+
+const browser = await launch();
+const page = await browser.newPage();
+await page.setViewport(1440, 900);
+
+/**
+ * Pick a document from the picker. The value is embedded in the expression
+ * because `page.evaluate(fn, args)` takes evaluation options as its second
+ * argument, not arguments for the function.
+ */
+const open = (value) =>
+  page.evaluate(`(() => {
+    const sel = document.getElementById('sample');
+    sel.value = ${JSON.stringify(value)};
+    sel.dispatchEvent(new Event('change'));
+  })()`);
+
+/**
+ * The screenshot is a deliverable: `docs/demo.png` is the README's picture of
+ * the app, so it is taken on the public example with a match boxed - the same
+ * view a reader gets when they open the published demo.
+ */
+const shot = async (file) => {
+  await page.screenshot(file);
+  fs.copyFileSync(file, path.join(here, '..', '..', 'docs', 'demo.png'));
+  console.log('screenshot: ' + file + ' (+ docs/demo.png)');
+};
+
+/** What the find bar says, and how much of it is boxed on the visible page. */
+const searchState = () =>
+  page.evaluate(() => {
+    const sr = document.getElementById('viewer').shadowRoot;
+    const page = document.getElementById('pageno').value;
+    const box = sr.querySelector(`.wpdf-page[data-page="${page}"]`);
+    return {
+      count: document.getElementById('search-count')?.textContent ?? '',
+      pageno: page,
+      highlights: sr.querySelectorAll('rect[data-wpdf-search]').length,
+      activeHighlights: sr.querySelectorAll('rect[data-wpdf-search="active"]').length,
+      // Boxes on the page we are looking at, active and inactive together.
+      bandsOnPage: box ? box.querySelectorAll('rect[data-wpdf-search]').length : 0,
+    };
+  });
 
 try {
   await page.goto(url);
@@ -33,18 +83,21 @@ try {
   await page.waitFor(() => typeof window.webpdf === 'object', { label: 'demo bootstrap', timeout: 90000 });
   await page.waitFor(() => !!document.getElementById('viewer'), { label: 'demo shell' });
 
-  console.log('— loading the LaTeX sample through the UI —');
+  console.log('— loading the sample through the UI —');
   const beforeLoad = await page.evaluate(() => ({
     sampleHidden: document.getElementById('sample')?.hidden === true,
     emptyHidden: document.getElementById('empty')?.hidden,
+    options: [...document.querySelectorAll('#sample option')].map((o) => o.value).filter(Boolean),
   }));
   if (beforeLoad.sampleHidden) fail('the sample picker should be offered before a document is open');
   if (beforeLoad.emptyHidden !== false) fail('the empty state should be showing before a document is open');
-  await page.evaluate(() => {
-    const sel = document.getElementById('sample');
-    sel.value = '/sample-latex.pdf';
-    sel.dispatchEvent(new Event('change'));
-  });
+  if (!beforeLoad.options.includes(PUBLIC_EXAMPLE)) {
+    fail(`the picker should offer the public example ${PUBLIC_EXAMPLE}, got ${JSON.stringify(beforeLoad.options)}`);
+  }
+  const fixturesServed = beforeLoad.options.includes(FIXTURE);
+  const document_ = fixturesServed ? FIXTURE : PUBLIC_EXAMPLE;
+  if (!fixturesServed) console.log('  (no test fixtures served here - using the public example)');
+  await open(document_);
 
   await page.waitFor(
     () => {
@@ -207,7 +260,8 @@ try {
     fail(`stepping up from the start should land on fit width, got ${steppedUp.mode} (${steppedUp.box})`);
   }
   console.log(`start ${Math.round(startLevel.zoom * 100)}% (${startLevel.mode}) -> fit width ${Math.round(startLevel.fitWidth * 100)}%`);
-  // Back to the opening level, which is also what the screenshot should show.
+  // Back to the level a document opens at: the state everything below assumes,
+  // and the level the screenshot ends up showing.
   await page.evaluate(() => document.getElementById('zoom-out').click());
   await new Promise((r) => setTimeout(r, 500));
 
@@ -238,9 +292,6 @@ try {
     fail(`the outline changed the layout: zoom ${openOutline.zoom} -> ${reopened.zoom}, width ${openOutline.width} -> ${reopened.width}, page ${openOutline.pageBox} -> ${reopened.pageBox}`);
   }
 
-  await page.screenshot(out);
-  console.log('screenshot: ' + out);
-
   // Also check that switching pages works and unloads far-away pages.
   await page.evaluate(() => document.getElementById('next').click());
   await new Promise((r) => setTimeout(r, 1200));
@@ -261,82 +312,128 @@ try {
   if (after.slots > 4) fail(`virtualisation is keeping too many slots: ${after.slots}`);
 
   // ---------------------------------------------------------------- search
-  // "encoder" appears on all three pages of the sample (2/3/7). Typing is enough:
-  // like a browser's find bar the first match is boxed and jumped to with no
-  // Enter, and every match on the page is boxed, not just the active one.
-  console.log('— searching the document —');
-  for (const wait of [600, 1200]) {
-    await page.evaluate(() => document.getElementById('prev').click());
-    await new Promise((r) => setTimeout(r, wait));
-  }
-  await page.evaluate(() => {
-    const input = document.getElementById('search');
-    input.focus();
-    input.value = 'encoder';
-    input.dispatchEvent(new Event('input', { bubbles: true }));
-  });
-  const searchState = () =>
-    page.evaluate(() => {
-      const sr = document.getElementById('viewer').shadowRoot;
-      const page = document.getElementById('pageno').value;
-      const box = sr.querySelector(`.wpdf-page[data-page="${page}"]`);
-      return {
-        count: document.getElementById('search-count')?.textContent ?? '',
-        pageno: page,
-        highlights: sr.querySelectorAll('rect[data-wpdf-search]').length,
-        activeHighlights: sr.querySelectorAll('rect[data-wpdf-search="active"]').length,
-        // Boxes on the page we are looking at, active and inactive together.
-        bandsOnPage: box ? box.querySelectorAll('rect[data-wpdf-search]').length : 0,
-      };
+  // The checks below count matches in the fixture, which never changes. (The
+  // same search runs against the public example further down, where the exact
+  // numbers are the document's business, not ours.)
+  if (!fixturesServed) {
+    console.log('— skipping the search checks: they are written against the fixture —');
+  } else {
+    // "encoder" appears on all three pages of the sample (2/3/7). Typing is
+    // enough: like a browser's find bar the first match is boxed and jumped to
+    // with no Enter, and every match on the page is boxed, not just the active
+    // one.
+    console.log('— searching the document —');
+    for (const wait of [600, 1200]) {
+      await page.evaluate(() => document.getElementById('prev').click());
+      await new Promise((r) => setTimeout(r, wait));
+    }
+    await page.evaluate(() => {
+      const input = document.getElementById('search');
+      input.focus();
+      input.value = 'encoder';
+      input.dispatchEvent(new Event('input', { bubbles: true }));
     });
-  // The trailing ellipsis means the background indexer is still going.
-  await page.waitFor(() => /^\d+\/\d+$/.test(document.getElementById('search-count')?.textContent ?? ''), {
-    label: 'search results',
-    timeout: 60000,
-  });
-  const found = await searchState();
-  const total = Number(found.count.split('/')[1] ?? '0');
-  console.log('typed "encoder": ' + JSON.stringify(found));
-  if (!/^1\/\d+$/.test(found.count)) fail(`the first match should be selected without pressing Enter, got ${found.count}`);
-  if (total < 9) fail(`expected at least 9 matches for "encoder", got ${total}`);
-  if (found.pageno !== '1') fail(`expected to land on page 1, got ${found.pageno}`);
-  // Page 1 has two occurrences: both boxed, one of them active.
-  if (found.bandsOnPage !== 2) fail(`every match on the visible page should be boxed, got ${found.bandsOnPage}`);
-  if (found.activeHighlights !== 1) fail(`exactly one match should be the active one, got ${found.activeHighlights}`);
+    // The trailing ellipsis means the background indexer is still going.
+    await page.waitFor(() => /^\d+\/\d+$/.test(document.getElementById('search-count')?.textContent ?? ''), {
+      label: 'search results',
+      timeout: 60000,
+    });
+    const found = await searchState();
+    const total = Number(found.count.split('/')[1] ?? '0');
+    console.log('typed "encoder": ' + JSON.stringify(found));
+    if (!/^1\/\d+$/.test(found.count)) fail(`the first match should be selected without pressing Enter, got ${found.count}`);
+    if (total < 9) fail(`expected at least 9 matches for "encoder", got ${total}`);
+    if (found.pageno !== '1') fail(`expected to land on page 1, got ${found.pageno}`);
+    // Page 1 has two occurrences: both boxed, one of them active.
+    if (found.bandsOnPage !== 2) fail(`every match on the visible page should be boxed, got ${found.bandsOnPage}`);
+    if (found.activeHighlights !== 1) fail(`exactly one match should be the active one, got ${found.activeHighlights}`);
 
-  // Enter still means "next", not "first".
-  await page.evaluate(() => {
-    const input = document.getElementById('search');
-    input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
-  });
-  await new Promise((r) => setTimeout(r, 500));
-  const next = await searchState();
-  console.log('after Enter: ' + JSON.stringify(next));
-  if (next.count !== `2/${total}`) fail(`Enter should move to the second match, got ${next.count}`);
+    // Enter still means "next", not "first".
+    await page.evaluate(() => {
+      const input = document.getElementById('search');
+      input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+    });
+    await new Promise((r) => setTimeout(r, 500));
+    const next = await searchState();
+    console.log('after Enter: ' + JSON.stringify(next));
+    if (next.count !== `2/${total}`) fail(`Enter should move to the second match, got ${next.count}`);
 
-  for (let i = 0; i < 1; i++) {
     await page.evaluate(() => document.getElementById('search-next').click());
     await new Promise((r) => setTimeout(r, 500));
-  }
-  const jumped = await searchState();
-  console.log('after one more match: ' + JSON.stringify(jumped));
-  if (jumped.count !== `3/${total}`) fail(`expected match 3 of ${total}, got ${jumped.count}`);
-  if (jumped.pageno !== '2') fail(`the third match is on page 2, got ${jumped.pageno}`);
-  if (jumped.bandsOnPage < 1) fail('the matches on page 2 are not boxed');
-  if (jumped.activeHighlights !== 1) fail(`exactly one match should be active on page 2, got ${jumped.activeHighlights}`);
+    const jumped = await searchState();
+    console.log('after one more match: ' + JSON.stringify(jumped));
+    if (jumped.count !== `3/${total}`) fail(`expected match 3 of ${total}, got ${jumped.count}`);
+    if (jumped.pageno !== '2') fail(`the third match is on page 2, got ${jumped.pageno}`);
+    if (jumped.bandsOnPage < 1) fail('the matches on page 2 are not boxed');
+    if (jumped.activeHighlights !== 1) fail(`exactly one match should be active on page 2, got ${jumped.activeHighlights}`);
 
-  // Chrome's other habit: clearing the query clears the boxes.
+    // Chrome's other habit: clearing the query clears the boxes.
+    await page.evaluate(() => {
+      const input = document.getElementById('search');
+      input.value = '';
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+    });
+    await new Promise((r) => setTimeout(r, 400));
+    const cleared = await page.evaluate(() => ({
+      count: document.getElementById('search-count').textContent,
+      highlights: document.getElementById('viewer').shadowRoot.querySelectorAll('rect[data-wpdf-search]').length,
+    }));
+    if (cleared.highlights !== 0 || cleared.count !== '') fail(`clearing should remove the boxes, got ${JSON.stringify(cleared)}`);
+  }
+
+  // ------------------------------------------------------- the public example
+  // The shipped page has no documents of its own, so this is the path a reader
+  // takes: the example is downloaded from its public URL and rendered like any
+  // other file. arXiv serves it with `access-control-allow-origin: *`, which is
+  // what makes that possible without a proxy.
+  console.log('— opening the public example —');
+  await open(PUBLIC_EXAMPLE);
+  await page.waitFor(
+    () => {
+      const sr = document.getElementById('viewer')?.shadowRoot;
+      return !!sr && sr.querySelectorAll('svg.wpdf-page-svg').length > 0;
+    },
+    { label: 'example render', timeout: 120000 },
+  );
+  await new Promise((r) => setTimeout(r, 1500));
+  const remote = await page.evaluate(() => {
+    const sr = document.getElementById('viewer').shadowRoot;
+    const text = [...sr.querySelectorAll('svg text')].map((t) => t.textContent).join(' ');
+    return {
+      pages: document.getElementById('pagecount')?.textContent,
+      textElements: sr.querySelectorAll('svg text').length,
+      outline: document.querySelectorAll('#toc-body .toc-item').length,
+      title: document.title,
+      rendersInWorker: window.webpdf.viewer()?.rendersInWorker ?? null,
+      prose: /encoder/i.test(text),
+    };
+  });
+  console.log('example: ' + JSON.stringify(remote));
+  if (Number(remote.pages) < 5) fail(`the example should be a real multi-page paper, got ${remote.pages} pages`);
+  if (remote.textElements < 20) fail(`the example rendered almost no text (${remote.textElements} elements)`);
+  if (!remote.prose) fail('the rendered page 1 of the example has no recognisable prose');
+  if (remote.outline < 5) fail(`the example's outline did not populate (${remote.outline} entries)`);
+  // A document that is not the fixture must still be a document we can open.
+  if (remote.rendersInWorker !== true) fail('the example did not render in the worker');
+  if (!remote.title) fail('the example did not set a document title');
+
+  // The same find bar, on a document nobody wrote for this test.
   await page.evaluate(() => {
     const input = document.getElementById('search');
-    input.value = '';
+    input.value = '3';
     input.dispatchEvent(new Event('input', { bubbles: true }));
   });
-  await new Promise((r) => setTimeout(r, 400));
-  const cleared = await page.evaluate(() => ({
-    count: document.getElementById('search-count').textContent,
-    highlights: document.getElementById('viewer').shadowRoot.querySelectorAll('rect[data-wpdf-search]').length,
-  }));
-  if (cleared.highlights !== 0 || cleared.count !== '') fail(`clearing should remove the boxes, got ${JSON.stringify(cleared)}`);
+  await page.waitFor(() => /^\d+\/\d+$/.test(document.getElementById('search-count')?.textContent ?? ''), {
+    label: 'example search results',
+    timeout: 60000,
+  });
+  const remoteHits = await searchState();
+  console.log('example search: ' + JSON.stringify(remoteHits));
+  if (!/^1\/\d+$/.test(remoteHits.count)) fail(`the first example match should be selected, got ${remoteHits.count}`);
+  if (remoteHits.bandsOnPage < 1) fail('the example matches are not boxed');
+  if (remoteHits.activeHighlights !== 1) fail(`exactly one example match should be active, got ${remoteHits.activeHighlights}`);
+
+  await shot(out);
 } finally {
   await page.close();
   await browser.close();

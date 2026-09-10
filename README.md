@@ -10,7 +10,7 @@ const viewer = await createViewer({ container: '#viewer', source: file });
 viewer.setZoom('fit-width');
 ```
 
-![the demo: a LaTeX paper rendered as SVG with its real fonts, its outline floating on the left, and a search hit highlighted](docs/demo.png)
+![the demo: a paper downloaded from arXiv, rendered as SVG with its real fonts, its outline floating on the left, and every match of a search boxed](docs/demo.png)
 
 ---
 
@@ -63,8 +63,9 @@ SVG with real text, plus outlines kept for whatever could not be converted
   verification suite measures this: **100.00% of the reference ink is
   reproduced**, within a one-pixel neighbourhood.
 * **Type 1 is not a special case.** A PFB is simply a font whose outlines MuPDF
-  read for us. The demo's sample PDF embeds five `/FontFile` Type 1 fonts and
-  converts all of them.
+  read for us. The LaTeX paper the tests render embeds five `/FontFile` Type 1
+  fonts and converts all of them - as does the pdfTeX paper the demo opens from
+  arXiv.
 * **Positioning comes from MuPDF.** MuPDF writes one `x` (and `y`) value per
   character, so the browser never has to agree with us about advances, kerning
   or shaping. The transform maths is exact:
@@ -106,7 +107,7 @@ older, larger, still-correct representation.
 
 ## Results
 
-Measured on the bundled samples, page 1:
+Measured on the test fixtures, page 1:
 
 | document | outline SVG | with real text | glyphs as text | fonts (WOFF) |
 | --- | --- | --- | --- | --- |
@@ -115,7 +116,7 @@ Measured on the bundled samples, page 1:
 | Manual, 3 pages, non-embedded base-14 | 454 KB | 68 KB (**15%**) | 3045 / 3045 | 27 KB |
 
 Ink coverage of the text render against MuPDF's own outline render: **100.000%**
-(page 1 of the LaTeX sample), 99.5–99.9% across the other pages tested. The
+(page 1 of the LaTeX fixture), 99.5–99.9% across the other pages tested. The
 residue is antialiasing and stem darkening, not missing or misplaced glyphs.
 
 ---
@@ -199,6 +200,14 @@ page rendered either side of the viewport):
 is deliberately thin, because everything about the pages' zoom belongs to the
 viewer:
 
+* **The example documents are fetched, not shipped.** Every entry in the picker is
+  a public URL - the first is *Attention Is All You Need* on arXiv, a pdfTeX paper
+  whose Type 1 fonts are exactly the case this library exists for. A published page
+  therefore carries no PDFs at all: the browser downloads the example from whoever
+  hosts it (arXiv serves it with `access-control-allow-origin: *`, so no proxy of
+  ours sits in the middle) and opens it like any other file. The two PDFs under
+  `tests/fixtures` are only *offered* on a local origin, where the dev and preview
+  servers serve them for the test suite; no build contains them.
 * **One bar, no status bar.** Messages float in a toast instead, so the pages own
   every pixel below the bar and there is no chrome pretending to stay put while
   the browser magnifies the document.
@@ -316,9 +325,13 @@ src/
     layout.ts               page geometry + visible-range maths
     viewer.ts               virtualised scrolling viewer (browser-owned pinch)
 demo/                       the demo application
+  examples.ts               the public URLs the demo offers, and the fixtures
 tests/
   *.test.ts                 Node tests (real PDFs through the real wasm)
+  fixtures/                 the PDFs the tests render; served only in dev
   browser/                  headless-Chromium verification over CDP
+scripts/
+  no-jekyll.mjs             marks the Pages artifact as pre-built
 ```
 
 Rendering never touches the DOM, which is why the same `PdfEngine` runs inline,
@@ -332,15 +345,32 @@ npm run dev          # demo on http://127.0.0.1:5173
 npm test             # Node tests: font pipeline over real PDFs
 npm run test:browser # builds the demo, serves it, verifies in headless Chromium
 npm run verify       # typecheck + both test suites
+npm run build:pages  # the published site, in dist/demo
 ```
 
 The browser suite is the interesting one. It renders each page twice — once as
 MuPDF outlines, once through the text upgrade — rasterises both, and reports how
 much of the reference ink the text render covers. It needs a Chromium binary;
-set `$CHROMIUM` if it is not at `/usr/bin/chromium`.
+set `$CHROMIUM` if it is not at `/usr/bin/chromium`. It also needs the network:
+the last thing it does is open the public example, because that is what a reader
+of the published page does.
 
 `tests/browser/diff.mjs` produces a red/green difference map for human eyes:
 overlapping ink is yellow, so any systematic offset or missing glyph is obvious.
+
+### Publishing
+
+`.github/workflows/pages.yml` typechecks, builds `dist/demo` and deploys it with
+`actions/deploy-pages` on every push to `main` (and on demand from the Actions
+tab). It deliberately does **not** run the test suites: rendering a paper and
+rasterising pages is a fine thing to do on a developer's machine and a poor gate
+between a commit and the published site.
+
+Pages has to be set to **Source: GitHub Actions** in the repository settings —
+there is no `gh-pages` branch and nothing to commit back to the repository. The
+site is served from the repository's own path (`…github.io/webPDF/`), which is
+why the demo derives its base from its own module URL and every asset Vite emits
+is referenced relatively.
 
 ---
 
