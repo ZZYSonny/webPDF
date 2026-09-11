@@ -173,6 +173,14 @@ async function connect(wsUrl) {
     send,
     evaluate,
     consoleMessages,
+    /** Subscribe to raw CDP events: `page.on('Tracing.dataCollected', (params) => …)`. */
+    on(method, handler) {
+      const listener = (msg) => {
+        if (msg.method === method) handler(msg.params);
+      };
+      listeners.add(listener);
+      return () => listeners.delete(listener);
+    },
     async goto(url, { timeout = 60000 } = {}) {
       const done = new Promise((resolve) => {
         const l = (msg) => {

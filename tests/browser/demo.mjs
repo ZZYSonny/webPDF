@@ -38,6 +38,27 @@ const page = await browser.newPage();
 await page.setViewport(1440, 900);
 
 /**
+ * Every `@font-face` the document is told about, from before it boots.
+ *
+ * Registering a face is not a no-op: the font set of the document changes and
+ * the browser lays out every text run in it again - every page currently
+ * rendered, not just the page the face belongs to. A page carries the faces it
+ * needs whether they are new or not, so the same family must never be
+ * registered twice.
+ */
+await page.send('Page.addScriptToEvaluateOnNewDocument', {
+  source: `(() => {
+    window.__faces = [];
+    const insertRule = CSSStyleSheet.prototype.insertRule;
+    CSSStyleSheet.prototype.insertRule = function (rule, index) {
+      const m = /@font-face\\s*\\{[^}]*font-family:\\s*'([^']+)'/.exec(String(rule));
+      if (m) window.__faces.push(m[1]);
+      return insertRule.call(this, rule, index);
+    };
+  })();`,
+});
+
+/**
  * Open one of the example papers, from the dropdown on the empty card. The
  * value is embedded in the expression because `page.evaluate(fn, args)` takes
  * evaluation options as its second argument, not arguments for the function.
@@ -430,24 +451,123 @@ try {
     fail(`the outline changed the layout: zoom ${openOutline.zoom} -> ${reopened.zoom}, width ${openOutline.width} -> ${reopened.width}, page ${openOutline.pageBox} -> ${reopened.pageBox}`);
   }
 
-  // Also check that switching pages works and unloads far-away pages.
+  // Paging works, the window is wider than the viewport, and pages far outside
+  // it are unloaded. The window is deliberately not "the visible pages": a page
+  // is rendered a viewport before it is read, so that arriving at it is free.
   await page.evaluate(() => window.webpdf.viewer().nextPage());
   await new Promise((r) => setTimeout(r, 1200));
   await page.evaluate(() => window.webpdf.viewer().nextPage());
   await new Promise((r) => setTimeout(r, 1200));
   const after = await page.evaluate(() => {
     const sr = document.getElementById('viewer').shadowRoot;
+    const chrome = document.querySelector('.topbar')?.offsetHeight ?? 0;
+    const slots = [...sr.querySelectorAll('.wpdf-page')].map((el) => {
+      const r = el.getBoundingClientRect();
+      return {
+        page: Number(el.dataset.page),
+        rendered: !!el.querySelector('svg'),
+        // How far outside the viewport this page is, in viewport heights.
+        away: r.bottom < chrome ? (chrome - r.bottom) / innerHeight : r.top > innerHeight ? (r.top - innerHeight) / innerHeight : 0,
+      };
+    });
     return {
       pageno: document.getElementById('pageno').value,
-      slots: sr.querySelectorAll('.wpdf-page').length,
-      rendered: sr.querySelectorAll('svg.wpdf-page-svg').length,
-      pages: [...sr.querySelectorAll('.wpdf-page')].map((e) => e.dataset.page),
+      slots: slots.length,
+      rendered: slots.filter((s) => s.rendered).length,
+      pages: slots.map((s) => s.page),
+      visible: slots.filter((s) => s.away === 0).map((s) => s.page),
+      outside: slots.filter((s) => s.away > 0),
+      // What the viewer thinks it has in hand but has not put on screen.
+      prepared: window.webpdf.viewer().preparedPages,
     };
   });
   console.log('after paging: ' + JSON.stringify(after));
   if (after.pageno !== '3') fail(`expected page 3, got ${after.pageno}`);
+  if (!after.visible.includes(3)) fail(`page 3 is not in the viewport: ${JSON.stringify(after.visible)}`);
   if (after.rendered < 1) fail('page 3 did not render');
-  if (after.slots > 4) fail(`virtualisation is keeping too many slots: ${after.slots}`);
+  if (after.outside.length === 0) fail('the window does not reach past the viewport, so a page is rendered only once it is being read');
+  // Every slot is within a couple of pages of the viewport: the window is
+  // bounded, so a long document does not accumulate pages.
+  if (after.slots > 8) fail(`virtualisation is keeping too many slots: ${after.slots}`);
+  if (after.pages.includes(10)) fail(`a page nowhere near the reader is still in the DOM: ${JSON.stringify(after.pages)}`);
+  // And while the reader sits still, the pages just past the window are
+  // rendered too - the work that would have been done on the way to them.
+  const ahead = after.prepared.filter((p) => p > Math.max(...after.pages));
+  if (ahead.length === 0) fail(`nothing beyond the window was prepared while the reader was at rest: ${JSON.stringify(after.prepared)}`);
+
+  /**
+   * A scroll defers what the reader is not looking at.
+   *
+   * Jumping a long way and then scrolling continuously is the case the whole
+   * mechanism exists for: pages are being rendered while the reader moves, and
+   * putting one in the document costs a frame - and registering the fonts it
+   * brings costs a layout of every page already rendered. So a page that is
+   * ready but not being looked at waits for the scroll to stop; a page the
+   * reader is looking at (or one page away from it) goes in regardless, because
+   * a blank page is worse than a dropped frame.
+   */
+  console.log('— a scroll defers what is not being looked at —');
+  await page.evaluate(() => window.webpdf.viewer().goToPage(3));
+  await new Promise((r) => setTimeout(r, 1500));
+  const seen = [];
+  for (let i = 0; i < 40; i++) {
+    // Part way in, everything on screen is thrown away and has to be rendered
+    // again while the reader is still moving - which is the case the deferral
+    // exists for. (A mode change is the honest way to cause it: it is what a
+    // reader does to a document that is already in front of them.)
+    if (i === 4) await page.evaluate(() => window.webpdf.viewer().setBionic(true, 0.5));
+    await page.send('Input.dispatchMouseEvent', {
+      type: 'mouseWheel',
+      x: 640,
+      y: 500,
+      deltaX: 0,
+      deltaY: 25,
+      pointerType: 'mouse',
+    });
+    await new Promise((r) => setTimeout(r, 16));
+    seen.push(
+      await page.evaluate(() => {
+        const sr = document.getElementById('viewer').shadowRoot;
+        const prepared = new Set(window.webpdf.viewer().preparedPages);
+        const waiting = [];
+        for (const el of sr.querySelectorAll('.wpdf-page')) {
+          if (el.querySelector('svg')) continue;
+          const page = Number(el.dataset.page);
+          const r = el.getBoundingClientRect();
+          // Looking at it, or one page away from it, which is where the haste
+          // rule applies.
+          const looked = r.bottom >= -r.height && r.top <= innerHeight + r.height;
+          if (prepared.has(page)) waiting.push({ page, looked });
+        }
+        return waiting;
+      }),
+    );
+  }
+  const deferred = seen.flat();
+  const deferredFar = deferred.filter((w) => !w.looked);
+  const readyButBlank = deferred.filter((w) => w.looked);
+  console.log(
+    'during the scroll: ' +
+      JSON.stringify({
+        samples: seen.length,
+        deferred: deferredFar.length,
+        deferredPages: [...new Set(deferredFar.map((w) => w.page))],
+        readyButBlank,
+      }),
+  );
+  if (deferredFar.length === 0) fail('a page that was rendered during a scroll went in immediately, so nothing was deferred');
+  if (readyButBlank.length) fail(`a page that was ready was left blank while the reader was looking at it: ${JSON.stringify(readyButBlank)}`);
+  // Once the scroll stops, everything in the window is in the document - and
+  // the mode that forced the renders is turned back off.
+  await new Promise((r) => setTimeout(r, 1500));
+  await page.evaluate(() => window.webpdf.viewer().setBionic(false));
+  await new Promise((r) => setTimeout(r, 1500));
+  const blank = await page.evaluate(`(() => {
+    const sr = document.getElementById('viewer').shadowRoot;
+    return [...sr.querySelectorAll('.wpdf-page')].filter((el) => !el.querySelector('svg')).map((el) => Number(el.dataset.page));
+  })()`);
+  console.log('after the scroll settles, blank pages in the window: ' + JSON.stringify(blank));
+  if (blank.length) fail(`pages were left blank after the scroll stopped: ${JSON.stringify(blank)}`);
 
   // ---------------------------------------------------------------- search
   // The checks below count matches in the cached paper, which never changes.
@@ -838,6 +958,20 @@ try {
       return status.startsWith('Cropping') ? false : status;
     })()`,
     'the crop to finish measuring',
+    60000,
+  );
+  // Measuring finishing is not the same moment as the page in front of the
+  // reader being redrawn through the new window: the pages are re-rendered as
+  // their boxes arrive, and the reader's own page is last in the queue only
+  // because everything else had to be measured first.
+  await waitUntil(
+    `(() => {
+      const shown = document.getElementById('pageno').value;
+      const svg = document.getElementById('viewer').shadowRoot.querySelector('.wpdf-page[data-page="' + shown + '"] svg');
+      const viewBox = svg?.getAttribute('viewBox') ?? '';
+      return viewBox && !viewBox.startsWith('0 0 ') ? viewBox : false;
+    })()`,
+    'the page in front of the reader to be redrawn cropped',
     60000,
   );
   const cropped = await cropState();
@@ -1365,6 +1499,40 @@ try {
     'the page and the text to come back',
     60000,
   );
+
+  // ------------------------------------------------------------- the fonts
+  /**
+   * A face is registered once and never again.
+   *
+   * This is the cost that used to land on a page boundary: a page brings its
+   * `@font-face` rules with it every time it is rendered, and handing the same
+   * family to the document a second time makes the browser lay out every text
+   * run on every page already rendered - a whole-viewport re-layout in the frame
+   * where a new page arrives. Whatever the reader has done by now - jumped,
+   * cropped, faded, scrolled - not one family may appear twice.
+   */
+  console.log('— fonts are registered once —');
+  const facesBefore = await page.evaluate('window.__faces.slice()');
+  await page.evaluate(() => window.webpdf.viewer().setBionic(true, 0.4));
+  await new Promise((r) => setTimeout(r, 1500));
+  await page.evaluate(() => window.webpdf.viewer().setBionic(false));
+  await new Promise((r) => setTimeout(r, 1500));
+  const facesAfter = await page.evaluate('window.__faces.slice()');
+  const count = (list) => {
+    const byFamily = new Map();
+    for (const family of list) byFamily.set(family, (byFamily.get(family) ?? 0) + 1);
+    return byFamily;
+  };
+  const byFamily = count(facesAfter);
+  const repeated = [...byFamily].filter(([, n]) => n > 1);
+  console.log(
+    'fonts: ' + JSON.stringify({ registered: facesAfter.length, distinct: byFamily.size, repeated: repeated.length, afterRedraw: facesAfter.length - facesBefore.length }),
+  );
+  if (facesAfter.length === 0) fail('no font face was registered at all, so the pages are not drawn with the fonts they were built with');
+  if (repeated.length) fail(`the same font face was registered more than once: ${JSON.stringify(repeated.slice(0, 4))}`);
+  if (facesAfter.length !== facesBefore.length) {
+    fail(`re-rendering the pages registered ${facesAfter.length - facesBefore.length} more font faces (they were already known)`);
+  }
 
   // ------------------------------------------------------------- the bar
   /**

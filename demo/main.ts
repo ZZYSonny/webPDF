@@ -217,6 +217,10 @@ async function ensureViewer(): Promise<PdfViewer> {
     zoomSteps: DEFAULT_ZOOM_STEPS,
     gap: 16,
     padding: 18,
+    // Pages either side of the viewport that stay in the document. The window
+    // itself is a viewport wider than that on each side, and the pages just past
+    // it are rendered while the reader is at rest, so that turning a page costs
+    // neither a render nor a font registration - see the README.
     keepPages: 1,
     shadowDom: true,
     // Read at each scroll rather than captured, so chrome that changes height

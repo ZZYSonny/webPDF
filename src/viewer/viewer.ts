@@ -27,9 +27,25 @@
  *  - Because the browser scales the whole document, chrome drawn next to the
  *    pages is magnified too (and can pan out of view). Hosts that want fixed
  *    chrome should hide it while `zoomed` is true on `zoom-change` events.
+ *
+ * Windowing is wider than the viewport on purpose, and what is *put in the
+ * document* is not the same as what is *rendered*:
+ *
+ *  - Pages are rendered for a window that reaches a whole viewport past the
+ *    viewport on each side, so a page is drawn well before it is looked at.
+ *  - A finished page is inserted into the DOM at a quiet moment rather than the
+ *    moment it arrives. Inserting 100-300 kB of SVG in the middle of a scroll
+ *    costs a frame, and - worse - a page brings `@font-face` rules with it, and
+ *    registering a face makes the browser lay out *every text run in the
+ *    document* again. That is what used to flash and stutter at a page
+ *    boundary. A page the reader is looking at, or is one page away from, still
+ *    goes in straight away: a hitch is better than a blank page.
+ *  - While the pipeline is idle, pages just past the window are rendered too -
+ *    work that would have been done on the way to them anyway. Their faces are
+ *    registered and their SVG is kept, so arriving at them costs nothing.
  */
 
-import type { DocumentInfo, PdfEngineLike, PdfSource, RenderOptions } from '../core/engine.ts';
+import type { DocumentInfo, PdfEngineLike, PdfSource, RenderOptions, RenderedPage } from '../core/engine.ts';
 import type { FontAsset } from '../core/font/registry.ts';
 import { linkTargetOf, type LinkTarget } from '../core/links.ts';
 import { debug as DEBUG } from '../core/debug.ts';
@@ -40,6 +56,7 @@ import {
   PageLayout,
   type LayoutOptions,
   type PageGeometry,
+  type Viewport,
   type ZoomMode,
 } from './layout.ts';
 
@@ -58,6 +75,12 @@ export type ViewerEvent =
       /** True while the browser is magnifying the page. */
       zoomed: boolean;
     }
+  /**
+   * A page has been rendered. It is not necessarily in the document yet: a page
+   * the reader is not near goes in at the next quiet moment, and either way the
+   * pages in hand are listed by `preparedPages` (`pageElement` is null until the
+   * page is actually inserted).
+   */
   | { type: 'render'; page: number; ms: number; asText: number; asOutlines: number; spaces: number }
   /**
    * Cropping advanced: `measured` of `total` pages have a box. A crop changes
@@ -93,6 +116,20 @@ export interface PdfViewerOptions {
   columns?: 1 | 2;
   /** How many pages beyond the viewport stay rendered, on each side. */
   keepPages?: number;
+  /**
+   * How far past the viewport the rendered window reaches, in viewport heights
+   * on each side, on top of `keepPages`. Default 1, which is the distance that
+   * gives a page time to be drawn before it is looked at; 0 narrows the window
+   * to the pages `keepPages` names (and is only worth it on a device where
+   * keeping a page or two more in memory is the binding constraint).
+   */
+  overscanViewports?: number;
+  /**
+   * Pages past the window to render while the pipeline has nothing else to do,
+   * so that arriving at them costs neither a render nor a font registration.
+   * Default 3; 0 renders nothing ahead.
+   */
+  prepareAhead?: number;
   /** Simultaneous page renders. 1 keeps scrolling smoothest on the main thread. */
   concurrency?: number;
   /**
@@ -131,15 +168,16 @@ interface PageSlot {
   index: number;
   el: HTMLDivElement;
   svg: Element | null;
-  state: 'empty' | 'queued' | 'rendering' | 'done';
-  /** Bumped whenever the slot is recycled, so late results are discarded. */
-  generation: number;
+  /** `empty`: nothing asked for yet. `pending`: asked for, not on screen. `done`: in the DOM. */
+  state: 'empty' | 'pending' | 'done';
 }
 
 interface QueueEntry {
   index: number;
   priority: number;
   seq: number;
+  /** The generation the render was asked for, so a stale answer is dropped. */
+  generation: number;
 }
 
 /**
@@ -160,6 +198,19 @@ interface HistoryState {
 }
 
 const DEFAULT_KEEP = 1;
+
+/**
+ * How long the view has to be still before deferred work runs. Long enough that
+ * the pause between two wheel notches does not count as stopping, short enough
+ * that the work is done before the reader has finished deciding to read on.
+ */
+const SETTLE_MS = 150;
+
+/** Pages past the window prepared while the pipeline has nothing else to do. */
+const PREPARE_AHEAD = 3;
+
+/** Priority of work that is only being done early. Below every page on screen. */
+const WARM_PRIORITY = 100;
 
 /**
  * Zoom presets: Ctrl+= and Ctrl+- walk this list, and hosts that render their own
@@ -207,7 +258,30 @@ export class PdfViewer {
   private readonly fontStyleEl: HTMLStyleElement | null;
   private readonly slots = new Map<number, PageSlot>();
   private readonly queue: QueueEntry[] = [];
-  private readonly inFlight = new Set<number>();
+  private readonly inFlight = new Map<number, number>();
+  /**
+   * Pages that have been rendered, keyed by index, whether or not they are in
+   * the DOM. A page here can be put on screen without asking the engine for
+   * anything; one that is past the window is simply waiting its turn.
+   */
+  private readonly results = new Map<number, RenderedPage>();
+  /** Faces built but not in the stylesheet yet, keyed by family. */
+  private readonly stagedFonts = new Map<string, FontAsset>();
+  /** Families already in the stylesheet. A face is registered once, ever. */
+  private readonly insertedFonts = new Set<string>();
+  /** Per-index render generation, bumped when what is on screen is wrong. */
+  private readonly generations = new Map<number, number>();
+  /** The window the last tick asked for: index -> priority. */
+  private window = new Map<number, number>();
+  /** Pages actually intersecting the viewport, as of the last tick. */
+  private visible: Viewport = { start: 0, end: 0 };
+  /** When the view last moved: what tells a scroll in flight from a pause. */
+  private lastMoveAt = 0;
+  private lastOffset = -1;
+  private settleTimer = 0;
+  private flushFrame = 0;
+  /** The window the engine was last told to keep; it is only told when it moves. */
+  private trimKey = '';
 
   private info: DocumentInfo | null = null;
   /** The pages as the document has them, whatever crop is in force. */
@@ -259,6 +333,8 @@ export class PdfViewer {
       padding: opts.padding ?? 16,
       columns: opts.columns ?? 1,
       keepPages: opts.keepPages ?? DEFAULT_KEEP,
+      overscanViewports: Math.max(0, opts.overscanViewports ?? 1),
+      prepareAhead: Math.max(0, Math.round(opts.prepareAhead ?? PREPARE_AHEAD)),
       concurrency: opts.concurrency ?? 1,
       shadowDom: opts.shadowDom ?? false,
       scrollMargin: opts.scrollMargin ?? 0,
@@ -366,6 +442,12 @@ export class PdfViewer {
     this.cropRunning = false;
     this.applyCropGeometry();
     this.clearSlots();
+    this.results.clear();
+    this.stagedFonts.clear();
+    this.generations.clear();
+    this.window = new Map();
+    this.lastOffset = -1;
+    this.trimKey = '';
     // A newly opened document starts at the level the `zoom` option asks for,
     // whatever the previous document was left at - and the mode has to say so, or
     // a fit level would stop re-fitting on a container resize.
@@ -730,18 +812,27 @@ export class PdfViewer {
     });
   }
 
-  /** Drop a rendered page, so it is rendered again through the current crop. */
+  /**
+   * Throw away what is on screen for a page, and anything rendered for it that
+   * has not been put there yet. Bumping the generation first is what makes a
+   * render already in flight harmless when it lands.
+   */
   private invalidateSlot(index: number): void {
+    this.generations.set(index, this.generationOf(index) + 1);
+    this.results.delete(index);
     const slot = this.slots.get(index);
-    if (!slot || slot.state === 'empty') return;
-    slot.generation++;
+    if (!slot) return;
     slot.el.innerHTML = '';
     slot.svg = null;
     slot.state = 'empty';
   }
 
   private invalidateAll(): void {
-    for (const index of [...this.slots.keys()]) this.invalidateSlot(index);
+    for (const index of new Set([...this.slots.keys(), ...this.results.keys()])) this.invalidateSlot(index);
+  }
+
+  private generationOf(index: number): number {
+    return this.generations.get(index) ?? 0;
   }
 
   private emitCrop(done: boolean): void {
@@ -851,6 +942,15 @@ export class PdfViewer {
     return this.slots.get(page - 1)?.svg ?? null;
   }
 
+  /**
+   * The pages the viewer has rendered and is holding, in page order - on screen
+   * or waiting to be. Everything here can be put in front of the reader without
+   * asking the engine for anything, which is what makes a page turn free.
+   */
+  get preparedPages(): number[] {
+    return [...this.results.keys()].sort((a, b) => a - b).map((index) => index + 1);
+  }
+
   /** Serialised SVG for a page. Renders it on demand. */
   async exportSvg(page: number): Promise<string> {
     const rendered = await this.engine.renderPage(page - 1, {
@@ -914,7 +1014,7 @@ export class PdfViewer {
       const el = document.createElement('div');
       el.className = 'wpdf-page';
       el.dataset.page = String(index + 1);
-      const s: PageSlot = { index, el, svg: null, state: 'empty', generation: 0 };
+      const s: PageSlot = { index, el, svg: null, state: 'empty' };
       slot = s;
       this.slots.set(index, slot);
       this.pagesEl.appendChild(el);
@@ -922,10 +1022,15 @@ export class PdfViewer {
     return slot;
   }
 
+  /**
+   * Forget the element for a page, not the page: what was rendered for it stays
+   * in `results`, so scrolling back to it costs a DOM insert rather than a
+   * render. A render still in flight for it is left to land - it will be kept
+   * as a prepared page.
+   */
   private removeSlot(index: number): void {
     const slot = this.slots.get(index);
     if (!slot) return;
-    slot.generation++;
     slot.el.remove();
     this.slots.delete(index);
   }
@@ -1003,14 +1108,26 @@ export class PdfViewer {
     const offset = this.scrollOffset();
     const viewportHeight = window.innerHeight || 1;
     const visible = this.layout.visibleRange(offset, viewportHeight, 0);
+    // The window reaches a whole viewport past the viewport unless the host says
+    // otherwise, so a page is rendered - and its fonts registered - while it is
+    // still a screen away from being read.
+    const overscan = this.opt.overscanViewports * viewportHeight;
+    const wide = overscan > 0 ? this.layout.visibleRange(offset, viewportHeight, overscan) : visible;
     const keep = this.opt.keepPages;
+    this.visible = visible;
 
     const wanted = new Map<number, number>(); // index -> priority
-    const first = Math.max(0, visible.start - keep);
-    const last = Math.min(this.geometry.length - 1, visible.end + keep);
+    // The widened range contains the visible one except where either fell back
+    // to the nearest page, so the window is the union of the two.
+    const first = Math.max(0, Math.min(visible.start, wide.start) - keep);
+    const last = Math.min(this.geometry.length - 1, Math.max(visible.end, wide.end) + keep);
     for (let i = first; i <= last; i++) {
-      wanted.set(i, i >= visible.start && i <= visible.end ? 0 : 1);
+      // On screen goes first; otherwise the page that will be reached soonest
+      // is the one worth having ready.
+      const distance = i < visible.start ? visible.start - i : i > visible.end ? i - visible.end : 0;
+      wanted.set(i, distance);
     }
+    this.window = wanted;
 
     for (const index of [...this.slots.keys()]) {
       if (!wanted.has(index)) this.removeSlot(index);
@@ -1019,37 +1136,184 @@ export class PdfViewer {
     for (const [index, priority] of wanted) {
       const slot = this.ensureSlot(index);
       this.positionSlot(slot);
-      if (slot.state === 'empty') this.enqueue(index, priority);
-      else if (slot.state === 'queued') this.bumpPriority(index, priority);
+      if (slot.state === 'done') continue;
+      // A page that has already been rendered only has to be put in; one that
+      // has not must be asked for.
+      if (this.results.has(index)) this.consider(index);
+      else this.enqueue(index, priority);
     }
 
     // Re-position slots affected by a layout change even when not re-created.
     for (const slot of this.slots.values()) this.positionSlot(slot);
 
-    this.engine.trimCaches?.([...wanted.keys()]);
+    // The engine is told what to keep only when the window actually moves: it is
+    // a message to another thread, and it releases pages, which costs work.
+    const trimKey = [...wanted.keys()].join(',');
+    if (trimKey !== this.trimKey) {
+      this.trimKey = trimKey;
+      this.engine.trimCaches?.([...wanted.keys()]);
+    }
 
     const page = this.layout.currentPage(offset, viewportHeight) + 1;
     if (page !== this.currentPage) {
       this.currentPage = page;
       this.emit({ type: 'page-change', page, pageCount: this.geometry.length });
     }
+    // A tick that finds the view somewhere new is the reader moving. This is
+    // what "scrolling" means below: not a `scroll` event, but the view having
+    // actually moved within the last `SETTLE_MS`.
+    if (offset !== this.lastOffset) {
+      this.lastOffset = offset;
+      this.lastMoveAt = performance.now();
+      clearTimeout(this.settleTimer);
+      this.settleTimer = 0;
+    }
     this.pump();
+    this.scheduleFlush();
+  }
+
+  /* -------------------------------------------------- window and document */
+
+  /** True while the view is still moving: deferred work has to wait. */
+  private scrolling(): boolean {
+    return performance.now() - this.lastMoveAt < SETTLE_MS;
+  }
+
+  /**
+   * Whether a page has to be on screen whatever else is going on: it is in the
+   * viewport, or next to it. A page this close is looked at within a flick, so
+   * it goes in the moment it is ready - a frame's work is better than a blank
+   * page - while everything further out waits for the scroll to stop.
+   */
+  private aboutToBeSeen(index: number): boolean {
+    return index >= this.visible.start - 1 && index <= this.visible.end + 1;
+  }
+
+  /**
+   * Put a rendered page on screen, now if the moment is right and later if not.
+   * A page outside the window keeps its faces staged, which the next quiet
+   * moment registers: that is what makes the page free when it is reached.
+   */
+  private consider(index: number): void {
+    const slot = this.slots.get(index);
+    if (!slot || !this.window.has(index)) {
+      this.scheduleFlush();
+      return;
+    }
+    if (slot.state === 'done') return;
+    if (!this.scrolling() || this.aboutToBeSeen(index)) this.insert(slot, index);
+    else {
+      slot.state = 'pending';
+      this.scheduleFlush();
+    }
+  }
+
+  /** Insert a rendered page into its slot. Faces go first, and always in one write. */
+  private insert(slot: PageSlot, index: number): void {
+    const page = this.results.get(index);
+    if (!page) return;
+    this.releaseFonts();
+    slot.el.innerHTML = page.svg;
+    slot.svg = slot.el.firstElementChild;
+    slot.state = 'done';
+    this.positionSlot(slot);
+  }
+
+  /**
+   * The quiet moment: put in whatever the reader has stopped in front of, and
+   * prepare what is coming. One page per frame, because each one is a parse and
+   * a paint of a whole page - being idle is not a reason to drop frames.
+   */
+  private flush(): void {
+    if (this.destroyed) return;
+    if (this.scrolling()) {
+      this.scheduleFlush();
+      return;
+    }
+    // Any face built since the last write goes in now, all of them at once:
+    // registering a face costs a layout of every text run in the document
+    // however many rules arrive together, so they may as well arrive together.
+    this.releaseFonts();
+
+    const waiting = this.waitingPages();
+    if (waiting.length > 0) {
+      const index = waiting[0];
+      const slot = this.slots.get(index);
+      if (slot) this.insert(slot, index);
+      this.flushFrame = requestAnimationFrame(() => {
+        this.flushFrame = 0;
+        this.flush();
+      });
+      return;
+    }
+    this.warmAhead();
+  }
+
+  /** Pages in the window that are rendered but not in the document yet, nearest first. */
+  private waitingPages(): number[] {
+    const out: number[] = [];
+    for (const index of this.window.keys()) {
+      const slot = this.slots.get(index);
+      if (slot && slot.state !== 'done' && this.results.has(index)) out.push(index);
+    }
+    return out.sort((a, b) => (this.window.get(a) ?? 0) - (this.window.get(b) ?? 0));
+  }
+
+  private scheduleFlush(): void {
+    if (this.settleTimer || this.destroyed) return;
+    this.settleTimer = window.setTimeout(() => {
+      this.settleTimer = 0;
+      this.flush();
+    }, SETTLE_MS);
+  }
+
+  /**
+   * Render the pages just past the window while the pipeline has nothing else to
+   * do. None of this is extra work - those pages would be rendered on the way to
+   * them - and doing it now means their fonts are registered and their SVG is in
+   * hand before the reader arrives, which is the whole point: what a page costs
+   * is paid while nobody is waiting for it.
+   */
+  private warmAhead(): void {
+    if (this.queue.length > 0 || this.inFlight.size > 0) return;
+    let last = -1;
+    for (const index of this.window.keys()) last = Math.max(last, index);
+    if (last < 0) return;
+    for (let i = last + 1; i <= last + this.opt.prepareAhead && i < this.geometry.length; i++) {
+      if (this.results.has(i)) continue;
+      this.enqueue(i, WARM_PRIORITY);
+    }
+    this.pump();
+  }
+
+  /** Keep the cache to the pages around the reader; the far-away ones go first. */
+  private trimResults(): void {
+    const limit = this.opt.prepareAhead + this.opt.keepPages + 4;
+    if (this.results.size <= limit) return;
+    const centre = Math.max(0, this.currentPage - 1);
+    for (const index of [...this.results.keys()].sort((a, b) => Math.abs(b - centre) - Math.abs(a - centre) || a - b)) {
+      if (this.results.size <= limit) break;
+      this.results.delete(index);
+    }
   }
 
   private enqueue(index: number, priority: number): void {
     const slot = this.slots.get(index);
-    if (!slot || slot.state !== 'empty') return;
-    slot.state = 'queued';
-    this.queue.push({ index, priority, seq: this.seq++ });
-  }
-
-  private bumpPriority(index: number, priority: number): void {
-    for (const entry of this.queue) {
-      if (entry.index === index) {
-        entry.priority = Math.min(entry.priority, priority);
-        return;
-      }
+    if (slot?.state === 'done') return;
+    // An index is asked for once: a second ask raises its priority and moves it
+    // to the current generation, which is what makes re-asking after an
+    // invalidation work rather than being swallowed by the stale entry.
+    const existing = this.queue.find((entry) => entry.index === index);
+    if (existing) {
+      existing.priority = Math.min(existing.priority, priority);
+      existing.generation = this.generationOf(index);
+      return;
     }
+    // In flight for an older generation: the answer is dropped when it lands,
+    // and `requeue` asks again on the way out.
+    if (this.inFlight.has(index)) return;
+    this.queue.push({ index, priority, seq: this.seq++, generation: this.generationOf(index) });
+    if (slot) slot.state = 'pending';
   }
 
   private pump(): void {
@@ -1058,18 +1322,26 @@ export class PdfViewer {
       this.queue.sort((a, b) => a.priority - b.priority || a.seq - b.seq);
       const entry = this.queue.shift();
       if (!entry) break;
-      const slot = this.slots.get(entry.index);
-      if (!slot || slot.state !== 'queued') continue;
-      slot.state = 'rendering';
-      this.inFlight.add(entry.index);
-      void this.renderSlot(slot);
+      if (this.generationOf(entry.index) !== entry.generation) continue;
+      this.inFlight.set(entry.index, entry.generation);
+      void this.render(entry);
     }
   }
 
-  private async renderSlot(slot: PageSlot): Promise<void> {
-    const generation = ++slot.generation;
-    const index = slot.index;
-    const opts: RenderOptions = {
+  /**
+   * Ask again for a page the engine answered for a moment that has passed - a
+   * crop, a fade or a zoom changed while the render was in the worker. Without
+   * this the page would sit blank until something else happened to re-ask.
+   */
+  private requeue(index: number): void {
+    const slot = this.slots.get(index);
+    if (!slot || slot.state === 'done' || !this.window.has(index)) return;
+    slot.state = 'empty';
+    this.enqueue(index, this.window.get(index) ?? 1);
+  }
+
+  private renderOptions(index: number): RenderOptions {
+    return {
       textMode: 'auto',
       idPrefix: `p${index}-`,
       responsive: true,
@@ -1079,17 +1351,25 @@ export class PdfViewer {
       bionic: this.bionicOn,
       bionicDim: this.bionicDimValue,
     };
+  }
+
+  private async render(entry: QueueEntry): Promise<void> {
+    const index = entry.index;
+    let kept = false;
     try {
       DEBUG('render start', index);
-      const rendered = await this.engine.renderPage(index, opts);
+      const rendered = await this.engine.renderPage(index, this.renderOptions(index));
       DEBUG('render done', index, rendered.svg.length);
-      if (this.destroyed || slot.generation !== generation || this.slots.get(index) !== slot) return;
+      if (this.destroyed) return;
+      // The selection, the zoom or the crop may have moved on while this was in
+      // the worker; the generation is what says so.
+      if (this.generationOf(index) !== entry.generation) return;
 
-      this.injectFonts(this.engine.drainNewFonts());
-      slot.el.innerHTML = rendered.svg;
-      slot.svg = slot.el.firstElementChild;
-      slot.state = 'done';
-      this.positionSlot(slot);
+      this.results.set(index, rendered);
+      this.stageFonts(rendered.fonts);
+      this.trimResults();
+      kept = true;
+      this.consider(index);
 
       this.emit({
         type: 'render',
@@ -1101,23 +1381,43 @@ export class PdfViewer {
       });
     } catch (error) {
       DEBUG('render failed', index, String(error));
-      if (slot.generation === generation) slot.state = 'empty';
+      const slot = this.slots.get(index);
+      if (slot && this.generationOf(index) === entry.generation) slot.state = 'empty';
       this.emit({ type: 'error', error, page: index + 1 });
     } finally {
       this.inFlight.delete(index);
       if (!this.destroyed) {
-        if (slot.state === 'empty' && this.slots.has(index)) {
-          // Retry once on the next tick; a genuine failure will recur and settle.
-          this.enqueue(index, 1);
-        }
+        // Nothing usable came of it: either it failed (retry once; a genuine
+        // failure will recur and settle) or it answered an older question.
+        if (!kept) this.requeue(index);
         this.pump();
+        this.scheduleFlush();
       }
     }
   }
 
-  private injectFonts(assets: readonly FontAsset[]): void {
-    if (assets.length === 0) return;
+  /* ---------------------------------------------------------------- fonts */
+
+  /**
+   * Hold a face until the document is told about it. A page's `fonts` are every
+   * face it needs, so a face is staged once and never twice - re-registering one
+   * is not a no-op for the browser: the font set of the document changes and it
+   * lays out every text run again, which is exactly the cost this avoids.
+   */
+  private stageFonts(assets: readonly FontAsset[]): void {
     for (const asset of assets) {
+      if (this.insertedFonts.has(asset.family) || this.stagedFonts.has(asset.family)) continue;
+      this.stagedFonts.set(asset.family, asset);
+    }
+  }
+
+  /** Everything staged, in one write. Called before a page that needs it goes in. */
+  private releaseFonts(): void {
+    if (this.stagedFonts.size === 0) return;
+    const assets = [...this.stagedFonts.values()];
+    this.stagedFonts.clear();
+    for (const asset of assets) {
+      this.insertedFonts.add(asset.family);
       if (this.fontSheet) {
         try {
           this.fontSheet.insertRule(asset.css, this.fontSheet.cssRules.length);
@@ -1278,9 +1578,16 @@ export class PdfViewer {
     if (this.frameRequest) cancelAnimationFrame(this.frameRequest);
     if (this.zoomFrame) cancelAnimationFrame(this.zoomFrame);
     if (this.cropFrame) cancelAnimationFrame(this.cropFrame);
+    if (this.flushFrame) cancelAnimationFrame(this.flushFrame);
+    clearTimeout(this.settleTimer);
     this.frameRequest = 0;
     this.zoomFrame = 0;
     this.cropFrame = 0;
+    this.flushFrame = 0;
+    this.settleTimer = 0;
+    this.results.clear();
+    this.stagedFonts.clear();
+    this.generations.clear();
     this.resizeObserver?.disconnect();
     this.resizeObserver = null;
     document.removeEventListener('scroll', this.onScroll, { capture: true });

@@ -164,9 +164,67 @@ viewer.setZoom(2);
 viewer.destroy();
 ```
 
-Only the pages touching the viewport, plus one on each side, are ever in the DOM.
-Everyone else is an absolutely positioned box whose geometry was computed up
-front, so zooming restyles boxes and never re-renders a page.
+Only the pages near the viewport are ever in the DOM. Everyone else is an
+absolutely positioned box whose geometry was computed up front, so zooming
+restyles boxes and never re-renders a page.
+
+The window is deliberately wider than the viewport, and *rendering* a page is
+deliberately separated from *putting it in the document*:
+
+```ts
+createViewer({
+  container,
+  keepPages: 1,           // pages either side of the viewport that stay in the DOM
+  overscanViewports: 1,   // how far past the viewport the rendered window reaches
+  prepareAhead: 3,        // pages past the window rendered while nothing else is happening
+});
+```
+
+* A page is rendered about a viewport before it can be read, so arriving at it is
+  not the moment its render starts.
+* A finished page goes into the document at a **quiet moment** - 150 ms after the
+  view has stopped moving - unless the reader is looking at it or is one page
+  away from it, in which case it goes in straight away.
+* While the pipeline is idle, the pages just past the window are rendered too.
+  Their SVG is kept (`viewer.preparedPages`) and their fonts are registered, so
+  reaching one costs a DOM insert and nothing else. None of this is extra work:
+  those pages would have been rendered on the way to them.
+
+That ordering is not a micro-optimisation: it is the difference between a smooth
+scroll and a hitch at every page boundary. Two costs land on a page insertion:
+
+| what | why it costs | measured |
+|---|---|---|
+| parsing 100-300 kB of SVG | the page is text-heavy and every element is a positioned `<tspan>` | 4-7 ms |
+| `@font-face` registration | adding *any* face makes the browser lay out every text run in the document again - all pages currently rendered, not just the new one | **60-110 ms** |
+
+The second one is the expensive one, and it used to be paid at every boundary,
+because a page carries the faces it needs every time it is rendered and each
+family was handed to the document again each time. Now a family is registered
+once for the life of the document - the demo test asserts that a full re-render
+of every rendered page registers zero faces - and what is left of the cost is
+paid while the reader is stationary.
+
+Measured three times on each build, same gesture (40 wheel notches at 60 px,
+crossing one page boundary in a 15-page paper, 1280x900):
+
+| | slow frames while scrolling | worst frame while scrolling | faces registered |
+|---|---|---|---|
+| pages rendered as they arrive, faces re-registered per page | 1, at the boundary | 70-89 ms | 18 |
+| this design | **0** | **≤19 ms** | 7 |
+
+The work did not disappear: it moved to the first frames after the scroll stops
+(67-127 ms in the same runs, in software rendering, with the reader looking at a
+page that is not moving). A page the reader *is* looking at never waits for that
+moment - it goes in as soon as it is ready.
+
+Preparing *every* font when the document loads is not possible: a glyph's outline
+only exists once that page has been through MuPDF's SVG device, so preparing the
+whole document means rendering the whole document - the SVG pass alone measures
+52 ms a page, about 5 s for a 100-page report and 39 s for the 756-page
+specification, before any font is built. Preparing the pages just ahead of the
+reader does the same job for the pages that matter, and the work stays bounded
+however long the document is.
 
 #### Cropping pages to their content
 
@@ -346,8 +404,8 @@ can show the level the *layout* is at without re-deriving it from the effective
 zoom - the browser's page scale is not a layout zoom and is not settable from
 script.
 
-Measured in this repository's Chromium (1440x900, three real LaTeX pages, one
-page rendered either side of the viewport):
+Measured in this repository's Chromium (1440x900, three real LaTeX pages, a
+viewport's worth of pages rendered either side of the viewport):
 
 | gesture | layout | layout ms | frames p50/p95 |
 |---|---|---|---|
@@ -355,6 +413,7 @@ page rendered either side of the viewport):
 | pinch + chained pan + virtualisation | 29 | 10 | 16.7 / 16.7 |
 | browser zoom (device pixel ratio 1 -> 1.5) | 0 | **0.0** | - |
 | Ctrl+= (one ladder step, re-layout) | 3 | 30-90 | - |
+| scrolling across a page boundary | 0 | **0.0** | 16.7 / 17.4 |
 | the previous design: JS resize of every page box per zoom step | 1/step | **~17.5/step** | 16.7 / 16.8 |
 
 ### Links
@@ -618,10 +677,13 @@ src/
       registry.ts           per-page planning, caching, @font-face rules
   worker/
     pdf.worker.ts           engine host; installs onmessage before awaiting wasm
-    client.ts               WorkerEngine: a PdfEngineLike that proxies to it
+    client.ts               WorkerEngine: a PdfEngineLike that proxies to it,
+                            handing out each face once
   viewer/
     layout.ts               page geometry + visible-range maths
-    viewer.ts               virtualised scrolling viewer (browser-owned pinch)
+    viewer.ts               virtualised scrolling viewer (browser-owned pinch):
+                            a window wider than the viewport, pages inserted at
+                            a quiet moment, pages prepared ahead
 demo/                       the demo application
   main.ts                   the bar, the card, and everything wired to them
   papers.mjs                the corpus: public URLs, and where they are cached
@@ -715,8 +777,24 @@ is referenced relatively.
   and punctuation are all emitted as text.
 * **Fonts are subset per page.** Each page builds its own subsets, roughly
   10–25 KB of WOFF per page. Correct and lazy (a page you never open costs
-  nothing), but a document-wide pass would share tables between pages and cut
-  that substantially — the obvious next optimisation.
+  nothing), and what a face costs is not how many of them there are: registering
+  *any* face makes the browser lay out every text run in the document again, so
+  one rule costs what twenty cost, and re-registering a face the document
+  already has costs just as much as a new one. Sharing a face between the pages
+  that use the same font is possible - glyph outlines are in em units, so the
+  same glyph is byte-identical on every page, and a page's font can be matched
+  to a document-level face by the glyphs they have in common (measured on a
+  figure-heavy paper: 70 per-page subsets become 28 shared faces over eight
+  pages). It does not remove the cost, though, because a face cannot grow: every
+  page that brings a glyph the face does not have yet needs another rule. So the
+  count is not what hurts - *when* the rule arrives is, and that is what the
+  viewer's quiet-moment registration and preparation ahead are for. Sharing
+  remains worth doing for memory, not for smoothness.
+* **A page can be blank for a moment when scrolling fast into unread
+  territory.** A page that has not been rendered yet cannot be shown, and a
+  reader who outruns the renderer sees the empty white box until it lands. The
+  window and the preparation ahead are sized so that this needs a flick of a
+  whole screen or more, and the page being looked at is always rendered first.
 * **Fonts are not hinted.** Outlines are re-emitted from MuPDF's, so the
   original bytecode hints are gone. This is mostly irrelevant for SVG at
   arbitrary zoom, but it is a real difference from embedding the original font.

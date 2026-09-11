@@ -20,6 +20,7 @@ import * as mupdf from 'mupdf';
 import { scanGlyphOutlines, scanGlyphPlacements } from '../src/core/svg/glyphs.ts';
 import { upgradeGlyphsToText } from '../src/core/svg/text-upgrade.ts';
 import { FontRegistry } from '../src/core/font/registry.ts';
+import { PdfEngine } from '../src/core/engine.ts';
 import { PAPERS, paperFor, pdfName } from '../demo/papers.mjs';
 import { download, ensurePapers } from './pdf-cache.mjs';
 
@@ -67,6 +68,7 @@ for (const { name, file } of documents) {
     const registry = new FontRegistry({ disableCompression: false });
     const pages = Math.min(doc.countPages(), 5);
     let convertedTotal = 0;
+    const facesHandedOut = new Set<string>();
 
     for (let i = 0; i < pages; i++) {
       const svg = renderPathSvg(doc, i);
@@ -75,6 +77,14 @@ for (const { name, file } of documents) {
       assert.ok(placements.length >= 0);
 
       const plan = await registry.planPage(outlines, placements);
+      // One page carries every face it needs, new or reused. A host is told
+      // about each face once: registering one again is not free - the browser
+      // lays out every text run in the document when its font set changes - so
+      // the plan must never name the same family twice either.
+      assert.equal(new Set(plan.assets.map((a) => a.family)).size, plan.assets.length, 'a face is named once per page');
+      for (const asset of plan.assets) {
+        facesHandedOut.add(asset.family);
+      }
       // Regression guard: opentype.js builds `cmap` with 16-bit segment maths,
       // so any code point above the BMP silently becomes unreachable glyph 0.
       for (const [fontId, planned] of plan.fonts) {
@@ -113,6 +123,31 @@ for (const { name, file } of documents) {
         `formats=${[...new Set(assets.map((a) => a.format))].join(',')}`,
     );
     assert.ok(assets.length >= 0);
+    assert.equal(assets.length, facesHandedOut.size, 'the registry built a face the pages never planned');
+  });
+
+  /**
+   * The engine, not the registry: a viewer is handed a page's fonts by
+   * `drainNewFonts`, and it must be told about each face once for the life of
+   * the document. A page rendered a second time - which is what scrolling back
+   * over it does - must add nothing at all.
+   */
+  test(`each face is handed out once: ${name}`, async () => {
+    const engine = new PdfEngine();
+    await engine.open(fs.readFileSync(file));
+    const seen = new Set<string>();
+    const pages = Math.min(engine.documentInfo.pageCount, 3);
+    for (let i = 0; i < pages; i++) {
+      await engine.renderPage(i, { textMode: 'auto' });
+      for (const asset of engine.drainNewFonts()) {
+        assert.ok(!seen.has(asset.family), `face ${asset.family} was handed out twice`);
+        seen.add(asset.family);
+      }
+    }
+    assert.ok(seen.size > 0, 'no face was handed out at all');
+    await engine.renderPage(0, { textMode: 'auto' });
+    assert.deepEqual(engine.drainNewFonts(), [], 're-rendering a page handed its faces out again');
+    engine.close();
   });
 }
 

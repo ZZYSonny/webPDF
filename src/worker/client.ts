@@ -26,7 +26,11 @@ export class WorkerEngine implements PdfEngineLike {
   private worker: Worker;
   private nextId = 1;
   private readonly pending = new Map<number, Pending>();
+  /** Faces built but not yet handed out. */
   private fonts: FontAsset[] = [];
+  private readonly staged = new Set<string>();
+  /** Faces the host has already been given, so it never registers one twice. */
+  private readonly delivered = new Set<string>();
 
   constructor(worker: Worker) {
     this.worker = worker;
@@ -60,12 +64,22 @@ export class WorkerEngine implements PdfEngineLike {
 
   async open(source: PdfSource, password?: string): Promise<DocumentInfo> {
     this.fonts = [];
+    this.staged.clear();
+    this.delivered.clear();
     return this.call<DocumentInfo>('open', [source, password]);
   }
 
   async renderPage(index: number, opts?: RenderOptions): Promise<RenderedPage> {
     const page = await this.call<RenderedPage>('renderPage', [index, opts]);
-    if (page.fonts.length) this.fonts.push(...page.fonts);
+    // A page carries every face it needs, reused or new. Only the new ones are
+    // worth handing on: registering a face the document already has costs the
+    // same as registering a brand new one - the browser throws away the layout
+    // of every text run in the document - and buys nothing at all.
+    for (const asset of page.fonts) {
+      if (this.delivered.has(asset.family) || this.staged.has(asset.family)) continue;
+      this.staged.add(asset.family);
+      this.fonts.push(asset);
+    }
     return page;
   }
 
@@ -74,12 +88,15 @@ export class WorkerEngine implements PdfEngineLike {
   }
 
   /**
-   * Fonts arrive with the page rather than through a second round trip; the
-   * worker has already used them to build the SVG.
+   * Fonts built since the last call, and never seen before that: the contract
+   * `FontRegistry` keeps on the main thread too. A host that inserts these into
+   * a stylesheet is adding each face once and only once.
    */
   drainNewFonts(): FontAsset[] {
     const out = this.fonts;
     this.fonts = [];
+    this.staged.clear();
+    for (const asset of out) this.delivered.add(asset.family);
     return out;
   }
 
