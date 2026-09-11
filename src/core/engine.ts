@@ -26,6 +26,7 @@ import {
   type CropRuleId,
   type CropSpan,
 } from './crop.ts';
+import { spaceMarks, type SpaceMark, type TextChar } from './svg/spaces.ts';
 
 export type PdfSource =
   | ArrayBuffer
@@ -95,6 +96,13 @@ export interface RenderOptions {
    * which is what the reference script crops to.
    */
   cropPadding?: number;
+  /**
+   * Bionic reading: bold the first letters of every word, so the eye has
+   * somewhere to land. The words have to be words, so this is only as good as
+   * the spaces in the text - which are written back in whatever this is set to
+   * (see `svg/spaces.ts`). Default false: a page looks like the document.
+   */
+  bionic?: boolean;
 }
 
 export interface RenderStats {
@@ -102,6 +110,8 @@ export interface RenderStats {
   glyphsAsText: number;
   glyphsAsOutlines: number;
   textRuns: number;
+  /** Space characters put back into the text: what makes words out of glyphs. */
+  spaces: number;
   fontsBuilt: number;
   fontsReused: number;
   ms: number;
@@ -266,6 +276,36 @@ function readSpans(page: mupdf.Page): CropSpan[] {
     stext.destroy();
   }
   return spans;
+}
+
+/**
+ * Every space the text device read, and the character it sits in front of.
+ *
+ * The SVG the outline device produces has no spaces in it: a space has no
+ * outline, so there is nothing to draw and nothing to reference. They are read
+ * here, from the same page, and written back into the text (`svg/spaces.ts`) -
+ * which is what turns "linearattention" back into two words, for a reader
+ * copying it and for anything that has to find word boundaries. Text only: the
+ * vectors and images a crop rule wants are asked for by `readSpans`.
+ */
+function readSpaces(page: mupdf.Page): SpaceMark[] {
+  const chars: TextChar[] = [];
+  let line = 0;
+  // No options: this walk wants the characters and their origins, and asking
+  // for the vectors and images as well would read the whole page's graphics to
+  // throw them away.
+  const stext = page.toStructuredText('');
+  try {
+    stext.walk({
+      beginLine() {
+        line++;
+      },
+      onChar: (c, origin) => chars.push({ text: c, x: origin[0], y: origin[1], line }),
+    });
+  } finally {
+    stext.destroy();
+  }
+  return spaceMarks(chars);
 }
 
 /** The box a rectangle in one space occupies in another, corners and all. */
@@ -551,6 +591,7 @@ export class PdfEngine implements PdfEngineLike {
       glyphsAsText: 0,
       glyphsAsOutlines: 0,
       textRuns: 0,
+      spaces: 0,
       fontsBuilt: 0,
       fontsReused: 0,
       ms: 0,
@@ -568,15 +609,21 @@ export class PdfEngine implements PdfEngineLike {
         debug('renderPage: planned', plan.fonts.size, 'fonts');
         stats.fontsBuilt = plan.built;
         stats.fontsReused = plan.reused;
-        const upgraded = upgradeGlyphsToText(svg, placements, {
-          familyFor: (fontId) => plan.fonts.get(fontId)?.family ?? null,
-          codeFor: (fontId, gid) => plan.fonts.get(fontId)?.codes.get(gid) ?? null,
-        });
+        const upgraded = upgradeGlyphsToText(
+          svg,
+          placements,
+          {
+            familyFor: (fontId) => plan.fonts.get(fontId)?.family ?? null,
+            codeFor: (fontId, gid) => plan.fonts.get(fontId)?.codes.get(gid) ?? null,
+          },
+          { spaces: readSpaces(page), bionic: opts.bionic },
+        );
         svg = upgraded.svg;
         debug('renderPage: upgraded', upgraded.stats);
         stats.textRuns = upgraded.stats.runs;
         stats.glyphsAsText = upgraded.stats.converted;
         stats.glyphsAsOutlines = upgraded.stats.kept;
+        stats.spaces = upgraded.stats.spaces;
         fonts = plan.assets;
       }
     }

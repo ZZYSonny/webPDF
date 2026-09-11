@@ -205,6 +205,56 @@ rule off and on again is free. Internal link destinations are points on the
 *uncropped* page and are translated to the crop before the jump, so a link still
 lands where it says.
 
+#### Bionic reading
+
+```ts
+viewer.setBionic(true);   // bold every word's first letters
+viewer.bionic;            // false: a document opens looking like itself
+```
+
+Bionic reading bolds the first letters of each word, so the eye has somewhere to
+land and the brain finishes the word. Which letters is not a guess of ours:
+[`text-vide`](https://github.com/Gumball12/text-vide) decides it from the word's
+length, and the engine turns its answer into a `<tspan font-weight="bold">`
+around exactly those glyphs. `renderDocument(source, { bionic: true })` does the
+same thing headlessly, and an exported SVG carries it.
+
+It changes how the text is **drawn** and nothing else. Every character in these
+pages carries its own x and y, so a bold character is drawn bold exactly where it
+was: the words do not reflow, the pages do not change size, and nothing has to be
+measured again. Toggling it re-renders what is on screen; the text, the selection
+and the position of every character are identical either way. The demo test
+checks that down to the ink - the same page, the same edges, more of them dark.
+
+#### Spaces, and why a copy works
+
+An outline SVG has no spaces in it. MuPDF draws a glyph by referencing its
+outline, and a space has no outline to reference, so it draws nothing at all -
+and what comes out is `Providedproperattributionisprovided`. That is what a
+reader copies, and bionic reading can find no word boundary in it either.
+
+So the spaces are written back (`src/core/svg/spaces.ts`). The text device
+reports every character it read, spaces included, with the origin it starts at;
+a space has no ink, so putting the character back cannot change what the page
+looks like. Two details are what make it exact rather than approximate:
+
+* **A space is anchored to the character after it**, which starts where the space
+  ended. The space is then written at that character's origin, so it stays inside
+  the line of the glyph it belongs to - which matters, because a cropped page
+  measures its lines and a box that hangs below one looks like a sliced line.
+  Anchoring to a *point* rather than to a bounding box is also what keeps it
+  right for rotated text.
+* **A line break is a space too.** The device ends a line instead of writing a
+  character, so two lines of the same run would otherwise read as one word
+  (`permission toreproduce`). It is written back only where the break is what
+  separates the two words: a line that already ends, or whose successor already
+  starts, with a space is separated once.
+
+A space the page *does* draw - some fonts give one an outline - is left to the
+glyph that already carries it, and trailing whitespace has nothing to sit in
+front of, so neither is written twice. This is on in every render, and costs
+about 4 ms a page.
+
 #### Who owns the zoom
 
 Zoom is split by gesture, because the two gestures have completely different
@@ -366,9 +416,13 @@ viewer:
   and kept as text. A hit is painted as a `<rect>` measured from a `Range` over
   the matched characters and mapped back through the page's own matrix, so it
   lands on the word - and the page's markup is never restyled.
-* **Search ignores whitespace on both sides.** Runs are one positioned string
-  each and a space glyph has no outline to build a font from, so a page's text can
-  read `AttentionIsAllYouNeed` (see the limitations).
+* **Search ignores whitespace on both sides.** The pages do carry real spaces
+  (`Attention Is All You Need`), but a match has to survive a line break, which is
+  where the browser's own find bar gives up: both the page and the query are
+  lower-cased with the whitespace removed, so `encoder and decoder` finds the two
+  words across a line and `AttentionIsAllYouNeed` finds them without the spaces.
+  The offsets are mapped back for the boxes, so the highlight still lands on the
+  characters that matched.
 * **Cropping is opt-in, and never edits the page.** The *Crop* dropdown, after the
   search box, lists the marks PaperCutter removes from a page before it measures
   what is left: the arXiv stamp, a publisher's header, a bare page number, a
@@ -379,6 +433,12 @@ viewer:
   it runs, so what a rule removes is never a guess. A **Padding** field above the
   list keeps a margin around what is left, in points, from 0 (the reference
   script's own crop) to two inches.
+* **Bionic reading is one square button, after the crop control.** `B` presses in
+  and every word in front of you gets its first letters bolded; press it again and
+  the page is the document's own again. It is a mode rather than a menu, so it is
+  a button rather than a dropdown, and it is the one control here that changes the
+  text without moving it: the demo test checks that every character in every run
+  keeps the exact position it had.
 * **Links are the viewer's, and the demo just says what happened.** Clicking an
   external link opens it in a new tab and the toast names the URI; a link a
   browser cannot follow (the *GPT-4 Technical Report* links to a local file) gets
@@ -406,7 +466,8 @@ for await (const page of renderDocument(bytes, { embedFonts: true })) {
 
 `crop: ['arxiv', 'page-number']` trims each page to its content as it is
 exported, changing only the root `viewBox` - the file still contains the whole
-page, the way a PDF with a crop box does.
+page, the way a PDF with a crop box does. `bionic: true` bolds the words' first
+letters on the way out, and the spaces are written back either way.
 
 `embedFonts: true` puts the `@font-face` rules inside the SVG, which is what
 makes an exported file self-contained — required for `<img src="…svg">`, for a
@@ -473,7 +534,9 @@ src/
     links.ts                link annotations → data, and → SVG hit areas
     svg/
       glyphs.ts             scanner for MuPDF's SVG (outlines + <use>)
-      text-upgrade.ts       <use> runs → <text> runs
+      text-upgrade.ts       <use> runs → <text> runs, with spaces and bold
+      spaces.ts             where the spaces the outline device cannot draw go
+      bionic.ts             text-vide's fixation points as tspan segments
       package.ts            id namespacing, root rewriting, font embedding
     font/
       svg-path.ts           SVG path data parser (M/L/H/V/C/Z + implicit repeats)
@@ -586,11 +649,23 @@ is referenced relatively.
   JS/wasm encoder tried either did not work in the browser or added a
   multi-megabyte dependency for a few hundred bytes per page.
 * **Per-page text is emitted by span, not by paragraph.** Line breaking is
-  whatever the PDF says; the SVG carries positioned runs, not flowing text. A
-  space glyph has no outline to rebuild a font from, so runs break at word
-  boundaries and the space between them is dropped: copy-paste (and naive search)
-  sees `AttentionIsAllYouNeed`. Emitting U+0020 from the PDF's advance widths
-  would fix it; the demo's search strips whitespace from both sides instead.
+  whatever the PDF says; the SVG carries positioned runs, not flowing text. The
+  spaces are written back (see [Spaces](#spaces-and-why-a-copy-works)), but a
+  run still ends where the document's own line does, so a word hyphenated across
+  a line break arrives as `trans-` and `formation` on either side of the space
+  the break stands for - which is what a PDF's own copy gives you too.
+* **A ligature is one glyph, so it is one character.** Where a document draws
+  `fi` as a single glyph, the cmap entry for that glyph is what the text gets:
+  in a TeX-produced paper that is a private-use code point, so a copied
+  `efficient` can carry a character other programs show as a box. It renders
+  correctly, and the tests allow for it, but searching for the decomposed
+  spelling does not match it. Mapping the glyph names back to `U+FB01` and
+  friends is the fix, and it belongs in the font build, not here.
+* **Bionic reading is synthetic bold.** The fonts rebuilt from the outlines have
+  one weight, so `font-weight: bold` is the browser's own emboldening rather than
+  a real bold face: the letters get heavier exactly where they are, which is what
+  the mode is for, but a document with a genuine bold face would render it that
+  way if the character belonged to that face.
 * **Cropping reads every page to lay the document out.** A crop changes each
   page's height, so the scroll height is only correct once every box is known:
   switching a rule on measures the whole document in the background (about 5 ms

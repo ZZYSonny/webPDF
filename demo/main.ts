@@ -71,6 +71,8 @@ const els = {
   cropAll: $<HTMLButtonElement>('crop-all'),
   cropNone: $<HTMLButtonElement>('crop-none'),
   cropPadding: $<HTMLInputElement>('crop-padding'),
+  bionicGroup: $('bionic-group'),
+  bionicBtn: $<HTMLButtonElement>('bionic-btn'),
   stats: $('stats'),
   viewer: $('viewer'),
   empty: $('empty'),
@@ -173,6 +175,7 @@ function onViewerEvent(event: ViewerEvent): void {
       els.zoomGroup.hidden = false;
       els.searchGroup.hidden = false;
       els.cropGroup.hidden = false;
+      els.bionicGroup.hidden = false;
       // The title rule is only usable on a document that declares a title.
       if (viewer) ensureCropMenu(viewer).setDocument(event.info.title);
       els.pagecount.textContent = String(event.info.pageCount);
@@ -222,7 +225,8 @@ function onViewerEvent(event: ViewerEvent): void {
       els.stats.title =
         `Page ${event.page}: ${event.ms} ms · ` +
         `${event.asText.toLocaleString()} glyphs as text` +
-        (event.asOutlines ? ` · ${event.asOutlines.toLocaleString()} as outlines` : '');
+        (event.asOutlines ? ` · ${event.asOutlines.toLocaleString()} as outlines` : '') +
+        (event.spaces ? ` · ${event.spaces.toLocaleString()} spaces written back` : '');
       search?.refresh();
       break;
     case 'link':
@@ -355,6 +359,30 @@ function ensureCropMenu(v: PdfViewer): CropMenu {
   });
   return crop;
 }
+
+/* --------------------------------------------------------------- bionic */
+
+/**
+ * Bionic reading is one bit of state, and the button *is* that state: the viewer
+ * re-renders what is on screen where it is - bolding changes how a character is
+ * drawn, never where it is - and `aria-pressed` says which of the two modes is
+ * in force, so there is no styling class that could disagree with it.
+ *
+ * It is worth knowing what it needs to work: the words. MuPDF's outline device
+ * draws no spaces, so the engine writes them back into the text first
+ * (`core/svg/spaces.ts`); without that every line would be one long word and
+ * there would be nothing to bold the start of.
+ */
+function toggleBionic(): void {
+  if (!viewer) return;
+  viewer.setBionic(!viewer.bionic);
+  els.bionicBtn.setAttribute('aria-pressed', String(viewer.bionic));
+  els.bionicBtn.title = viewer.bionic
+    ? 'Bionic reading on — click to show the pages as the document sets them'
+    : 'Bionic reading — bold the first letters of every word, so the eye has somewhere to land';
+}
+
+els.bionicBtn.addEventListener('click', toggleBionic);
 
 /* ---------------------------------------------------------------- panels */
 

@@ -128,6 +128,25 @@
             </div>
           </div>
         </div>
+        <!--
+          Bionic reading is a mode, not a menu: it is on or it is off, so it is a
+          single square button that stays pressed while it is on. It sits after
+          the crop control because both change how a page is drawn rather than
+          where the reader is, and it is a button rather than a dropdown because
+          there is nothing to choose.
+        -->
+        <div class="group" id="bionic-group" hidden>
+          <button
+            id="bionic-btn"
+            class="btn bionic-btn"
+            type="button"
+            aria-pressed="false"
+            aria-label="Bionic reading"
+            title="Bionic reading — bold the first letters of every word, so the eye has somewhere to land"
+          >
+            B
+          </button>
+        </div>
         <span id="stats" class="perf mono" title="Time the last page render took"></span>
       </div>
     </header>

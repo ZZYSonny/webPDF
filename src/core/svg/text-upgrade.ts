@@ -20,9 +20,16 @@
  *
  *   A = a/K, B = b/K, C = -c/K, D = -d/K, K = sqrt(|ad - bc|)
  *   (X, Y) = [A C; B D]^-1 (e, f)      - the per-character baseline origin
+ *
+ * Two things are put back at this point rather than later, because this is where
+ * a glyph is still a glyph with a position rather than a character in a string:
+ * the spaces the outline device could not draw (`spaces.ts`), and the fixation
+ * points of bionic reading (`bionic.ts`).
  */
 
 import type { GlyphPlacement, Attribute } from './glyphs.ts';
+import type { SpaceMark } from './spaces.ts';
+import { bionicSegments } from './bionic.ts';
 
 export interface GlyphEncoding {
   /**
@@ -42,12 +49,22 @@ export interface UpgradeOptions {
   pruneUnusedOutlines?: boolean;
   /** Add text-rendering hints that favour geometric accuracy. */
   preciseTextRendering?: boolean;
+  /**
+   * Spaces to write back into the text, each in front of the glyph its next
+   * character became (see `spaces.ts`). Without them the runs are the words run
+   * together, because that is what the outline device drew.
+   */
+  spaces?: readonly SpaceMark[];
+  /** Bold the first letters of every word, the way bionic reading does. */
+  bionic?: boolean;
 }
 
 export interface UpgradeStats {
   runs: number;
   converted: number;
   kept: number;
+  /** Space characters written back into the text. */
+  spaces: number;
 }
 
 export interface UpgradeResult {
@@ -111,8 +128,18 @@ interface Run {
   family: string;
   matrix: { a: number; b: number; c: number; d: number };
   attrs: string;
-  items: { x: number; y: number; code: number; gid: number; advanceEm?: number }[];
+  items: RunItem[];
   source: string;
+}
+
+interface RunItem {
+  x: number;
+  y: number;
+  code: number;
+  /** -1 for a character written back rather than drawn. */
+  gid: number;
+  /** A space: it has a position but no glyph of its own. */
+  synthetic?: boolean;
 }
 
 /** True when the placement carries a stroke; those stay as outlines. */
@@ -123,6 +150,99 @@ function hasStroke(attrs: readonly Attribute[]): boolean {
   return false;
 }
 
+/** A twentieth of a point: far below any glyph, far above float noise. */
+const ANCHOR_EPSILON = 0.05;
+
+/**
+ * Which glyph each space goes in front of.
+ *
+ * A space ends exactly where the next character begins, and the text device
+ * reports that character's origin, so a space is matched to the *placement* with
+ * that origin. The placements are bucketed on a grid the size of the tolerance,
+ * because a page has thousands of them and a document has thousands of spaces,
+ * and comparing every pair would be the only slow part of a page render.
+ *
+ * Two kinds of mark are dropped. A space the page draws itself - some fonts do
+ * give one an outline - is already in the SVG as a glyph, and writing the
+ * character a second time would double it. A space whose next character is not
+ * in the SVG at all (it stayed an outline, or it is trailing whitespace with
+ * nothing after it) has nothing to sit in front of.
+ */
+function anchorSpaces(placements: readonly GlyphPlacement[], marks: readonly SpaceMark[]): Map<number, SpaceMark[]> {
+  const out = new Map<number, SpaceMark[]>();
+  if (marks.length === 0) return out;
+
+  const cell = (v: number): number => Math.round(v / ANCHOR_EPSILON);
+  const grid = new Map<string, number[]>();
+  placements.forEach((p, index) => {
+    const key = `${cell(p.matrix.e)},${cell(p.matrix.f)}`;
+    const bucket = grid.get(key);
+    if (bucket) bucket.push(index);
+    else grid.set(key, [index]);
+  });
+
+  /** The placement starting at this point, if there is one. */
+  const at = (x: number, y: number): number => {
+    const cx = cell(x);
+    const cy = cell(y);
+    for (let dx = -1; dx <= 1; dx++) {
+      for (let dy = -1; dy <= 1; dy++) {
+        const bucket = grid.get(`${cx + dx},${cy + dy}`);
+        if (!bucket) continue;
+        for (const index of bucket) {
+          const p = placements[index];
+          if (Math.abs(p.matrix.e - x) <= ANCHOR_EPSILON && Math.abs(p.matrix.f - y) <= ANCHOR_EPSILON) return index;
+        }
+      }
+    }
+    return -1;
+  };
+
+  for (const mark of marks) {
+    if (mark.kind === 'space' && at(mark.originX, mark.originY) >= 0) continue;
+    const index = at(mark.x, mark.y);
+    if (index < 0) continue;
+    const bucket = out.get(index);
+    if (bucket) bucket.push(mark);
+    else out.set(index, [mark]);
+  }
+  return out;
+}
+
+/**
+ * The `<tspan>`s a run's characters go in.
+ *
+ * Normally one, with every position in a single list. With bionic reading on,
+ * one per stretch `text-vide` marked, each carrying the slice of the position
+ * lists that belongs to it - so a bold character is drawn bold *at the place it
+ * was*, never moved, because every character keeps the x and y it had.
+ */
+function tspans(chars: readonly string[], xs: readonly string[], ys: readonly string[], bionic: boolean): string {
+  const whole = (): string => `<tspan x="${xs.join(' ')}" y="${ys.join(' ')}">${chars.join('')}</tspan>`;
+  if (!bionic) return whole();
+
+  const segments = bionicSegments(chars.join(''));
+  // The segments have to account for every glyph exactly once. `text-vide`
+  // decides where the words are and this decides where the glyphs are; if the
+  // two ever disagree - a release with different word rules, a character it
+  // reads as markup - the run is written plain, which is right, rather than bold
+  // in the wrong place, which is not.
+  if (segments.reduce((n, s) => n + s.chars, 0) !== chars.length) return whole();
+
+  let at = 0;
+  let out = '';
+  for (const segment of segments) {
+    const end = at + segment.chars;
+    if (end > at) {
+      out +=
+        `<tspan${segment.bold ? ' font-weight="bold"' : ''}` +
+        ` x="${xs.slice(at, end).join(' ')}" y="${ys.slice(at, end).join(' ')}">${segment.text}</tspan>`;
+    }
+    at = end;
+  }
+  return out;
+}
+
 export function upgradeGlyphsToText(
   svg: string,
   placements: readonly GlyphPlacement[],
@@ -131,8 +251,10 @@ export function upgradeGlyphsToText(
 ): UpgradeResult {
   const simpleOnly = opts.simpleTextOnly ?? true;
   const precise = opts.preciseTextRendering ?? true;
+  const bionic = opts.bionic ?? false;
+  const spaces = anchorSpaces(placements, opts.spaces ?? []);
 
-  const stats: UpgradeStats = { runs: 0, converted: 0, kept: 0 };
+  const stats: UpgradeStats = { runs: 0, converted: 0, kept: 0, spaces: 0 };
   const pieces: string[] = [];
   let cursor = 0;
   let run: Run | null = null;
@@ -163,23 +285,26 @@ export function upgradeGlyphsToText(
 
     const xs: string[] = [];
     const ys: string[] = [];
-    let text = '';
+    const chars: string[] = [];
+    let synthetic = 0;
     for (const it of r.items) {
       const X = (D * it.x - C * it.y) / det;
       const Y = (-B * it.x + A * it.y) / det;
       xs.push(fmt(X));
       ys.push(fmt(Y));
-      text += escapeText(String.fromCodePoint(it.code));
+      chars.push(escapeText(String.fromCodePoint(it.code)));
+      if (it.synthetic) synthetic++;
     }
 
     let out = `<text${r.attrs} transform="matrix(${fmt(A)} ${fmt(B)} ${fmt(C)} ${fmt(D)} 0 0)" font-size="${fmt(K)}" font-family="${r.family}" font-weight="normal" font-style="normal"`;
     if (precise) out += ' text-rendering="geometricPrecision"';
     out += ' xml:space="preserve">';
-    out += `<tspan x="${xs.join(' ')}" y="${ys.join(' ')}">${text}</tspan>`;
+    out += tspans(chars, xs, ys, bionic);
     out += '</text>';
     pieces.push(out);
     stats.runs++;
-    stats.converted += r.items.length;
+    stats.converted += r.items.length - synthetic;
+    stats.spaces += synthetic;
   };
 
   const canExtend = (p: GlyphPlacement, family: string, code: number): boolean => {
@@ -191,12 +316,23 @@ export function upgradeGlyphsToText(
     return true;
   };
 
-  for (const p of placements) {
+  /** The spaces in front of a glyph, in the order they were read. */
+  const pushSpaces = (target: Run, marks: readonly SpaceMark[]): void => {
+    for (const mark of marks) target.items.push({ x: mark.x, y: mark.y, code: mark.code, gid: -1, synthetic: true });
+  };
+
+  for (const [index, p] of placements.entries()) {
     const family = enc.familyFor(p.fontId);
     const code = family && !hasStroke(p.attrs) ? enc.codeFor(p.fontId, p.gid) : null;
     const ok = code !== null && code > 0 && (!simpleOnly || isSimpleCode(code));
+    // The spaces whose next character became this glyph.
+    const marks = spaces.get(index);
 
     if (!ok) {
+      // This glyph stays an outline, so there is no text to put its spaces in
+      // front of; the run that just ended is the same point in the reading
+      // order, and putting them there keeps the offset a space is anchored by.
+      if (marks && run) pushSpaces(run, marks);
       flush();
       pieces.push(svg.slice(cursor, p.start), svg.slice(p.start, p.end));
       cursor = p.end;
@@ -221,6 +357,7 @@ export function upgradeGlyphsToText(
     }
     // `run` is non-null: either it survived or we just created one.
     const active = run as unknown as Run;
+    if (marks) pushSpaces(active, marks);
     active.source += svg.slice(cursor, p.start) + svg.slice(p.start, p.end);
     cursor = p.end;
     prevEnd = p.end;

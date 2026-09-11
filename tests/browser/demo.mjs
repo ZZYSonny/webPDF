@@ -973,6 +973,236 @@ try {
   })()`);
   await new Promise((r) => setTimeout(r, 200));
 
+  // --------------------------------------------------------- bionic reading
+  /**
+   * Bionic reading is a mode, and there are three things to check about it: it
+   * is off until it is asked for, it is really *drawn* (a bold attribute the
+   * font cannot honour would be a lie, and the attribute is the part that is
+   * easy to get right), and it changes nothing else - the same characters, in
+   * the same places, saying the same thing.
+   *
+   * It is also where the spaces are checked where a reader meets them. An
+   * outline SVG has none at all: the words arrive run together, and this is the
+   * assertion that says they no longer do.
+   */
+  console.log('— bionic reading —');
+  await page.evaluate(`(() => {
+    const input = document.getElementById('pageno');
+    input.value = '1';
+    input.dispatchEvent(new Event('change'));
+  })()`);
+  await waitForPage(1);
+
+  /** The toggle, and the page in front of the reader, character by character. */
+  const bionicState = () =>
+    page.evaluate(`(() => {
+      const sr = document.getElementById('viewer').shadowRoot;
+      const shown = document.getElementById('pageno').value;
+      const svg = sr.querySelector('.wpdf-page[data-page="' + shown + '"] svg');
+      const button = document.getElementById('bionic-btn');
+      const rect = button.getBoundingClientRect();
+      const crop = document.getElementById('crop-btn').getBoundingClientRect();
+      const search = document.getElementById('search-box').getBoundingClientRect();
+      const texts = svg ? [...svg.querySelectorAll('text')] : [];
+      const all = texts.map((t) => t.textContent).join('');
+      const words = all.split(/\\s+/).filter(Boolean);
+      // Every character's own start position: the page's geometry as the
+      // browser resolved it, which is what "nothing moved" has to mean.
+      const starts = texts.flatMap((t) => {
+        const out = [];
+        for (let i = 0; i < (t.textContent ?? '').length; i++) {
+          try {
+            const p = t.getStartPositionOfChar(i);
+            out.push(Math.round(p.x * 100) / 100 + ',' + Math.round(p.y * 100) / 100);
+          } catch {
+            out.push('?');
+          }
+        }
+        return out;
+      });
+      const bold = svg ? svg.querySelector('tspan[font-weight="bold"]') : null;
+      return {
+        exists: !document.getElementById('bionic-group').hidden,
+        afterSearch: rect.left > search.left,
+        afterCrop: rect.left > crop.left,
+        square: Math.abs(rect.width - rect.height) <= 1 && rect.width >= 20,
+        pressed: button.getAttribute('aria-pressed'),
+        viewBox: svg ? svg.getAttribute('viewBox') : null,
+        texts: texts.length,
+        chars: all.length,
+        words: words.length,
+        // A page with no spaces in it averages tens of characters per "word".
+        perWord: words.length ? Math.round((all.length / words.length) * 10) / 10 : 0,
+        prose: all.slice(0, 80),
+        full: all.slice(0, 4000),
+        bold: svg ? svg.querySelectorAll('tspan[font-weight="bold"]').length : 0,
+        weight: bold ? getComputedStyle(bold).fontWeight : null,
+        starts,
+      };
+    })()`);
+
+  const plainText = await bionicState();
+  console.log(
+    'bionic off : ' +
+      JSON.stringify({
+        square: plainText.square,
+        afterCrop: plainText.afterCrop,
+        pressed: plainText.pressed,
+        texts: plainText.texts,
+        words: plainText.words,
+        perWord: plainText.perWord,
+        prose: plainText.prose,
+      }),
+  );
+  if (!plainText.exists) fail('the bionic toggle is not in the bar');
+  if (!plainText.afterSearch || !plainText.afterCrop) fail('the bionic toggle should sit after the crop control');
+  if (!plainText.square) fail('the bionic toggle should be a square button');
+  if (plainText.pressed !== 'false') fail(`bionic reading should start off, got aria-pressed=${plainText.pressed}`);
+  if (plainText.bold) fail(`nothing should be bold before it is asked for (${plainText.bold} runs)`);
+  // The words, which is what bionic reading needs and what a reader copies.
+  if (plainText.words < 100) fail(`page 1 should have real words in it, found ${plainText.words}`);
+  if (plainText.perWord > 12) fail(`the page averages ${plainText.perWord} characters per word: the spaces are missing`);
+  if (!/\bthe\b/.test(plainText.full)) fail(`page 1 does not read as prose: ${JSON.stringify(plainText.prose)}`);
+
+  await page.evaluate(() => document.getElementById('bionic-btn').click());
+  await waitUntil(
+    `(() => {
+      const shown = document.getElementById('pageno').value;
+      const svg = document.getElementById('viewer').shadowRoot.querySelector('.wpdf-page[data-page="' + shown + '"] svg');
+      return !!svg && svg.querySelectorAll('tspan[font-weight="bold"]').length > 0;
+    })()`,
+    'the bionic render',
+    60000,
+  );
+  const marked = await bionicState();
+  console.log('bionic on  : ' + JSON.stringify({ pressed: marked.pressed, bold: marked.bold, weight: marked.weight, texts: marked.texts }));
+  if (marked.pressed !== 'true') fail(`the toggle should report itself pressed, got ${marked.pressed}`);
+  if (marked.bold < 100) fail(`bionic reading marked ${marked.bold} runs, which is not every word`);
+  // Bold has to be a weight the font is actually drawn at.
+  if (marked.weight !== '700') fail(`the fixation points are not bold (font-weight ${marked.weight})`);
+  if (marked.chars !== plainText.chars || marked.words !== plainText.words) fail('bionic reading changed the text');
+  if (marked.texts !== plainText.texts) fail(`bionic reading changed the page's text elements (${plainText.texts} -> ${marked.texts})`);
+  if (JSON.stringify(marked.starts) !== JSON.stringify(plainText.starts)) {
+    fail('bionic reading moved a character');
+  }
+
+  // The find bar measures the characters it boxes, and those characters are now
+  // one tspan deeper in the markup: it has to still find them.
+  await page.evaluate(`(() => {
+    const input = document.getElementById('search');
+    input.value = 'attention';
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+  })()`);
+  await page.waitFor(() => /^\d+\/\d+$/.test(document.getElementById('search-count')?.textContent ?? ''), {
+    label: 'bionic search results',
+    timeout: 60000,
+  });
+  const found = await searchState();
+  console.log('search while bold: ' + JSON.stringify(found));
+  if (found.bandsOnPage < 1) fail('the find bar lost the text when it was drawn bold');
+
+  /**
+   * How much ink the page puts down, and where its edges are - rasterised from
+   * the SVG the viewer would export, so this is the drawing itself and not the
+   * attributes that asked for it.
+   */
+  const ink = () =>
+    page.evaluate(`(async () => {
+      const markup = await window.webpdf.viewer().exportSvg(1);
+      const url = URL.createObjectURL(new Blob([markup], { type: 'image/svg+xml;charset=utf-8' }));
+      try {
+        const img = new Image();
+        await new Promise((res, rej) => {
+          img.onload = res;
+          img.onerror = () => rej(new Error('the exported SVG did not rasterize'));
+          img.src = url;
+        });
+        const canvas = document.createElement('canvas');
+        canvas.width = img.naturalWidth || 612;
+        canvas.height = img.naturalHeight || 792;
+        const ctx = canvas.getContext('2d', { willReadFrequently: true });
+        ctx.drawImage(img, 0, 0);
+        const data = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
+        let dark = 0, left = canvas.width, top = canvas.height, right = -1, bottom = -1;
+        for (let y = 0; y < canvas.height; y++) {
+          for (let x = 0; x < canvas.width; x++) {
+            if (data[(y * canvas.width + x) * 4 + 3] > 128) {
+              dark++;
+              if (x < left) left = x;
+              if (x > right) right = x;
+              if (y < top) top = y;
+              if (y > bottom) bottom = y;
+            }
+          }
+        }
+        return { dark, box: [left, top, right, bottom] };
+      } finally {
+        URL.revokeObjectURL(url);
+      }
+    })()`);
+
+  const boldInk = await ink();
+  await page.evaluate(() => document.getElementById('bionic-btn').click());
+  await waitUntil(
+    `(() => {
+      const shown = document.getElementById('pageno').value;
+      const svg = document.getElementById('viewer').shadowRoot.querySelector('.wpdf-page[data-page="' + shown + '"] svg');
+      return !!svg && svg.querySelectorAll('tspan[font-weight="bold"]').length === 0;
+    })()`,
+    'the plain render to come back',
+    60000,
+  );
+  const plainInk = await ink();
+  const turnedOff = await bionicState();
+  console.log('ink        : ' + JSON.stringify({ plain: plainInk.dark, bionic: boldInk.dark, plainBox: plainInk.box, boldBox: boldInk.box }));
+  if (!(boldInk.dark > plainInk.dark * 1.05)) fail(`bionic reading should put down more ink (${plainInk.dark} -> ${boldInk.dark})`);
+  for (const [i, edge] of ['left', 'top', 'right', 'bottom'].entries()) {
+    if (Math.abs(boldInk.box[i] - plainInk.box[i]) > 3) {
+      fail(`bionic reading changed where the page's ink is (${edge}: ${plainInk.box[i]} -> ${boldInk.box[i]})`);
+    }
+  }
+  if (turnedOff.pressed !== 'false' || turnedOff.bold) fail('the toggle should put the page back exactly as it was');
+  if (JSON.stringify(turnedOff.starts) !== JSON.stringify(plainText.starts)) fail('turning it off did not restore the page');
+
+  // The crop and bionic controls are independent: a crop is a window onto the
+  // page, and how the text in it is drawn cannot move the window.
+  await page.evaluate(() => document.querySelector('#crop-list .crop-option[data-id="page-number"]').click());
+  const croppedBox = await waitUntil(
+    `(() => {
+      const shown = document.getElementById('pageno').value;
+      const svg = document.getElementById('viewer').shadowRoot.querySelector('.wpdf-page[data-page="' + shown + '"] svg');
+      const viewBox = svg?.getAttribute('viewBox') ?? '';
+      return viewBox && !viewBox.startsWith('0 0 ') ? viewBox : false;
+    })()`,
+    'the crop',
+    60000,
+  );
+  await page.evaluate(() => document.getElementById('bionic-btn').click());
+  await waitUntil(
+    `(() => {
+      const shown = document.getElementById('pageno').value;
+      const svg = document.getElementById('viewer').shadowRoot.querySelector('.wpdf-page[data-page="' + shown + '"] svg');
+      return !!svg && svg.querySelectorAll('tspan[font-weight="bold"]').length > 0;
+    })()`,
+    'the bionic render of a cropped page',
+    60000,
+  );
+  const croppedBold = await bionicState();
+  console.log('cropped + bold: ' + JSON.stringify({ viewBox: croppedBox, boldViewBox: croppedBold.viewBox }));
+  if (croppedBold.viewBox !== croppedBox) fail(`bionic reading changed the crop (${croppedBox} -> ${croppedBold.viewBox})`);
+  // Back to nothing at all, which is where the next section finds the reader.
+  await page.evaluate(() => document.getElementById('bionic-btn').click());
+  await page.evaluate(() => document.getElementById('crop-none').click());
+  await waitUntil(
+    `(() => {
+      const shown = document.getElementById('pageno').value;
+      const svg = document.getElementById('viewer').shadowRoot.querySelector('.wpdf-page[data-page="' + shown + '"] svg');
+      return !!svg && (svg.getAttribute('viewBox') ?? '').startsWith('0 0 ') && svg.querySelectorAll('tspan[font-weight="bold"]').length === 0;
+    })()`,
+    'the page and the text to come back',
+    60000,
+  );
+
   // ------------------------------------------------------- the public example
   // The shipped page has no documents of its own, so this is the path a reader
   // takes: the example is downloaded from its public URL and rendered like any

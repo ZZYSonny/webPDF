@@ -539,6 +539,32 @@ select.btn {
   white-space: normal;
 }
 
+/* -------------------------------------------------------- bionic reading */
+
+/**
+ * One square, because it is one mode: a fixed width and height, the letter
+ * centred in it, and the pressed state carried by `aria-pressed` rather than by
+ * a class of its own - the attribute is what a screen reader reads out anyway,
+ * so the styling and the state cannot drift apart.
+ */
+.bionic-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  font-size: 13px;
+  font-weight: 700;
+  line-height: 1;
+}
+
+.bionic-btn[aria-pressed='true'] {
+  background: var(--accent-dim);
+  border-color: var(--accent);
+  color: #fff;
+}
+
 /* ------------------------------------------------------------ layout */
 
 .layout {

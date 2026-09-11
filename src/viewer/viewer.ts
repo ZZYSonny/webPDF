@@ -57,7 +57,7 @@ export type ViewerEvent =
       /** True while the browser is magnifying the page. */
       zoomed: boolean;
     }
-  | { type: 'render'; page: number; ms: number; asText: number; asOutlines: number }
+  | { type: 'render'; page: number; ms: number; asText: number; asOutlines: number; spaces: number }
   /**
    * Cropping advanced: `measured` of `total` pages have a box. A crop changes
    * every page's height, so it cannot be applied in one go without reading the
@@ -219,6 +219,8 @@ export class PdfViewer {
   private cropRules: CropRuleId[] = [];
   /** Page units kept around the content box, on every side. */
   private padding = 0;
+  /** Bionic reading: bold every word's first letters. */
+  private bionicOn = false;
   /** Bumped whenever the selection changes, so a running pass gives up. */
   private cropEpoch = 0;
   private cropMeasured = 0;
@@ -592,6 +594,32 @@ export class PdfViewer {
     return this.padding;
   }
 
+  /* ------------------------------------------------------------- bionic */
+
+  /**
+   * Bionic reading: bold the first letters of every word, so the eye has
+   * somewhere to land and the brain finishes the word.
+   *
+   * This changes how the text is drawn and nothing else. Every character in
+   * these pages carries its own x and y, so a bold one is drawn bold exactly
+   * where it was: the pages do not move, do not change size, and do not have to
+   * be measured again. That is why this re-renders what is on screen rather
+   * than re-laying it out. Default off, so a document opens looking like itself.
+   */
+  setBionic(on: boolean): void {
+    const next = on === true;
+    if (next === this.bionicOn) return;
+    this.bionicOn = next;
+    // What is on screen was drawn without them (or with), and is now wrong.
+    this.invalidateAll();
+    this.update();
+  }
+
+  /** Whether pages are drawn with bionic reading's fixation points. */
+  get bionic(): boolean {
+    return this.bionicOn;
+  }
+
   private measureCrop(): void {
     const measure = this.engine.measureCrop?.bind(this.engine);
     const rules = this.cropRules;
@@ -811,6 +839,7 @@ export class PdfViewer {
       className: 'wpdf-page-svg',
       crop: this.cropRules,
       cropPadding: this.padding,
+      bionic: this.bionicOn,
     });
     return rendered.svg;
   }
@@ -1024,6 +1053,7 @@ export class PdfViewer {
       className: 'wpdf-page-svg',
       crop: this.cropRules,
       cropPadding: this.padding,
+      bionic: this.bionicOn,
     };
     try {
       DEBUG('render start', index);
@@ -1043,6 +1073,7 @@ export class PdfViewer {
         ms: rendered.stats.ms,
         asText: rendered.stats.glyphsAsText,
         asOutlines: rendered.stats.glyphsAsOutlines,
+        spaces: rendered.stats.spaces,
       });
     } catch (error) {
       DEBUG('render failed', index, String(error));

@@ -79,6 +79,8 @@ export interface RenderDocumentOptions extends EngineOptions {
    * SVGs without a viewer.
    */
   crop?: readonly CropRuleId[] | null;
+  /** Bold the first letters of every word, the way bionic reading does. */
+  bionic?: boolean;
   onPage?: (page: RenderedPage, index: number) => void | Promise<void>;
   signal?: AbortSignal;
 }
@@ -108,6 +110,7 @@ export async function* renderDocument(
         responsive: false,
         idPrefix: `p${i}-`,
         crop: opts.crop,
+        bionic: opts.bionic,
       });
       await opts.onPage?.(page, i);
       yield page;
