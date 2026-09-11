@@ -148,6 +148,37 @@ export class PageLayout {
     const b = this.boxes[Math.max(0, Math.min(index, this.boxes.length - 1))];
     return b ? Math.max(0, b.top - this.opt.padding) : 0;
   }
+
+  /**
+   * Scroll offset that brings a point *inside* a page to the top of the viewport
+   * - what an internal link's destination asks for. `y` is in page units, and is
+   * clamped to the page: a destination outside it is a broken annotation, not an
+   * invitation to scroll somewhere else.
+   */
+  offsetOfPoint(index: number, y: number, scale: number): number {
+    const b = this.boxes[Math.max(0, Math.min(index, this.boxes.length - 1))];
+    if (!b) return 0;
+    if (!Number.isFinite(y) || y <= 0) return b.top;
+    return b.top + Math.min(y, b.height / (scale || 1)) * scale;
+  }
+
+  /**
+   * The other direction: which page, and which point inside it, a scroll offset
+   * puts at the top of the viewport. Exactly the inverse of `offsetOfPoint` and
+   * `offsetOf` (a y of null is a page top), which is what lets a position be
+   * remembered and come back to at a different zoom.
+   */
+  pointAt(offset: number, scale: number): { index: number; y: number | null } {
+    if (this.boxes.length === 0) return { index: 0, y: null };
+    let index = 0;
+    for (let i = 0; i < this.boxes.length; i++) {
+      if (this.boxes[i].top <= offset + this.opt.padding) index = i;
+      else break;
+    }
+    const b = this.boxes[index];
+    const y = (offset - b.top) / (scale || 1);
+    return { index, y: y <= 0 ? null : Math.min(y, b.height / (scale || 1)) };
+  }
 }
 
 export type ZoomMode = 'custom' | 'fit-width' | 'fit-page';

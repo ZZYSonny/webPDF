@@ -48,17 +48,29 @@ export interface SvgDimensions {
   viewBox: string;
 }
 
-/** Read the width/height/viewBox MuPDF wrote onto the root `<svg>` element. */
+/**
+ * Read the page geometry MuPDF wrote onto the root `<svg>` element.
+ *
+ * The `viewBox` is the page's own size and is what this prefers: the
+ * width/height attributes may since have been rewritten to fill a container
+ * (`rewriteSvgRoot`), at which point they say nothing about the page.
+ */
 export function readSvgDimensions(svg: string): SvgDimensions | null {
   const root = /<svg\b[^>]*>/.exec(svg);
   if (!root) return null;
-  const w = /\bwidth="([^"]*)"/.exec(root[0]);
-  const h = /\bheight="([^"]*)"/.exec(root[0]);
   const vb = /\bviewBox="([^"]*)"/.exec(root[0]);
-  const width = w ? Number.parseFloat(w[1]) : NaN;
-  const height = h ? Number.parseFloat(h[1]) : NaN;
-  if (!Number.isFinite(width) || !Number.isFinite(height)) return null;
-  return { width, height, viewBox: vb ? vb[1] : `0 0 ${width} ${height}` };
+  if (vb) {
+    const parts = vb[1].trim().split(/[\s,]+/).map(Number);
+    if (parts.length === 4 && parts.every(Number.isFinite) && parts[2] > 0 && parts[3] > 0) {
+      return { width: parts[2], height: parts[3], viewBox: vb[1] };
+    }
+  }
+  const px = (attr: RegExpExecArray | null): number =>
+    attr && /^[\d.]+$/.test(attr[1].trim()) ? Number.parseFloat(attr[1]) : NaN;
+  const width = px(/\bwidth="([^"]*)"/.exec(root[0]));
+  const height = px(/\bheight="([^"]*)"/.exec(root[0]));
+  if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) return null;
+  return { width, height, viewBox: `0 0 ${width} ${height}` };
 }
 
 export interface SvgRootOptions {

@@ -76,6 +76,107 @@ const searchState = () =>
     };
   });
 
+/* ------------------------------------------------------------------ links */
+
+/**
+ * Every hit area of one kind that is on screen right now, with the point to
+ * click. A link under the sticky bar, or half off the viewport, cannot be
+ * clicked, so it is not a candidate.
+ */
+const linkCandidates = (kind) =>
+  page.evaluate(`(() => {
+    const sr = document.getElementById('viewer').shadowRoot;
+    const chrome = document.querySelector('.topbar')?.offsetHeight ?? 0;
+    const out = [];
+    for (const svg of sr.querySelectorAll('svg.wpdf-page-svg')) {
+      for (const a of svg.querySelectorAll('a[data-wpdf-link="${kind}"]')) {
+        const r = a.getBoundingClientRect();
+        if (r.width < 2 || r.height < 2) continue;
+        if (r.top < chrome + 8 || r.bottom > innerHeight - 8) continue;
+        out.push({
+          slot: a.closest('.wpdf-page')?.dataset.page ?? null,
+          page: a.getAttribute('data-wpdf-page'),
+          dest: a.getAttribute('data-wpdf-y'),
+          uri: a.getAttribute('data-wpdf-uri'),
+          href: a.getAttribute('href'),
+          tabindex: a.getAttribute('tabindex'),
+          cx: r.left + r.width / 2,
+          cy: r.top + r.height / 2,
+        });
+      }
+    }
+    return out;
+  })()`);
+
+/** What the browser actually hits at a point - the transparent rect, hopefully. */
+const whatIsAt = (cx, cy) =>
+  page.evaluate(`(() => {
+    const sr = document.getElementById('viewer').shadowRoot;
+    const el = sr.elementFromPoint(${cx}, ${cy});
+    const a = el && el.closest ? el.closest('a[data-wpdf-link]') : null;
+    return {
+      tag: el ? el.tagName : null,
+      kind: a ? a.getAttribute('data-wpdf-link') : null,
+      page: a ? a.getAttribute('data-wpdf-page') : null,
+      uri: a ? a.getAttribute('data-wpdf-uri') : null,
+    };
+  })()`);
+
+/** Where a destination ended up, and whether anything navigated to get there. */
+const landed = (page_, y) =>
+  page.evaluate(`(() => {
+    const sr = document.getElementById('viewer').shadowRoot;
+    const box = sr.querySelector('.wpdf-page[data-page="${page_}"]');
+    const scale = window.webpdf.viewer().zoom;
+    return {
+      pageno: document.getElementById('pageno').value,
+      scrollY: Math.round(window.scrollY),
+      // The destination point, measured in the viewport it was supposed to land in.
+      top: box ? Math.round(box.getBoundingClientRect().top + ${y} * scale) : null,
+      chrome: document.querySelector('.topbar')?.offsetHeight ?? 0,
+      hash: location.hash,
+      href: location.href,
+      url: document.getElementById('toast')?.textContent ?? '',
+    };
+  })()`);
+
+const mouseClick = async (cx, cy) => {
+  await page.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: cx, y: cy, button: 'none', buttons: 0 });
+  await page.send('Input.dispatchMouseEvent', { type: 'mousePressed', x: cx, y: cy, button: 'left', buttons: 1, clickCount: 1 });
+  await page.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: cx, y: cy, button: 'left', buttons: 0, clickCount: 1 });
+};
+
+const pressEnter = async () => {
+  const key = { key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13, nativeVirtualKeyCode: 13 };
+  await page.send('Input.dispatchKeyEvent', { type: 'rawKeyDown', ...key });
+  await page.send('Input.dispatchKeyEvent', { type: 'keyUp', ...key });
+};
+
+/** Wait for an expression *string* to become truthy (the page's number is in it). */
+const waitUntil = async (expression, label, timeout = 30000) => {
+  const deadline = Date.now() + timeout;
+  let last;
+  while (Date.now() < deadline) {
+    last = await page.evaluate(expression);
+    if (last) return last;
+    await new Promise((r) => setTimeout(r, 150));
+  }
+  throw new Error(`Timed out waiting for ${label} (last value: ${JSON.stringify(last)})`);
+};
+
+/** Wait for a page's SVG to be in the DOM, so its links can be clicked. */
+const waitForPage = async (n, timeout = 30000) => {
+  await waitUntil(
+    `(() => {
+      const sr = document.getElementById('viewer')?.shadowRoot;
+      return !!sr?.querySelector('.wpdf-page[data-page="${n}"] svg.wpdf-page-svg');
+    })()`,
+    `page ${n} render`,
+    timeout,
+  );
+  await new Promise((r) => setTimeout(r, 300));
+};
+
 try {
   await page.goto(url);
   // The module graph includes a 10 MB wasm fetch, so wait until the app has
@@ -380,6 +481,183 @@ try {
       highlights: document.getElementById('viewer').shadowRoot.querySelectorAll('rect[data-wpdf-search]').length,
     }));
     if (cleared.highlights !== 0 || cleared.count !== '') fail(`clearing should remove the boxes, got ${JSON.stringify(cleared)}`);
+  }
+
+  // ----------------------------------------------------------------- links
+  // Everything below drives real mouse and key events, because the point of a
+  // link is that a transparent rectangle is hit-testable where it looks like it
+  // is: a synthetic `el.click()` would pass even if nothing could be clicked.
+  if (!cachedDoc) {
+    console.log('— skipping the link checks: they are written against the cached paper —');
+  } else {
+    console.log('— links: an internal jump —');
+    // Page 1 of the paper is its title page and carries no links at all; the
+    // citations start on page 2.
+    await page.evaluate(() => window.webpdf.viewer().goToPage(2));
+    await waitForPage(2);
+
+    const internal = (await linkCandidates('internal')).filter((l) => Number(l.page) !== 2);
+    console.log(`candidates on page 2: ${internal.length}`);
+    if (!internal.length) fail('page 2 of the paper should offer internal links');
+    const jump = internal[0];
+    if (jump.tabindex !== '0') fail(`a hit area should be focusable, got tabindex=${jump.tabindex}`);
+
+    const hit = await whatIsAt(jump.cx, jump.cy);
+    if (hit.kind !== 'internal' || hit.page !== jump.page) {
+      fail(`the click point should hit the link itself, got ${JSON.stringify(hit)}`);
+    }
+
+    const before = await landed(2, 0);
+    await mouseClick(jump.cx, jump.cy);
+    await waitUntil(`document.getElementById('pageno').value === ${JSON.stringify(jump.page)}`, `jump to page ${jump.page}`);
+    await new Promise((r) => setTimeout(r, 400));
+    const after = await landed(jump.page, jump.dest === null ? 0 : Number(jump.dest));
+    console.log(`clicked a link to page ${jump.page} (y=${jump.dest}): ` + JSON.stringify(after));
+    if (after.pageno !== jump.page) fail(`the jump should land on page ${jump.page}, got ${after.pageno}`);
+    // The destination is put at the top of the viewport, clear of the sticky bar
+    // - not at the top of the window, which is where the bar is.
+    if (after.top === null) fail(`page ${jump.page} is not rendered after the jump`);
+    else if (Math.abs(after.top - after.chrome) > 3) {
+      fail(`the destination should sit just below the bar (${after.chrome}px), it is at ${after.top}px`);
+    }
+    // An internal link is the viewer's own business: the page's URL is the
+    // host's, and a PDF destination is not a document fragment.
+    if (after.hash !== '' || after.href !== before.href) {
+      fail(`an internal jump must not touch the URL: ${before.href} -> ${after.href}`);
+    }
+
+    console.log('— links: Back returns to where the link was clicked —');
+    // The jump is in the session history (with the URL untouched), so Back is the
+    // reader's undo: the position before the click, then Forward for the jump.
+    await page.evaluate('history.back()');
+    await waitUntil(`document.getElementById('pageno').value === ${JSON.stringify(before.pageno)}`, `Back to page ${before.pageno}`);
+    await new Promise((r) => setTimeout(r, 400));
+    const wentBack = await landed(before.pageno, 0);
+    console.log(`after Back: page ${wentBack.pageno}, scrollY ${wentBack.scrollY} (was ${before.scrollY})`);
+    if (Math.abs(wentBack.scrollY - before.scrollY) > 2) {
+      fail(`Back should restore the scroll position ${before.scrollY}, it is at ${wentBack.scrollY}`);
+    }
+    if (wentBack.hash !== '' || wentBack.href !== before.href) {
+      fail(`Back must not change the URL either: ${wentBack.href}`);
+    }
+
+    await page.evaluate('history.forward()');
+    await waitUntil(`document.getElementById('pageno').value === ${JSON.stringify(jump.page)}`, `Forward to page ${jump.page}`);
+    await new Promise((r) => setTimeout(r, 400));
+    const wentForward = await landed(jump.page, jump.dest === null ? 0 : Number(jump.dest));
+    console.log(`after Forward: page ${wentForward.pageno}, scrollY ${wentForward.scrollY} (was ${after.scrollY})`);
+    if (Math.abs(wentForward.scrollY - after.scrollY) > 2) {
+      fail(`Forward should return to the link's destination (${after.scrollY}), it is at ${wentForward.scrollY}`);
+    }
+
+    console.log('— links: the keyboard reaches them too —');
+    await page.evaluate(() => window.webpdf.viewer().goToPage(2));
+    await waitForPage(2);
+    const focused = await page.evaluate(`(() => {
+      const sr = document.getElementById('viewer').shadowRoot;
+      const a = [...sr.querySelectorAll('a[data-wpdf-link="internal"]')]
+        .find((el) => el.getAttribute('data-wpdf-page') !== '2');
+      if (!a) return null;
+      a.focus();
+      return { page: a.getAttribute('data-wpdf-page'), active: sr.activeElement === a || document.activeElement === a };
+    })()`);
+    if (!focused) fail('no internal link to focus on page 2');
+    else if (!focused.active) fail('an <a tabindex="0"> hit area did not take focus');
+    else {
+      await pressEnter();
+      await waitUntil(`document.getElementById('pageno').value === ${JSON.stringify(focused.page)}`, `keyboard jump to page ${focused.page}`);
+      console.log(`Enter on a focused link: page ${focused.page}`);
+    }
+
+    console.log('— links: an external target —');
+    // A new tab is the viewer's default, and this is what opening one looks
+    // like without one: the URI the document carries, handed to `window.open`.
+    await page.evaluate(() => {
+      window.__opened = [];
+      window.open = (uri, target, features) => {
+        window.__opened.push([uri, target, features]);
+        return null;
+      };
+    });
+    let external = [];
+    for (const n of [9, 10, 11, 8]) {
+      await page.evaluate(`window.webpdf.viewer().goToPage(${n})`);
+      await waitForPage(n);
+      external = (await linkCandidates('external')).filter((l) => /^https?:/.test(l.uri ?? ''));
+      if (external.length) break;
+    }
+    if (!external.length) fail('no external link could be found in the paper');
+    else {
+      const link = external[0];
+      console.log(`external link: ${link.uri}`);
+      const hit = await whatIsAt(link.cx, link.cy);
+      if (hit.kind !== 'external' || hit.uri !== link.uri) {
+        fail(`the click point should hit the external link, got ${JSON.stringify(hit)}`);
+      }
+      const before = await landed(link.slot, 0);
+      await mouseClick(link.cx, link.cy);
+      await new Promise((r) => setTimeout(r, 600));
+      const opened = await page.evaluate('window.__opened');
+      const after = await landed(link.slot, 0);
+      console.log('opened: ' + JSON.stringify(opened));
+      if (opened.length !== 1) fail(`exactly one link should have been opened, got ${JSON.stringify(opened)}`);
+      else {
+        if (opened[0][0] !== link.uri) fail(`opened ${opened[0][0]}, expected ${link.uri}`);
+        if (opened[0][1] !== '_blank') fail(`a link should open in a new tab, got target ${opened[0][1]}`);
+        if (!/noopener/.test(String(opened[0][2]))) fail(`the new tab should not get an opener: ${opened[0][2]}`);
+      }
+      // Following a link out of the document must not navigate the page that is
+      // showing it - that is the whole reason the viewer owns the click.
+      if (after.href !== before.href) fail(`the page navigated away: ${before.href} -> ${after.href}`);
+      if (!/new tab/.test(after.url)) fail(`the demo should say what it did with the link, got ${JSON.stringify(after.url)}`);
+    }
+
+    console.log('— links: one a browser cannot follow —');
+    // The GPT-4 report's header links to `file://gpt4-report@openai.com`. There
+    // is nothing a page can do with that, and the honest answer is to say so
+    // rather than to leave a link that looks broken.
+    const localPaper = beforeLoad.options.find((value) => value.includes('2303.08774'));
+    if (!localPaper) {
+      console.log('  (the GPT-4 report is not in the cache - skipped)');
+    } else {
+      await open(localPaper);
+      await page.waitFor(
+        () => {
+          const sr = document.getElementById('viewer')?.shadowRoot;
+          return !!sr && sr.querySelectorAll('svg.wpdf-page-svg').length > 0;
+        },
+        { label: 'GPT-4 report render', timeout: 120000 },
+      );
+      await new Promise((r) => setTimeout(r, 1200));
+      await page.evaluate('window.__opened = []');
+      // That link is at the foot of the title page, well below the fold at this
+      // zoom: bring the bottom-most external link into view before clicking it.
+      await page.evaluate(`(() => {
+        const sr = document.getElementById('viewer').shadowRoot;
+        const links = [...sr.querySelectorAll('a[data-wpdf-link="external"]')];
+        const last = links[links.length - 1];
+        if (last) last.scrollIntoView({ block: 'center' });
+        return links.length;
+      })()`);
+      await new Promise((r) => setTimeout(r, 500));
+      const untouchable = (await linkCandidates('external')).filter((l) => l.href === null);
+      if (!untouchable.length) {
+        fail('the GPT-4 report should offer its `file:` link as a hit area with no href');
+      } else {
+        const link = untouchable[0];
+        console.log(`unopenable link: ${link.uri}`);
+        if (!/^file:/.test(link.uri ?? '')) fail(`expected the file: link, got ${link.uri}`);
+        const hit = await whatIsAt(link.cx, link.cy);
+        if (hit.uri !== link.uri) fail(`the click point should hit the link itself, got ${JSON.stringify(hit)}`);
+        await mouseClick(link.cx, link.cy);
+        await new Promise((r) => setTimeout(r, 500));
+        const openedLinks = await page.evaluate('window.__opened');
+        const said = await page.evaluate("document.getElementById('toast')?.textContent ?? ''");
+        console.log(`said: ${JSON.stringify(said)}`);
+        if (openedLinks.length !== 0) fail(`nothing should have been opened, got ${JSON.stringify(openedLinks)}`);
+        if (!/cannot open/.test(said)) fail(`the demo should say the link cannot be opened, got ${JSON.stringify(said)}`);
+      }
+    }
   }
 
   // ------------------------------------------------------- the public example

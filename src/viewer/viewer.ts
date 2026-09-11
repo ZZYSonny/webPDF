@@ -31,6 +31,7 @@
 
 import type { DocumentInfo, PdfEngineLike, PdfSource, RenderOptions } from '../core/engine.ts';
 import type { FontAsset } from '../core/font/registry.ts';
+import { linkTargetOf, type LinkTarget } from '../core/links.ts';
 import { debug as DEBUG } from '../core/debug.ts';
 import {
   computeFitScale,
@@ -57,7 +58,16 @@ export type ViewerEvent =
     }
   | { type: 'render'; page: number; ms: number; asText: number; asOutlines: number }
   | { type: 'error'; error: unknown; page?: number }
-  | { type: 'drop-accepted'; name: string };
+  | { type: 'drop-accepted'; name: string }
+  /**
+   * A link in the document was activated, either by a click on its hit area or
+   * from the keyboard. Returning `false` from `onEvent` takes the link over: the
+   * viewer then does nothing, and the host does whatever it likes with the
+   * (mutable) event. Otherwise an internal link jumps and an external one opens
+   * in a new tab - unless its scheme is not one a browser will follow, in which
+   * case `openable` is false and the viewer only reports it.
+   */
+  | ({ type: 'link' } & LinkTarget);
 
 export interface PdfViewerOptions {
   container: HTMLElement;
@@ -81,10 +91,31 @@ export interface PdfViewerOptions {
    * host page (or a browser extension) whose CSS you do not control.
    */
   shadowDom?: boolean;
+  /**
+   * Pixels of the host's own chrome sitting above the pages - a sticky top bar,
+   * say. Every scroll the viewer performs stops this far short, so a page or a
+   * link destination is not parked underneath it. Pass a function to have it
+   * re-measured (the value is read at each scroll), or leave it out when nothing
+   * overlaps the pages.
+   */
+  scrollMargin?: number | (() => number);
+  /**
+   * Record a jump to an internal link in the browser's session history, so the
+   * Back button returns to the position you were reading (and Forward to where
+   * the link went). The URL is never touched - the entries differ only in their
+   * state. Default true; set it to false when the host page owns the history
+   * (an embedded viewer inside a single-page app, say), in which case Back
+   * leaves the document instead of stepping back inside it.
+   */
+  history?: boolean;
   /** Accept PDFs dropped onto the container. */
   acceptDrop?: boolean;
   className?: string;
-  onEvent?: (event: ViewerEvent) => void;
+  /**
+   * Called for every viewer event. Return `false` to take a `link` over; the
+   * return value is ignored for everything else.
+   */
+  onEvent?: (event: ViewerEvent) => void | boolean;
 }
 
 interface PageSlot {
@@ -100,6 +131,23 @@ interface QueueEntry {
   index: number;
   priority: number;
   seq: number;
+}
+
+/**
+ * A position in the document: a page, and a point within it (`null` = the page
+ * top). Page units, not pixels, so it survives a zoom between the two moments -
+ * and `doc` is which document it was, because a history entry outlives the
+ * document it was recorded in.
+ */
+interface Place {
+  doc: number;
+  page: number;
+  y: number | null;
+}
+
+/** The state a viewer owns in the browser's history, under one key. */
+interface HistoryState {
+  webpdf?: Place;
 }
 
 const DEFAULT_KEEP = 1;
@@ -133,7 +181,7 @@ function isEditable(target: EventTarget | null): boolean {
 }
 
 export class PdfViewer {
-  private readonly opt: Required<Omit<PdfViewerOptions, 'onEvent'>> & { onEvent?: (e: ViewerEvent) => void };
+  private readonly opt: Required<Omit<PdfViewerOptions, 'onEvent'>> & { onEvent?: (e: ViewerEvent) => void | boolean };
   private readonly engine: PdfEngineLike;
   /** The host element; its height is set to the full layout height. */
   private readonly host: HTMLElement;
@@ -170,6 +218,8 @@ export class PdfViewer {
   private resizeObserver: ResizeObserver | null = null;
   private lastWidth = 0;
   private lastDpr = 1;
+  /** Bumped per document, so a history entry cannot land in the wrong one. */
+  private docSeq = 0;
 
   private constructor(opts: PdfViewerOptions) {
     this.engine = opts.engine;
@@ -184,6 +234,8 @@ export class PdfViewer {
       keepPages: opts.keepPages ?? DEFAULT_KEEP,
       concurrency: opts.concurrency ?? 1,
       shadowDom: opts.shadowDom ?? false,
+      scrollMargin: opts.scrollMargin ?? 0,
+      history: opts.history ?? true,
       acceptDrop: opts.acceptDrop ?? true,
       className: opts.className ?? '',
       onEvent: opts.onEvent,
@@ -245,6 +297,11 @@ export class PdfViewer {
     window.visualViewport?.addEventListener('resize', this.onPageScale);
     window.visualViewport?.addEventListener('scroll', this.onPageScale);
     document.addEventListener('keydown', this.onKeyDown);
+    window.addEventListener('popstate', this.onPopState);
+    // Delegate both link gestures inside the shadow tree, where the hit areas
+    // live and where `event.target` is not retargeted to the shadow host.
+    this.pagesEl.addEventListener('click', this.onClick);
+    this.pagesEl.addEventListener('keydown', this.onLinkKeyDown);
     if (this.opt.acceptDrop) this.installDropTarget();
 
     if (typeof ResizeObserver !== 'undefined') {
@@ -272,6 +329,7 @@ export class PdfViewer {
 
   setDocument(info: DocumentInfo): void {
     this.info = info;
+    this.docSeq++;
     this.geometry = info.pages.map((p) => ({ width: p.width, height: p.height }));
     this.clearSlots();
     // A newly opened document starts at the level the `zoom` option asks for,
@@ -433,6 +491,54 @@ export class PdfViewer {
     this.update();
   }
 
+  /**
+   * Scroll to a destination: a page, and optionally a point within it in the
+   * document's own coordinates (points from the page's top-left, the space
+   * `PageLink` uses). This is where an internal link goes; `goToPage` is the
+   * same call with no point.
+   */
+  goToDestination(page: number, y: number | null = null): void {
+    if (!this.info) return;
+    const index = Math.max(0, Math.min(this.info.pageCount - 1, Math.round(page) - 1));
+    const offset = y === null ? this.layout.offsetOf(index) : this.layout.offsetOfPoint(index, y, this.scale);
+    this.scrollToOffset(offset);
+    this.update();
+  }
+
+  /* -------------------------------------------------------------- history */
+
+  /** Where the reader is now: the page, and the point at the top of the page area. */
+  private placeHere(): Place {
+    // Measured from the top of the *page area*, not of the window: a host's
+    // chrome covers the first `scrollMargin` pixels, and restoring uses the same
+    // margin, so the two cancel out and the position comes back exactly.
+    const point = this.layout.pointAt(this.scrollOffset() + this.scrollMargin(), this.scale);
+    return { doc: this.docSeq, page: point.index + 1, y: point.y };
+  }
+
+  /**
+   * Make a jump something Back can undo: the position being left is written into
+   * the entry that is current now, and the position being gone to becomes the
+   * new entry. Both halves are needed - with only the first, Forward would come
+   * back to where the link was *clicked* rather than where it went.
+   */
+  private rememberPlace(from: Place, to: Place): void {
+    if (!this.opt.history || typeof history === 'undefined' || !history.pushState) return;
+    try {
+      history.replaceState({ webpdf: from } satisfies HistoryState, '');
+      history.pushState({ webpdf: to } satisfies HistoryState, '');
+    } catch {
+      // A host that has frozen history, or a sandboxed document without one:
+      // jumping is more important than remembering where from.
+    }
+  }
+
+  private onPopState = (event: PopStateEvent): void => {
+    const place = (event.state as HistoryState | null)?.webpdf;
+    if (!place || place.doc !== this.docSeq) return;
+    this.goToDestination(place.page, place.y);
+  };
+
   nextPage(): void {
     this.goToPage(this.currentPage + 1);
   }
@@ -460,13 +566,22 @@ export class PdfViewer {
 
   /* ------------------------------------------------------- scroll mapping */
 
+  /**
+   * Whatever the host has parked over the pages. Scrolling short by it is what
+   * keeps a target from disappearing behind that chrome.
+   */
+  private scrollMargin(): number {
+    const raw = typeof this.opt.scrollMargin === 'function' ? this.opt.scrollMargin() : this.opt.scrollMargin;
+    return Number.isFinite(raw) && raw > 0 ? raw : 0;
+  }
+
   /** Offset of the viewport's top edge within the laid-out pages. */
   private scrollOffset(): number {
     return -this.host.getBoundingClientRect().top;
   }
 
   private scrollToOffset(offset: number): void {
-    const top = this.host.getBoundingClientRect().top + window.scrollY + offset;
+    const top = this.host.getBoundingClientRect().top + window.scrollY + offset - this.scrollMargin();
     window.scrollTo({ top: Math.max(0, top), behavior: 'auto' });
   }
 
@@ -700,6 +815,55 @@ export class PdfViewer {
 
   /* ------------------------------------------------------------- gestures */
 
+  /**
+   * A click on a link hit area. Left clicks only: a middle click (which the
+   * browser delivers as `auxclick`) keeps its native meaning, and the context
+   * menu still offers the anchor's own `href`.
+   */
+  private onClick = (event: MouseEvent): void => {
+    if (event.defaultPrevented || event.button !== 0) return;
+    const target = linkTargetOf(event.target as Element | null);
+    if (!target) return;
+    // Own the click from here on, whether or not a host takes it over: the
+    // hit areas are not meant to navigate the host page themselves.
+    event.preventDefault();
+    this.activateLink(target);
+  };
+
+  /** The same activation from the keyboard, for a focused hit area. */
+  private onLinkKeyDown = (event: KeyboardEvent): void => {
+    if (event.key !== 'Enter' && event.key !== ' ') return;
+    const target = linkTargetOf(event.target as Element | null);
+    if (!target) return;
+    event.preventDefault();
+    this.activateLink(target);
+  };
+
+  /**
+   * Tell the host about a link - the event object is handed out as it is, so a
+   * host that wants a different target can simply change the fields before
+   * letting the default run - and then do whatever the viewer does with it,
+   * unless the host took it over by returning false.
+   */
+  private activateLink(target: LinkTarget): void {
+    const event: { type: 'link' } & LinkTarget = { type: 'link', ...target };
+    if (this.emit(event)) this.performLink(event);
+  }
+
+  private performLink(event: { type: 'link' } & LinkTarget): void {
+    if (event.kind === 'internal') {
+      const index = Math.max(0, Math.min((this.info?.pageCount ?? 1) - 1, Math.round(event.page) - 1));
+      this.rememberPlace(this.placeHere(), { doc: this.docSeq, page: index + 1, y: event.y });
+      this.goToDestination(event.page, event.y);
+      return;
+    }
+    // A URI no browser will follow is reported and left alone; a host that can
+    // do something with it (an extension opening a local file, say) takes the
+    // link over instead of letting this run.
+    if (!event.openable) return;
+    window.open(event.uri, '_blank', 'noopener,noreferrer');
+  }
+
   private onKeyDown = (event: KeyboardEvent): void => {
     const mod = event.ctrlKey || event.metaKey;
     if (mod && !event.altKey) {
@@ -784,8 +948,9 @@ export class PdfViewer {
     });
   }
 
-  private emit(event: ViewerEvent): void {
-    this.opt.onEvent?.(event);
+  /** Returns false when a host handler took the event over by returning false. */
+  private emit(event: ViewerEvent): boolean {
+    return this.opt.onEvent?.(event) !== false;
   }
 
   destroy(): void {
@@ -801,6 +966,9 @@ export class PdfViewer {
     window.visualViewport?.removeEventListener('resize', this.onPageScale);
     window.visualViewport?.removeEventListener('scroll', this.onPageScale);
     document.removeEventListener('keydown', this.onKeyDown);
+    window.removeEventListener('popstate', this.onPopState);
+    this.pagesEl.removeEventListener('click', this.onClick);
+    this.pagesEl.removeEventListener('keydown', this.onLinkKeyDown);
     this.clearSlots();
     this.surface.remove();
     this.host.style.height = '';
@@ -818,5 +986,14 @@ const VIEWER_CSS = `
 .wpdf-pages{position:relative;margin:0 auto}
 .wpdf-page{position:absolute;background:#fff;box-shadow:0 1px 3px rgba(0,0,0,.22);overflow:hidden;contain:strict}
 .wpdf-page-svg{display:block;width:100%;height:100%}
+/* A PDF link is an invisible rectangle, so the only way to know it is there is
+   to be told: the hit area lights up under the pointer and under the keyboard.
+   It is deliberately not boxed in the page the way an editable field is - a
+   document's own pixels stay its own (and so does an exported SVG); the
+   affordance belongs to the viewer. */
+.wpdf-page-svg a.wpdf-link{cursor:pointer}
+.wpdf-page-svg a.wpdf-link:hover>rect{fill:rgba(37,99,235,.16)}
+.wpdf-page-svg a.wpdf-link:focus-visible{outline:none}
+.wpdf-page-svg a.wpdf-link:focus-visible>rect{fill:rgba(37,99,235,.22);stroke:#2563eb;stroke-width:1}
 .wpdf-host.wpdf-drop-active::after{content:"";position:absolute;inset:6px;border:2px dashed #2563eb;border-radius:8px;pointer-events:none;z-index:5}
 `;

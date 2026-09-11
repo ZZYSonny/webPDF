@@ -113,11 +113,17 @@ their public URLs (`demo/papers.mjs`):
 | document | outline SVG | with real text | glyphs as text | fonts (WOFF) |
 | --- | --- | --- | --- | --- |
 | *Attention Is All You Need*, 1 page (6 Type 1/PFB fonts) | 373 KB | 65 KB (**17%**) | 2464 / 2464 | 6 (21 KB) |
-| *Deep Residual Learning*, 1 page (9 fonts, bitmap figures) | 572 KB | 96 KB (**17%**) | 3630 / 3630 | 9 (33 KB) |
-| *GPT-4 Technical Report*, 1 page (6 fonts) | 397 KB | 76 KB (**19%**) | 2917 / 2917 | 6 (19 KB) |
+| *Deep Residual Learning*, 1 page (9 fonts, bitmap figures) | 572 KB | 103 KB (**18%**) | 3630 / 3630 | 9 (33 KB) |
+| *GPT-4 Technical Report*, 1 page (6 fonts) | 397 KB | 78 KB (**20%**) | 2917 / 2917 | 6 (19 KB) |
 
-The same paper over 3 pages: 1255 KB of outlines become 424 KB (34%) across 18
+The same paper over 3 pages: 1255 KB of outlines become 429 KB (34%) across 18
 distinct faces, 51 KB of WOFF.
+
+Those numbers are the default output, link hit areas included — that is what the
+extra 1–7 KB buys: one anchor and one transparent rectangle per link annotation
+(37 on the *Deep Residual Learning* page, 8 on the *GPT-4* page, 33 across the
+first three pages of *Attention Is All You Need*, and none at all on its title
+page). `links: false` drops them again.
 
 Ink coverage of the text render against MuPDF's own outline render: **100.000%**
 (page 1 of *Attention Is All You Need*), 99.5–99.9% across the other pages
@@ -199,6 +205,70 @@ page rendered either side of the viewport):
 | Ctrl+= (one ladder step, re-layout) | 3 | 30-90 | - |
 | the previous design: JS resize of every page box per zoom step | 1/step | **~17.5/step** | 16.7 / 16.8 |
 
+### Links
+
+A PDF link is an invisible rectangle over the page content, so the renderer
+supplies both the target and the affordance. Every link annotation becomes a
+transparent, focusable `<a>` hit area inside the page's SVG, and the same links
+come back as data on the rendered page:
+
+```ts
+const page = await engine.renderPage(0);
+page.links;   // [{ kind: 'internal', rect, page, x, y }, { kind: 'external', rect, uri }]
+```
+
+Because the hit areas *are* part of the SVG, they scale with the page at any zoom
+without anything being re-measured, they survive `exportSvg`, and a downloaded
+SVG file carries its own links. They are invisible, though: a PDF's links are
+invisible, an exported SVG should be the page's own pixels, and no browser boxes
+an anchor either — so the pointer and the keyboard are what reveal them (hover
+paints a wash over the link, focus rings it). A `javascript:` URI never becomes
+an `href`: a PDF is untrusted input, and an `href` is an instruction to navigate.
+
+In the viewer, a click (or Enter, on a focused hit area) is caught rather than
+followed - the page showing the document is never replaced by what the document
+links to:
+
+```ts
+createViewer({
+  container: '#viewer',
+  // The viewer's own chrome overlaps the pages, so jumps stop short of it.
+  scrollMargin: () => document.querySelector('.topbar')!.offsetHeight,
+  onEvent: (event) => {
+    if (event.type !== 'link') return;
+    if (event.kind === 'external' && !allowed(event.uri)) {
+      openInMyOwnTab(event.uri);
+      return false;             // taken over: the viewer does nothing
+    }
+    if (event.kind === 'internal') event.y = null;  // go to the page top instead
+    // Returning anything else lets the default run, with the event as edited.
+  },
+});
+```
+
+* An **internal** link scrolls to the destination *point*, not just to the page:
+  the destination the PDF names (its `y`, in points from the page's top-left)
+  ends up at the top of the viewport, clear of `scrollMargin`. A destination
+  without a point - `Fit`, `FitB`, a bare `#page=` - targets the page top
+  instead. Nothing is written to the URL: a destination is not a document
+  fragment, and in an embedded viewer the address bar belongs to the host.
+* An **external** link opens in a new tab (`window.open(uri, '_blank',
+  'noopener,noreferrer')`). The anchor keeps its own `href`, so middle-click,
+  Ctrl-click and "copy link address" behave the way they do everywhere else.
+* **Back undoes a jump.** Following an internal link writes two entries into the
+  session history - the position being left, and the destination - so the
+  browser's Back button returns to exactly where the link was clicked from, and
+  Forward returns to where it went. A position is remembered as a page and a
+  point inside it, not as a pixel offset, so it still lands on the same line
+  after a zoom in between. The URL is never touched: the entries differ only in
+  their state, and `history: false` opts out entirely for a host whose own router
+  owns the history (or a viewer embedded in a single-page app, where Back should
+  leave the document rather than step back inside it).
+* A URI a browser will not follow - `javascript:`, `data:`, `file:`, a relative
+  path - gets a hit area and a `link` event with `openable: false`, but no
+  `href`. Only the host knows whether it can do something with one of those (an
+  extension fetching a `file:` URL, say), so the viewer reports it and stops.
+
 ### The demo app
 
 `npm run dev` serves the demo, which is this library plus a toolbar. The toolbar
@@ -239,6 +309,13 @@ viewer:
 * **Search ignores whitespace on both sides.** Runs are one positioned string
   each and a space glyph has no outline to build a font from, so a page's text can
   read `AttentionIsAllYouNeed` (see the limitations).
+* **Links are the viewer's, and the demo just says what happened.** Clicking an
+  external link opens it in a new tab and the toast names the URI; a link a
+  browser cannot follow (the *GPT-4 Technical Report* links to a local file) gets
+  the same click, no navigation, and a toast that says so. Back - the browser's
+  own button, there is no chrome for it - returns to the position a link was
+  clicked from. The demo does not take a link over: `onEvent` returning `false`
+  is the hook for a host that wants to.
 
 ### Headless rendering
 
@@ -260,6 +337,10 @@ for await (const page of renderDocument(bytes, { embedFonts: true })) {
 `embedFonts: true` puts the `@font-face` rules inside the SVG, which is what
 makes an exported file self-contained — required for `<img src="…svg">`, for a
 downloaded file, or for a CSS background.
+
+Link hit areas are included by default, so the exported SVG is clickable where
+it is opened as a document; `links: false` leaves them out, and `page.links` is
+data either way.
 
 ### Browser extension notes
 
@@ -314,6 +395,7 @@ src/
   core/
     engine.ts               MuPDF document + page rendering (DOM-free)
     debug.ts                opt-in pipeline tracing
+    links.ts                link annotations → data, and → SVG hit areas
     svg/
       glyphs.ts             scanner for MuPDF's SVG (outlines + <use>)
       text-upgrade.ts       <use> runs → <text> runs
@@ -435,6 +517,14 @@ is referenced relatively.
 * **The worker path is verified in Chromium only.** It relies on module workers
   and `CompressionStream`, both of which are widely available, but the fallback
   exists precisely because worker startup can be blocked by a host's CSP.
+* **Links follow only what a browser can follow.** `https`, `http`, `mailto` and
+  `tel` become `href`s; everything else is reported and left inert (see
+  [Links](#links)). A relative link has no base URL to resolve against - a PDF
+  does not have one - so it is treated the same way. An internal destination
+  carries the point the PDF names, and the viewer uses its `y`: the `x` is
+  reported for hosts that care about columns, and ignored by a viewer that
+  scrolls in one column. Ink annotations, form fields and other annotation types
+  are not interactive; only link annotations are.
 
 ## Licence
 

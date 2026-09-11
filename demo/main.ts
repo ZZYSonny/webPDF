@@ -69,6 +69,12 @@ let info: DocumentInfo | null = null;
 let currentPage = 1;
 let busy = 0;
 let toastTimer = 0;
+/**
+ * Height of the sticky bar, kept current by the observer at the bottom of this
+ * file. The pages scroll *under* it, so every scroll the viewer performs has to
+ * stop this far short or it parks the target behind the chrome.
+ */
+let topbarHeight = 0;
 
 /* ---------------------------------------------------------------- sources */
 
@@ -127,6 +133,9 @@ async function ensureViewer(): Promise<PdfViewer> {
     padding: 18,
     keepPages: 1,
     shadowDom: true,
+    // Read at each scroll rather than captured, so a bar that wraps to two rows
+    // on a narrow window keeps the pages clear of it.
+    scrollMargin: () => topbarHeight,
     onEvent: onViewerEvent,
   });
   search = createSearch({ viewer, onChange: renderSearch });
@@ -183,6 +192,16 @@ function onViewerEvent(event: ViewerEvent): void {
         `${event.asText.toLocaleString()} glyphs as text` +
         (event.asOutlines ? ` · ${event.asOutlines.toLocaleString()} as outlines` : '');
       search?.refresh();
+      break;
+    case 'link':
+      // The viewer has already done the work - an internal link jumped, an
+      // external one opened in a new tab - so this only says what happened. A
+      // document can link to anything, and the ones a browser will not follow
+      // are worth spelling out rather than leaving as a dead click.
+      if (event.kind === 'external') {
+        if (event.openable) notify(`Opening ${event.uri} in a new tab`);
+        else notify(`This document links to ${event.uri}, which a browser cannot open`, 'error');
+      }
       break;
     case 'drop-accepted':
       notify(`Opening ${event.name}…`);
@@ -533,7 +552,8 @@ window.addEventListener('keydown', (event) => {
 const topbar = document.querySelector<HTMLElement>('.topbar');
 if (topbar) {
   const measure = (): void => {
-    document.documentElement.style.setProperty('--topbar-h', `${topbar.offsetHeight}px`);
+    topbarHeight = topbar.offsetHeight;
+    document.documentElement.style.setProperty('--topbar-h', `${topbarHeight}px`);
   };
   measure();
   if (typeof ResizeObserver !== 'undefined') new ResizeObserver(measure).observe(topbar);

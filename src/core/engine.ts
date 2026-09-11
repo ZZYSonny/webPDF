@@ -14,6 +14,7 @@ import { upgradeGlyphsToText } from './svg/text-upgrade.ts';
 import { FontRegistry, type FontAsset } from './font/registry.ts';
 import { debug } from './debug.ts';
 import { inlineFontCss, namespaceSvgIds, readSvgDimensions, rewriteSvgRoot, stripXmlProlog } from './svg/package.ts';
+import { injectSvgLinks, type PageLink } from './links.ts';
 
 export type PdfSource =
   | ArrayBuffer
@@ -62,6 +63,12 @@ export interface RenderOptions {
    * already carries the stylesheet.
    */
   embedFonts?: boolean;
+  /**
+   * Add a clickable hit area for every link annotation. Default true. They are
+   * invisible, so this costs bytes rather than fidelity; `links` on the result
+   * carries the same links as data either way.
+   */
+  links?: boolean;
 }
 
 export interface RenderStats {
@@ -80,6 +87,8 @@ export interface RenderedPage {
   width: number;
   height: number;
   fonts: FontAsset[];
+  /** The page's link annotations, in the page's own coordinates. */
+  links: PageLink[];
   stats: RenderStats;
 }
 
@@ -156,6 +165,54 @@ function toOutline(items: RawOutlineItem[] | null): OutlineNode[] {
     open: !!it.open,
     children: toOutline(it.down ?? null),
   }));
+}
+
+/**
+ * Every link annotation on a page, as plain data.
+ *
+ * Nothing here is allowed to fail the page: a broken annotation is skipped, an
+ * unresolvable destination is reported with page -1 (the viewer then leaves it
+ * alone rather than inventing a target), and an unknown URI is reported as it is
+ * - deciding what is safe to open is `links.ts`'s job, at the point where an
+ * `href` would be written.
+ */
+function readLinks(doc: mupdf.Document, page: mupdf.Page): PageLink[] {
+  const out: PageLink[] = [];
+  let links: mupdf.Link[];
+  try {
+    links = page.getLinks();
+  } catch {
+    return out;
+  }
+  for (const link of links) {
+    try {
+      const b = link.getBounds();
+      const rect: [number, number, number, number] = [b[0], b[1], b[2], b[3]];
+      if (!rect.every((v) => Number.isFinite(v))) continue;
+      const uri = link.getURI();
+      if (link.isExternal()) {
+        out.push({ kind: 'external', rect, uri });
+        continue;
+      }
+      let page1 = -1;
+      let x: number | null = null;
+      let y: number | null = null;
+      try {
+        const dest = doc.resolveLinkDestination(link);
+        if (typeof dest.page === 'number' && dest.page >= 0) {
+          page1 = dest.page + 1;
+          if (Number.isFinite(dest.x)) x = dest.x;
+          if (Number.isFinite(dest.y)) y = dest.y;
+        }
+      } catch {
+        /* a named destination that is not there: keep the link, drop the target */
+      }
+      out.push({ kind: 'internal', rect, page: page1, x, y });
+    } catch {
+      /* one bad annotation is not worth losing the rest of the page */
+    }
+  }
+  return out;
 }
 
 export class PdfEngine implements PdfEngineLike {
@@ -252,7 +309,10 @@ export class PdfEngine implements PdfEngineLike {
   async renderPage(index: number, opts: RenderOptions = {}): Promise<RenderedPage> {
     const started = Date.now();
     const textMode = opts.textMode ?? 'auto';
+    const doc = this.doc;
+    if (!doc) throw new DocumentNotOpenError();
     const page = this.loadPage(index);
+    const links = opts.links === false ? [] : readLinks(doc, page);
 
     debug('renderPage: mupdf render', index);
     // MuPDF objects are only finalised on GC, which is far too late when a long
@@ -309,6 +369,10 @@ export class PdfEngine implements PdfEngineLike {
 
     svg = stripXmlProlog(svg);
     if (opts.idPrefix) svg = namespaceSvgIds(svg, opts.idPrefix);
+    // After the id rewriting, so the hit areas cannot be caught by it: they carry
+    // a `data-` copy of the target rather than a fragment `href` that would have
+    // to be namespaced too.
+    svg = injectSvgLinks(svg, links);
     if (opts.embedFonts && fonts.length) {
       svg = inlineFontCss(svg, fonts.map((f) => f.css).join('\n'));
     }
@@ -317,7 +381,7 @@ export class PdfEngine implements PdfEngineLike {
     const dims = readSvgDimensions(svg) ?? { width: 612, height: 792, viewBox: '' };
     stats.ms = Date.now() - started;
 
-    return { index, svg, width: dims.width, height: dims.height, fonts, stats };
+    return { index, svg, width: dims.width, height: dims.height, fonts, links, stats };
   }
 
   /** Release a page and its cached resources. */
