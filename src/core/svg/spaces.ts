@@ -6,7 +6,7 @@
  * its words run together - "Providedproperattributionisprovided" - and that
  * glued string is what a reader copies, what a spell checker sees, and what any
  * word-level tool has to work with. Bionic reading is the immediate reason this
- * matters (it can only bold the first letters of a *word* if it can find where
+ * matters (it can only mark the first letters of a *word* if it can find where
  * the words are), but a plain copy is reason enough.
  *
  * The text device knows better: it reports every character it read, spaces

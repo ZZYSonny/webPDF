@@ -364,14 +364,14 @@ function ensureCropMenu(v: PdfViewer): CropMenu {
 
 /**
  * Bionic reading is one bit of state, and the button *is* that state: the viewer
- * re-renders what is on screen where it is - bolding changes how a character is
- * drawn, never where it is - and `aria-pressed` says which of the two modes is
- * in force, so there is no styling class that could disagree with it.
+ * re-renders what is on screen where it is - fading a stretch of text changes
+ * how it is drawn, never where it is - and `aria-pressed` says which of the two
+ * modes is in force, so there is no styling class that could disagree with it.
  *
  * It is worth knowing what it needs to work: the words. MuPDF's outline device
  * draws no spaces, so the engine writes them back into the text first
  * (`core/svg/spaces.ts`); without that every line would be one long word and
- * there would be nothing to bold the start of.
+ * there would be nothing to hold at full strength.
  */
 function toggleBionic(): void {
   if (!viewer) return;
@@ -379,7 +379,7 @@ function toggleBionic(): void {
   els.bionicBtn.setAttribute('aria-pressed', String(viewer.bionic));
   els.bionicBtn.title = viewer.bionic
     ? 'Bionic reading on — click to show the pages as the document sets them'
-    : 'Bionic reading — bold the first letters of every word, so the eye has somewhere to land';
+    : 'Bionic reading — hold the first letters of every word, and fade the rest'
 }
 
 els.bionicBtn.addEventListener('click', toggleBionic);

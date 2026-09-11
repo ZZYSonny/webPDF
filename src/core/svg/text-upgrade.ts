@@ -24,12 +24,12 @@
  * Two things are put back at this point rather than later, because this is where
  * a glyph is still a glyph with a position rather than a character in a string:
  * the spaces the outline device could not draw (`spaces.ts`), and the fixation
- * points of bionic reading (`bionic.ts`).
+ * points bionic reading is made of (`bionic.ts`).
  */
 
 import type { GlyphPlacement, Attribute } from './glyphs.ts';
 import type { SpaceMark } from './spaces.ts';
-import { bionicSegments } from './bionic.ts';
+import { BIONIC_DIM, bionicSegments } from './bionic.ts';
 
 export interface GlyphEncoding {
   /**
@@ -55,7 +55,10 @@ export interface UpgradeOptions {
    * together, because that is what the outline device drew.
    */
   spaces?: readonly SpaceMark[];
-  /** Bold the first letters of every word, the way bionic reading does. */
+  /**
+   * Bionic reading: keep every word's first letters at full strength and fade
+   * the rest, so the eye has somewhere to land.
+   */
   bionic?: boolean;
 }
 
@@ -213,9 +216,12 @@ function anchorSpaces(placements: readonly GlyphPlacement[], marks: readonly Spa
  * The `<tspan>`s a run's characters go in.
  *
  * Normally one, with every position in a single list. With bionic reading on,
- * one per stretch `text-vide` marked, each carrying the slice of the position
- * lists that belongs to it - so a bold character is drawn bold *at the place it
- * was*, never moved, because every character keeps the x and y it had.
+ * one per stretch `text-vide` marked: the fixation points stay the text as the
+ * document set it, and everything between them is drawn back at a reduced
+ * opacity (`bionic.ts` says why fading rather than bolding). Either way each
+ * tspan carries its own slice of the position lists, so a character is drawn
+ * exactly where it was - nothing is emboldened into its neighbour, and nothing
+ * moves.
  */
 function tspans(chars: readonly string[], xs: readonly string[], ys: readonly string[], bionic: boolean): string {
   const whole = (): string => `<tspan x="${xs.join(' ')}" y="${ys.join(' ')}">${chars.join('')}</tspan>`;
@@ -225,8 +231,8 @@ function tspans(chars: readonly string[], xs: readonly string[], ys: readonly st
   // The segments have to account for every glyph exactly once. `text-vide`
   // decides where the words are and this decides where the glyphs are; if the
   // two ever disagree - a release with different word rules, a character it
-  // reads as markup - the run is written plain, which is right, rather than bold
-  // in the wrong place, which is not.
+  // reads as markup - the run is written plain, which is right, rather than
+  // faded in the wrong places, which is not.
   if (segments.reduce((n, s) => n + s.chars, 0) !== chars.length) return whole();
 
   let at = 0;
@@ -234,8 +240,11 @@ function tspans(chars: readonly string[], xs: readonly string[], ys: readonly st
   for (const segment of segments) {
     const end = at + segment.chars;
     if (end > at) {
+      // A stretch of nothing but whitespace is between two words rather than in
+      // one: fading it would be an attribute that draws no pixel.
+      const fade = !segment.fixation && segment.text.trim() !== '';
       out +=
-        `<tspan${segment.bold ? ' font-weight="bold"' : ''}` +
+        `<tspan${fade ? ` fill-opacity="${BIONIC_DIM}"` : ''}` +
         ` x="${xs.slice(at, end).join(' ')}" y="${ys.slice(at, end).join(' ')}">${segment.text}</tspan>`;
     }
     at = end;

@@ -208,23 +208,37 @@ lands where it says.
 #### Bionic reading
 
 ```ts
-viewer.setBionic(true);   // bold every word's first letters
+viewer.setBionic(true);   // every word's first letters at full strength
 viewer.bionic;            // false: a document opens looking like itself
 ```
 
-Bionic reading bolds the first letters of each word, so the eye has somewhere to
-land and the brain finishes the word. Which letters is not a guess of ours:
-[`text-vide`](https://github.com/Gumball12/text-vide) decides it from the word's
-length, and the engine turns its answer into a `<tspan font-weight="bold">`
-around exactly those glyphs. `renderDocument(source, { bionic: true })` does the
-same thing headlessly, and an exported SVG carries it.
+Bionic reading gives every word a *fixation point* - its first letters, so the eye
+has somewhere to land and the brain finishes the word on its own. Which letters is
+not a guess of ours: [`text-vide`](https://github.com/Gumball12/text-vide) decides
+it from the word's length, and the engine holds exactly those glyphs at the
+document's own strength while everything else in the word is drawn back at half
+opacity (`core/svg/bionic.ts`). `renderDocument(source, { bionic: true })` does
+the same thing headlessly, and an exported SVG carries it.
 
-It changes how the text is **drawn** and nothing else. Every character in these
-pages carries its own x and y, so a bold character is drawn bold exactly where it
-was: the words do not reflow, the pages do not change size, and nothing has to be
-measured again. Toggling it re-renders what is on screen; the text, the selection
-and the position of every character are identical either way. The demo test
-checks that down to the ink - the same page, the same edges, more of them dark.
+**Faded, not bold** - and that is the part worth reading. The fonts here are
+rebuilt from the page's own outlines and have one weight, so `font-weight: bold`
+is the browser's synthetic emboldening: it smears the letterforms of a text face
+badly, and because every character keeps the position the PDF gave it, the
+emboldened letter is drawn wider *into* the letter after it, so a fixation point
+looks both blobby and cramped. An opacity costs nothing, works on text of any
+colour (it is not a grey - it is the page's own ink, thinned), and leaves the
+glyphs exactly as they were.
+
+It is a text-level effect rather than a word-level one: anything `text-vide` finds
+no word in - a bare number, a formula, a run of symbols - is faded like a word's
+tail, so a page of prose reads as intended and a table reads as uniformly light.
+
+It changes how the text is **drawn** and nothing else. Every character carries its
+own x and y, and the fade is an attribute of the character's own `<tspan>`: the
+words do not reflow, the pages do not change size, and nothing has to be measured
+again. Toggling it re-renders what is on screen; the text, the selection and the
+position of every character are identical either way. The demo test checks that
+down to the ink: the same page, the same edges, less of it dark.
 
 #### Spaces, and why a copy works
 
@@ -434,11 +448,12 @@ viewer:
   list keeps a margin around what is left, in points, from 0 (the reference
   script's own crop) to two inches.
 * **Bionic reading is one square button, after the crop control.** `B` presses in
-  and every word in front of you gets its first letters bolded; press it again and
-  the page is the document's own again. It is a mode rather than a menu, so it is
-  a button rather than a dropdown, and it is the one control here that changes the
-  text without moving it: the demo test checks that every character in every run
-  keeps the exact position it had.
+  and every word in front of you keeps its first letters dark while the rest of it
+  fades; press it again and the page is the document's own again. It is a mode
+  rather than a menu, so it is a button rather than a dropdown, and nothing is
+  emboldened: each word's remainder is drawn at half opacity, which the demo test
+  checks along with every character in every run keeping the exact position it
+  had.
 * **Links are the viewer's, and the demo just says what happened.** Clicking an
   external link opens it in a new tab and the toast names the URI; a link a
   browser cannot follow (the *GPT-4 Technical Report* links to a local file) gets
@@ -466,8 +481,8 @@ for await (const page of renderDocument(bytes, { embedFonts: true })) {
 
 `crop: ['arxiv', 'page-number']` trims each page to its content as it is
 exported, changing only the root `viewBox` - the file still contains the whole
-page, the way a PDF with a crop box does. `bionic: true` bolds the words' first
-letters on the way out, and the spaces are written back either way.
+page, the way a PDF with a crop box does. `bionic: true` fades the words' tails on
+the way out, and the spaces are written back either way.
 
 `embedFonts: true` puts the `@font-face` rules inside the SVG, which is what
 makes an exported file self-contained — required for `<img src="…svg">`, for a
@@ -534,9 +549,9 @@ src/
     links.ts                link annotations → data, and → SVG hit areas
     svg/
       glyphs.ts             scanner for MuPDF's SVG (outlines + <use>)
-      text-upgrade.ts       <use> runs → <text> runs, with spaces and bold
+      text-upgrade.ts       <use> runs → <text> runs, with spaces and fading
       spaces.ts             where the spaces the outline device cannot draw go
-      bionic.ts             text-vide's fixation points as tspan segments
+      bionic.ts             text-vide's fixation points, and how they are drawn
       package.ts            id namespacing, root rewriting, font embedding
     font/
       svg-path.ts           SVG path data parser (M/L/H/V/C/Z + implicit repeats)
@@ -661,11 +676,12 @@ is referenced relatively.
   correctly, and the tests allow for it, but searching for the decomposed
   spelling does not match it. Mapping the glyph names back to `U+FB01` and
   friends is the fix, and it belongs in the font build, not here.
-* **Bionic reading is synthetic bold.** The fonts rebuilt from the outlines have
-  one weight, so `font-weight: bold` is the browser's own emboldening rather than
-  a real bold face: the letters get heavier exactly where they are, which is what
-  the mode is for, but a document with a genuine bold face would render it that
-  way if the character belonged to that face.
+* **Bionic reading fades rather than emboldens.** A fixation point is the
+  document's own ink at full strength and the rest of the word is half faded; a
+  reader who expects the fixation points to be *bolder* (as the original Bionic
+  Reading does it) will find the contrast comes from the other side. Bolding is
+  not available as an option because these fonts have one weight, and synthetic
+  bold on a text face looks worse than no bold at all.
 * **Cropping reads every page to lay the document out.** A crop changes each
   page's height, so the scroll height is only correct once every box is known:
   switching a rule on measures the whole document in the background (about 5 ms

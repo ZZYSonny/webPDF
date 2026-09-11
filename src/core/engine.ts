@@ -97,10 +97,11 @@ export interface RenderOptions {
    */
   cropPadding?: number;
   /**
-   * Bionic reading: bold the first letters of every word, so the eye has
-   * somewhere to land. The words have to be words, so this is only as good as
-   * the spaces in the text - which are written back in whatever this is set to
-   * (see `svg/spaces.ts`). Default false: a page looks like the document.
+   * Bionic reading: hold every word's first letters at full strength and fade
+   * the rest, so the eye has somewhere to land. The words have to be words, so
+   * this is only as good as the spaces in the text - which are written back in
+   * whatever this is set to (see `svg/spaces.ts`). Default false: a page looks
+   * like the document.
    */
   bionic?: boolean;
 }

@@ -23,7 +23,7 @@ import fs from 'node:fs';
 import * as mupdf from 'mupdf';
 import { PdfEngine } from '../src/core/engine.ts';
 import { isSpaceChar, spaceMarks, type TextChar } from '../src/core/svg/spaces.ts';
-import { bionicSegments } from '../src/core/svg/bionic.ts';
+import { BIONIC_DIM, bionicSegments } from '../src/core/svg/bionic.ts';
 import { scanGlyphPlacements } from '../src/core/svg/glyphs.ts';
 import { upgradeGlyphsToText } from '../src/core/svg/text-upgrade.ts';
 import { PAPERS } from '../demo/papers.mjs';
@@ -122,11 +122,13 @@ const textOf = (svg: string): string =>
 const xsOf = (svg: string): string[] =>
   [...svg.matchAll(/<tspan[^>]*\sx="([^"]*)"/g)].flatMap((m) => m[1].split(/\s+/).filter(Boolean));
 
-const boldOf = (svg: string): string[] =>
-  [...svg.matchAll(/<tspan font-weight="bold"[^>]*>([\s\S]*?)<\/tspan>/g)].map((m) => m[1]);
+/** The words' fixation points: the stretches left at full strength. */
+const fixationOf = (svg: string): string[] =>
+  [...svg.matchAll(/<tspan(?! fill-opacity)[^>]*>([\s\S]*?)<\/tspan>/g)].map((m) => m[1]);
 
-const plainOf = (svg: string): string[] =>
-  [...svg.matchAll(/<tspan(?! font-weight)[^>]*>([\s\S]*?)<\/tspan>/g)].map((m) => m[1]);
+/** Everything drawn back at the reduced opacity. */
+const fadedOf = (svg: string): string[] =>
+  [...svg.matchAll(/<tspan fill-opacity="[^"]*"[^>]*>([\s\S]*?)<\/tspan>/g)].map((m) => m[1]);
 
 /** "hello world": h e l l o, a space, w o r l d - the space drawn by nothing. */
 const HELLO = page([
@@ -230,11 +232,11 @@ test('bionic segments are the text, split at the fixation points', () => {
     segments.reduce((n, s) => n + s.chars, 0),
     [...text].length,
   );
-  const bold = segments.filter((s) => s.bold).map((s) => s.text);
-  assert.ok(bold.length >= 8, 'every word gets a fixation point');
+  const fixation = segments.filter((s) => s.fixation).map((s) => s.text);
+  assert.ok(fixation.length >= 8, 'every word gets a fixation point');
   // A fixation point is a word's beginning, never a word's end or a space.
-  for (const word of bold) assert.match(word, /^[A-Za-z]+$/);
-  assert.equal(bold[0], 'Bion');
+  for (const word of fixation) assert.match(word, /^[A-Za-z]+$/);
+  assert.equal(fixation[0], 'Bion');
 });
 
 test('a character reference is one character, and is left alone', () => {
@@ -254,7 +256,7 @@ test('a character reference is one character, and is left alone', () => {
   );
 });
 
-test('bionic bolds the words and moves nothing', () => {
+test('bionic fades everything that is not a fixation point', () => {
   const placements = scanGlyphPlacements(HELLO);
   const spaces = spaceMarks(chars(['h', 0, 0, 0], [' ', 25, 0, 0], ['w', 30, 0, 0]));
   const plain = upgradeGlyphsToText(HELLO, placements, enc, { spaces });
@@ -263,13 +265,19 @@ test('bionic bolds the words and moves nothing', () => {
   assert.equal(textOf(bionic.svg), 'hello world');
   assert.deepEqual(xsOf(bionic.svg), xsOf(plain.svg));
   assert.equal(bionic.stats.converted, plain.stats.converted);
-  // One bold tspan per word, each carrying the glyphs of its own prefix - and
-  // `text-vide`'s own answer for a five-letter word is three letters, which is
-  // why this is not simply "the first three of every word".
-  assert.deepEqual(boldOf(bionic.svg), ['hel', 'wor']);
-  // The rest of each word, and the space between them, are still there.
-  assert.deepEqual(plainOf(bionic.svg), ['lo ', 'ld']);
+  // One tspan per word for the fixation point, carrying the glyphs of its own
+  // prefix - and `text-vide`'s own answer for a five-letter word is three
+  // letters, which is why this is not simply "the first three of every word".
+  assert.deepEqual(fixationOf(bionic.svg), ['hel', 'wor']);
+  // The rest of each word is the same characters at the one opacity the module
+  // names; the space between the words rides along with the word it follows.
+  assert.deepEqual(fadedOf(bionic.svg), ['lo ', 'ld']);
+  assert.ok(bionic.svg.includes(`fill-opacity="${BIONIC_DIM}"`));
   assert.equal(bionic.svg.match(/<tspan/g)?.length, 4);
+  // Nothing is emboldened: a font without a bold face would be smeared by that,
+  // and the letter after it crowded.
+  assert.equal(bionic.svg.includes('font-weight="bold"'), false);
+  assert.equal(fadedOf(plain.svg).length, 0);
 });
 
 /* ------------------------------------------------------ through the engine */
@@ -369,14 +377,18 @@ test('a real page: bionic reading draws the same glyphs in the same places', { s
     assert.equal(bionic.svg.match(/<text\b/g)?.length, plain.svg.match(/<text\b/g)?.length);
     assert.equal(bionic.stats.spaces, plain.stats.spaces);
 
-    const bold = boldOf(bionic.svg);
-    assert.ok(bold.length > 100, `fixation points: ${bold.length}`);
-    assert.equal(boldOf(plain.svg).length, 0, 'nothing is bold without it');
-    for (const run of bold) assert.ok(!/\s/.test(run), `a fixation point is inside a word: ${JSON.stringify(run)}`);
-    // The same runs, cut into more pieces: one extra tspan per fixation point
-    // (the rest of the word it is the start of).
+    const faded = fadedOf(bionic.svg);
+    assert.ok(faded.length > 100, `faded stretches: ${faded.length}`);
+    assert.equal(fadedOf(plain.svg).length, 0, 'nothing is faded without it');
+    // A fixation point is the start of a word, so it never contains a space;
+    // what is faded is what comes after one, and every faded stretch has
+    // something in it to draw - a bare space between two words is left alone.
+    for (const run of fixationOf(bionic.svg)) {
+      if (/\S/.test(run)) assert.ok(!/\s/.test(run), `a fixation point spans a word boundary: ${JSON.stringify(run)}`);
+    }
+    for (const run of faded) assert.ok(/\S/.test(run), `a faded stretch draws nothing: ${JSON.stringify(run)}`);
+    // The same runs, cut into more pieces: one tspan per word's remainder.
     assert.ok((bionic.svg.match(/<tspan/g)?.length ?? 0) > (plain.svg.match(/<tspan/g)?.length ?? 0));
-    assert.equal(plainOf(bionic.svg).length, plainOf(plain.svg).length + bold.length);
 
     // And a crop is still the same window, whatever the text is drawn like.
     const rules = ['arxiv', 'page-number'] as const;

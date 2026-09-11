@@ -976,10 +976,10 @@ try {
   // --------------------------------------------------------- bionic reading
   /**
    * Bionic reading is a mode, and there are three things to check about it: it
-   * is off until it is asked for, it is really *drawn* (a bold attribute the
-   * font cannot honour would be a lie, and the attribute is the part that is
-   * easy to get right), and it changes nothing else - the same characters, in
-   * the same places, saying the same thing.
+   * is off until it is asked for, it is really *drawn* (an attribute that put no
+   * pixel on the page would be a lie, and the attribute is the easy part to get
+   * right), and it changes nothing else - the same characters, in the same
+   * places, saying the same thing.
    *
    * It is also where the spaces are checked where a reader meets them. An
    * outline SVG has none at all: the words arrive run together, and this is the
@@ -1020,7 +1020,8 @@ try {
         }
         return out;
       });
-      const bold = svg ? svg.querySelector('tspan[font-weight="bold"]') : null;
+      const faded = svg ? svg.querySelector('tspan[fill-opacity]') : null;
+      const fixation = svg ? svg.querySelector('tspan:not([fill-opacity])') : null;
       return {
         exists: !document.getElementById('bionic-group').hidden,
         afterSearch: rect.left > search.left,
@@ -1035,8 +1036,12 @@ try {
         perWord: words.length ? Math.round((all.length / words.length) * 10) / 10 : 0,
         prose: all.slice(0, 80),
         full: all.slice(0, 4000),
-        bold: svg ? svg.querySelectorAll('tspan[font-weight="bold"]').length : 0,
-        weight: bold ? getComputedStyle(bold).fontWeight : null,
+        faded: svg ? svg.querySelectorAll('tspan[fill-opacity]').length : 0,
+        opacity: faded ? getComputedStyle(faded).fillOpacity : null,
+        // Nothing may be emboldened: the rebuilt fonts have one weight, so a
+        // bold here is the browser's synthetic smearing.
+        weighted: svg ? svg.querySelectorAll('[font-weight="bold"]').length : 0,
+        weight: fixation ? getComputedStyle(fixation).fontWeight : null,
         starts,
       };
     })()`);
@@ -1058,7 +1063,7 @@ try {
   if (!plainText.afterSearch || !plainText.afterCrop) fail('the bionic toggle should sit after the crop control');
   if (!plainText.square) fail('the bionic toggle should be a square button');
   if (plainText.pressed !== 'false') fail(`bionic reading should start off, got aria-pressed=${plainText.pressed}`);
-  if (plainText.bold) fail(`nothing should be bold before it is asked for (${plainText.bold} runs)`);
+  if (plainText.faded) fail(`nothing should be faded before it is asked for (${plainText.faded} runs)`);
   // The words, which is what bionic reading needs and what a reader copies.
   if (plainText.words < 100) fail(`page 1 should have real words in it, found ${plainText.words}`);
   if (plainText.perWord > 12) fail(`the page averages ${plainText.perWord} characters per word: the spaces are missing`);
@@ -1069,17 +1074,21 @@ try {
     `(() => {
       const shown = document.getElementById('pageno').value;
       const svg = document.getElementById('viewer').shadowRoot.querySelector('.wpdf-page[data-page="' + shown + '"] svg');
-      return !!svg && svg.querySelectorAll('tspan[font-weight="bold"]').length > 0;
+      return !!svg && svg.querySelectorAll('tspan[fill-opacity]').length > 0;
     })()`,
     'the bionic render',
     60000,
   );
   const marked = await bionicState();
-  console.log('bionic on  : ' + JSON.stringify({ pressed: marked.pressed, bold: marked.bold, weight: marked.weight, texts: marked.texts }));
+  console.log('bionic on  : ' + JSON.stringify({ pressed: marked.pressed, faded: marked.faded, opacity: marked.opacity, weighted: marked.weighted, texts: marked.texts }));
   if (marked.pressed !== 'true') fail(`the toggle should report itself pressed, got ${marked.pressed}`);
-  if (marked.bold < 100) fail(`bionic reading marked ${marked.bold} runs, which is not every word`);
-  // Bold has to be a weight the font is actually drawn at.
-  if (marked.weight !== '700') fail(`the fixation points are not bold (font-weight ${marked.weight})`);
+  if (marked.faded < 100) fail(`bionic reading faded ${marked.faded} runs, which is not the rest of every word`);
+  // The fade has to be a real one, at the strength the module names.
+  if (Number(marked.opacity) > 0.6 || Number(marked.opacity) < 0.4) fail(`the faded text is drawn at ${marked.opacity}`);
+  // And nothing is emboldened: a synthetic bold would smear the letterforms and
+  // crowd the character after it.
+  if (marked.weighted) fail(`${marked.weighted} element(s) were emboldened`);
+  if (marked.weight !== '400') fail(`the fixation points are not at the font's own weight (${marked.weight})`);
   if (marked.chars !== plainText.chars || marked.words !== plainText.words) fail('bionic reading changed the text');
   if (marked.texts !== plainText.texts) fail(`bionic reading changed the page's text elements (${plainText.texts} -> ${marked.texts})`);
   if (JSON.stringify(marked.starts) !== JSON.stringify(plainText.starts)) {
@@ -1098,8 +1107,8 @@ try {
     timeout: 60000,
   });
   const found = await searchState();
-  console.log('search while bold: ' + JSON.stringify(found));
-  if (found.bandsOnPage < 1) fail('the find bar lost the text when it was drawn bold');
+  console.log('search while faded: ' + JSON.stringify(found));
+  if (found.bandsOnPage < 1) fail('the find bar lost the text when it was faded');
 
   /**
    * How much ink the page puts down, and where its edges are - rasterised from
@@ -1123,10 +1132,16 @@ try {
         const ctx = canvas.getContext('2d', { willReadFrequently: true });
         ctx.drawImage(img, 0, 0);
         const data = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
-        let dark = 0, left = canvas.width, top = canvas.height, right = -1, bottom = -1;
+        let dark = 0, mass = 0, left = canvas.width, top = canvas.height, right = -1, bottom = -1;
         for (let y = 0; y < canvas.height; y++) {
           for (let x = 0; x < canvas.width; x++) {
-            if (data[(y * canvas.width + x) * 4 + 3] > 128) {
+            const i = (y * canvas.width + x) * 4;
+            const alpha = data[i + 3] / 255;
+            // Ink as the eye receives it: how dark the pixel is, not how many
+            // pixels passed a threshold - a faded glyph is the same glyph with
+            // less of it, which no single cut-off measures.
+            mass += alpha * (1 - (data[i] + data[i + 1] + data[i + 2]) / (3 * 255));
+            if (alpha > 0.5) {
               dark++;
               if (x < left) left = x;
               if (x > right) right = x;
@@ -1135,33 +1150,39 @@ try {
             }
           }
         }
-        return { dark, box: [left, top, right, bottom] };
+        const round = (n) => Math.round(n * 100) / 100;
+        return { dark, mass: round(mass), perMille: round((1000 * mass) / (canvas.width * canvas.height)), box: [left, top, right, bottom] };
       } finally {
         URL.revokeObjectURL(url);
       }
     })()`);
 
-  const boldInk = await ink();
+  const fadedInk = await ink();
   await page.evaluate(() => document.getElementById('bionic-btn').click());
   await waitUntil(
     `(() => {
       const shown = document.getElementById('pageno').value;
       const svg = document.getElementById('viewer').shadowRoot.querySelector('.wpdf-page[data-page="' + shown + '"] svg');
-      return !!svg && svg.querySelectorAll('tspan[font-weight="bold"]').length === 0;
+      return !!svg && svg.querySelectorAll('tspan[fill-opacity]').length === 0;
     })()`,
     'the plain render to come back',
     60000,
   );
   const plainInk = await ink();
   const turnedOff = await bionicState();
-  console.log('ink        : ' + JSON.stringify({ plain: plainInk.dark, bionic: boldInk.dark, plainBox: plainInk.box, boldBox: boldInk.box }));
-  if (!(boldInk.dark > plainInk.dark * 1.05)) fail(`bionic reading should put down more ink (${plainInk.dark} -> ${boldInk.dark})`);
+  console.log('ink        : ' + JSON.stringify({ plain: plainInk.perMille, bionic: fadedInk.perMille, plainBox: plainInk.box, fadedBox: fadedInk.box }));
+  // Fading has to be visible: the page loses around a tenth of its ink, since
+  // the fixation points stay at full strength and the rules and figures on the
+  // page are drawings, which nothing fades.
+  if (!(fadedInk.mass < plainInk.mass * 0.95)) fail(`bionic reading should lighten the page (${plainInk.mass} -> ${fadedInk.mass})`);
+  // The same page with the same edges: the light is turned down, nothing moved
+  // and nothing grew.
   for (const [i, edge] of ['left', 'top', 'right', 'bottom'].entries()) {
-    if (Math.abs(boldInk.box[i] - plainInk.box[i]) > 3) {
-      fail(`bionic reading changed where the page's ink is (${edge}: ${plainInk.box[i]} -> ${boldInk.box[i]})`);
+    if (Math.abs(fadedInk.box[i] - plainInk.box[i]) > 3) {
+      fail(`bionic reading changed where the page's ink is (${edge}: ${plainInk.box[i]} -> ${fadedInk.box[i]})`);
     }
   }
-  if (turnedOff.pressed !== 'false' || turnedOff.bold) fail('the toggle should put the page back exactly as it was');
+  if (turnedOff.pressed !== 'false' || turnedOff.faded) fail('the toggle should put the page back exactly as it was');
   if (JSON.stringify(turnedOff.starts) !== JSON.stringify(plainText.starts)) fail('turning it off did not restore the page');
 
   // The crop and bionic controls are independent: a crop is a window onto the
@@ -1182,14 +1203,14 @@ try {
     `(() => {
       const shown = document.getElementById('pageno').value;
       const svg = document.getElementById('viewer').shadowRoot.querySelector('.wpdf-page[data-page="' + shown + '"] svg');
-      return !!svg && svg.querySelectorAll('tspan[font-weight="bold"]').length > 0;
+      return !!svg && svg.querySelectorAll('tspan[fill-opacity]').length > 0;
     })()`,
     'the bionic render of a cropped page',
     60000,
   );
-  const croppedBold = await bionicState();
-  console.log('cropped + bold: ' + JSON.stringify({ viewBox: croppedBox, boldViewBox: croppedBold.viewBox }));
-  if (croppedBold.viewBox !== croppedBox) fail(`bionic reading changed the crop (${croppedBox} -> ${croppedBold.viewBox})`);
+  const croppedFaded = await bionicState();
+  console.log('cropped + faded: ' + JSON.stringify({ viewBox: croppedBox, fadedViewBox: croppedFaded.viewBox }));
+  if (croppedFaded.viewBox !== croppedBox) fail(`bionic reading changed the crop (${croppedBox} -> ${croppedFaded.viewBox})`);
   // Back to nothing at all, which is where the next section finds the reader.
   await page.evaluate(() => document.getElementById('bionic-btn').click());
   await page.evaluate(() => document.getElementById('crop-none').click());
@@ -1197,7 +1218,7 @@ try {
     `(() => {
       const shown = document.getElementById('pageno').value;
       const svg = document.getElementById('viewer').shadowRoot.querySelector('.wpdf-page[data-page="' + shown + '"] svg');
-      return !!svg && (svg.getAttribute('viewBox') ?? '').startsWith('0 0 ') && svg.querySelectorAll('tspan[font-weight="bold"]').length === 0;
+      return !!svg && (svg.getAttribute('viewBox') ?? '').startsWith('0 0 ') && svg.querySelectorAll('tspan[fill-opacity]').length === 0;
     })()`,
     'the page and the text to come back',
     60000,
