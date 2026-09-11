@@ -35,7 +35,7 @@ export interface BionicSegment {
 }
 
 /**
- * How much of its strength the rest of a word is drawn at.
+ * How much of its strength the rest of a word is drawn at, by default.
  *
  * The fixation points are the text as the document set it and everything around
  * them is faded, rather than the fixation points being emboldened: these fonts
@@ -46,11 +46,27 @@ export interface BionicSegment {
  * themselves untouched.
  *
  * A half is the balance the eye wants: dark enough that the whole word is still
- * comfortably readable, light enough that the fixation points lead. It is a
- * single number on purpose - anything between about 0.4 and 0.6 reads well, and
- * below 0.3 the remainder starts to look like a printing fault.
+ * comfortably readable, light enough that the fixation points lead. How much of
+ * a word is held is a matter of taste and of eyesight, so it is a setting
+ * (`bionicDim` on the render options, `PdfViewer.setBionic`) rather than a
+ * constant - but it is a *fade*, and a fade has to leave something of the word:
+ * below about 0.2 the remainder reads as a printing fault, and at 1 nothing is
+ * faded at all.
  */
 export const BIONIC_DIM = 0.5;
+
+/** The faintest a word's remainder may be drawn: any less and it is not there. */
+export const BIONIC_MIN_DIM = 0.05;
+
+/**
+ * The dim actually used to draw a page: the caller's number when it is one, and
+ * the default when it is not. Clamped rather than rejected - a host offering a
+ * slider cannot send a page to opacity 0 by accident.
+ */
+export function bionicDim(value: number | undefined): number {
+  if (value === undefined || !Number.isFinite(value)) return BIONIC_DIM;
+  return Math.min(1, Math.max(BIONIC_MIN_DIM, value));
+}
 
 const FIXATION = /<b>([\s\S]*?)<\/b>/g;
 /** A character reference: one character, however many bytes it takes to write. */

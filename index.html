@@ -5,36 +5,51 @@
     <!-- user-scalable=yes is what lets the *browser* own pinch-zoom; the page itself never rescales anything in response to a gesture -->
     <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=yes, maximum-scale=12" />
     <title>webpdf — PDF pages as SVG with real text</title>
+    <meta name="description" content="PDF pages rendered to SVG with real, selectable text: fonts are rebuilt from the document's own outlines, including the Type 1 faces LaTeX produces." />
+    <meta name="theme-color" content="#171a21" />
+    <!--
+      The mark: a page, and the text this project puts back into it. SVG first
+      (it is one small file and stays crisp at any size), with the PNG for the
+      browsers and crawlers that will not take an SVG icon.
+    -->
+    <link rel="icon" href="/demo/icon.svg" type="image/svg+xml" />
+    <link rel="icon" href="/demo/icon.png" type="image/png" sizes="512x512" />
+    <link rel="apple-touch-icon" href="/demo/icon.png" />
     <link rel="stylesheet" href="/demo/styles.css" />
   </head>
   <body>
-    <header class="topbar">
-      <!-- left: getting a document in, its outline, and where you are in it -->
+    <!--
+      The bar is the document's chrome and nothing else: with no document open
+      there is nothing for it to hold - a file arrives from the card below, by
+      drag and drop or by Ctrl+O - so it is the card that is on screen, on its
+      own, and the bar appears with the first page.
+    -->
+    <header class="topbar" hidden>
       <div class="bar-left">
-        <button id="open" class="btn primary" type="button">Open PDF…</button>
-        <input id="file" type="file" accept="application/pdf,.pdf" hidden />
-        <!--
-          The picker is filled in by the demo (see `demo/examples.ts`): the
-          documents it offers are fetched from public URLs, and which of them
-          this page can serve depends on where it is running.
-        -->
-        <select id="sample" class="btn" title="Load an example document"></select>
-        <button id="toc-toggle" class="btn" type="button" aria-expanded="false" aria-controls="toc" title="Show or hide the outline">
-          Outline
+        <button
+          id="toc-toggle"
+          class="btn icon"
+          type="button"
+          aria-expanded="false"
+          aria-controls="toc"
+          aria-label="Outline"
+          title="Show or hide the outline"
+          hidden
+        >
+          <svg class="glyph" viewBox="0 0 16 16" aria-hidden="true">
+            <path d="M2.4 4h1.4M6 4h7.6M2.4 8h1.4M6 8h7.6M2.4 12h1.4M6 12h7.6" />
+          </svg>
         </button>
         <div class="group" id="nav-group" hidden>
-          <button id="prev" class="btn icon" type="button" title="Previous page (↑)">‹</button>
           <input id="pageno" class="page-input" type="text" inputmode="numeric" value="1" aria-label="Page number" />
-          <span class="muted">/ <span id="pagecount">0</span></span>
-          <button id="next" class="btn icon" type="button" title="Next page (↓)">›</button>
+          <span class="page-total muted">/ <span id="pagecount">0</span></span>
         </div>
       </div>
 
       <!-- middle: the layout zoom level, and nothing about the browser's own -->
       <div class="bar-mid">
         <div class="group" id="zoom-group" hidden>
-          <button id="zoom-out" class="btn icon" type="button" title="Next level down (Ctrl −)">−</button>
-          <div class="zoom-field">
+          <div class="field zoom-field">
             <input
               id="zoom-value"
               class="zoom-input mono"
@@ -48,9 +63,8 @@
             <span class="zoom-unit" aria-hidden="true">%</span>
             <button
               id="zoom-menu-btn"
-              class="zoom-menu-btn"
+              class="field-caret"
               type="button"
-              tabindex="-1"
               aria-haspopup="listbox"
               aria-expanded="false"
               aria-controls="zoom-menu"
@@ -58,17 +72,19 @@
             >
               ▾
             </button>
-            <div id="zoom-menu" class="zoom-menu" role="listbox" aria-label="Zoom levels" hidden></div>
+            <div id="zoom-menu" class="menu zoom-menu" role="listbox" aria-label="Zoom levels" hidden></div>
           </div>
-          <button id="zoom-in" class="btn icon" type="button" title="Next level up (Ctrl +)">+</button>
         </div>
       </div>
 
-      <!-- right: finding text, and what the last render cost -->
+      <!-- right: finding text, and the two modes that change how a page is drawn -->
       <div class="bar-right">
         <div class="group" id="search-group" hidden>
           <div id="search-box" class="search">
-            <span class="search-icon" aria-hidden="true">⌕</span>
+            <svg class="search-icon" viewBox="0 0 16 16" aria-hidden="true">
+              <circle cx="7" cy="7" r="4.1" />
+              <path d="M10.05 10.05 14 14" />
+            </svg>
             <input
               id="search"
               class="search-input"
@@ -89,16 +105,22 @@
             Cropping is off until a rule is checked: nothing about a document
             changes on its own (see demo/crop.ts).
           -->
-          <div class="crop-field">
+          <div class="field crop-field">
             <button
               id="crop-btn"
-              class="btn crop-btn"
+              class="btn icon crop-btn"
               type="button"
               aria-haspopup="listbox"
               aria-expanded="false"
               aria-controls="crop-menu"
+              aria-label="Crop"
+              title="Trim each page to its content, leaving out the marks you check"
             >
-              Crop<span id="crop-count" class="crop-count mono"></span>
+              <svg class="glyph" viewBox="0 0 16 16" aria-hidden="true">
+                <path d="M4.6 1.8v9.6h9.6" />
+                <path d="M1.8 4.6h9.6v9.6" />
+              </svg>
+              <span class="caret" aria-hidden="true">▾</span>
             </button>
             <div id="crop-menu" class="crop-menu" hidden>
               <div class="crop-head">
@@ -117,9 +139,9 @@
                   min="0"
                   max="144"
                   step="1"
-                  value="0"
+                  value="6"
                   inputmode="numeric"
-                  title="Page units (1/72 inch) kept around the content on every side — 0 crops exactly to it, as PaperCutter does"
+                  title="Page units (1/72 inch) kept around the content on every side — 6 pt is a hair of white, 0 crops exactly to the ink as PaperCutter does"
                 />
                 <span class="crop-pad-unit" aria-hidden="true">pt</span>
                 <span class="crop-pad-hint">kept around the content</span>
@@ -129,25 +151,28 @@
           </div>
         </div>
         <!--
-          Bionic reading is a mode, not a menu: it is on or it is off, so it is a
-          single square button that stays pressed while it is on. It sits after
-          the crop control because both change how a page is drawn rather than
-          where the reader is, and it is a button rather than a dropdown because
-          there is nothing to choose.
+          Bionic reading is one choice - off, or a fade - so it is a dropdown
+          rather than a switch: the menu says which value is in force, and the
+          star on a row marks it. It sits after the crop control because both
+          change how a page is drawn rather than where the reader is.
         -->
         <div class="group" id="bionic-group" hidden>
-          <button
-            id="bionic-btn"
-            class="btn bionic-btn"
-            type="button"
-            aria-pressed="false"
-            aria-label="Bionic reading"
-            title="Bionic reading — hold the first letters of every word, and fade the rest"
-          >
-            B
-          </button>
+          <div class="field">
+            <button
+              id="bionic-btn"
+              class="btn bionic-btn"
+              type="button"
+              aria-haspopup="listbox"
+              aria-expanded="false"
+              aria-controls="bionic-menu"
+              aria-label="Bionic reading"
+              title="Bionic reading — hold the first letters of every word at full strength"
+            >
+              B<span class="caret" aria-hidden="true">▾</span>
+            </button>
+            <div id="bionic-menu" class="menu bionic-menu" role="listbox" aria-label="Bionic reading" hidden></div>
+          </div>
         </div>
-        <span id="stats" class="perf mono" title="Time the last page render took"></span>
       </div>
     </header>
     <main class="layout">
@@ -172,9 +197,28 @@
               <strong>selectable text</strong> that references a real font, and only falls back to
               outlines where that is not provably safe.
             </p>
+            <!--
+              Getting a document in: the file picker, and the example papers.
+              The examples are a dropdown of documents rather than a button that
+              opens one, because which paper to read is the reader's choice.
+            -->
+            <input id="file" type="file" accept="application/pdf,.pdf" hidden />
             <div class="empty-actions">
               <button id="empty-open" class="btn primary" type="button">Choose a file</button>
-              <button id="empty-sample" class="btn" type="button">Open the example paper</button>
+              <div class="field" id="example-field">
+                <button
+                  id="example-btn"
+                  class="btn field-btn"
+                  type="button"
+                  aria-haspopup="listbox"
+                  aria-expanded="false"
+                  aria-controls="example-menu"
+                  title="Read one of the papers this demo was built and tested against — a public document, fetched over the network"
+                >
+                  Open an example paper<span class="caret" aria-hidden="true">▾</span>
+                </button>
+                <div id="example-menu" class="menu example-menu" role="listbox" aria-label="Example papers" hidden></div>
+              </div>
             </div>
           </div>
         </div>

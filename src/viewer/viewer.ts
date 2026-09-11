@@ -34,6 +34,7 @@ import type { FontAsset } from '../core/font/registry.ts';
 import { linkTargetOf, type LinkTarget } from '../core/links.ts';
 import { debug as DEBUG } from '../core/debug.ts';
 import { normaliseRules, padBox, type CropRect, type CropRuleId } from '../core/crop.ts';
+import { BIONIC_DIM, bionicDim } from '../core/svg/bionic.ts';
 import {
   computeFitScale,
   PageLayout,
@@ -221,6 +222,8 @@ export class PdfViewer {
   private padding = 0;
   /** Bionic reading: every word's first letters at full strength, the rest faded. */
   private bionicOn = false;
+  /** How much strength the faded part of a word keeps, 0..1. */
+  private bionicDimValue = BIONIC_DIM;
   /** Bumped whenever the selection changes, so a running pass gives up. */
   private cropEpoch = 0;
   private cropMeasured = 0;
@@ -607,12 +610,20 @@ export class PdfViewer {
    * not have to be measured again. That is why this re-renders what is on screen
    * rather than re-laying it out. Default off, so a document opens looking like
    * itself.
+   *
+   * `dim` is how much strength the faded part of each word keeps, 0..1, and
+   * stays where it is put: passing it without `on` is how a host changes the
+   * fade while the mode is already on, and leaving it out keeps the value in
+   * force (`BIONIC_DIM` until one is given). Either way what is on screen was
+   * drawn the other way and is now wrong, so it is re-rendered - never
+   * re-measured, because a fade moves nothing.
    */
-  setBionic(on: boolean): void {
+  setBionic(on: boolean, dim?: number): void {
     const next = on === true;
-    if (next === this.bionicOn) return;
+    const nextDim = bionicDim(dim ?? this.bionicDimValue);
+    if (next === this.bionicOn && nextDim === this.bionicDimValue) return;
     this.bionicOn = next;
-    // What is on screen was drawn without them (or with), and is now wrong.
+    this.bionicDimValue = nextDim;
     this.invalidateAll();
     this.update();
   }
@@ -620,6 +631,11 @@ export class PdfViewer {
   /** Whether pages are drawn with bionic reading's fixation points. */
   get bionic(): boolean {
     return this.bionicOn;
+  }
+
+  /** The opacity the faded part of a word is drawn at, 0..1. */
+  get bionicDim(): number {
+    return this.bionicDimValue;
   }
 
   private measureCrop(): void {
@@ -769,15 +785,19 @@ export class PdfViewer {
    * while the layout measures from the top of whatever the reader is actually
    * looking at. With a crop in force those two differ by the top of the crop,
    * and a jump that ignored it lands a whole margin too far down the page.
+   *
+   * The top of the crop is `cropBox`, not the measured box underneath it: a
+   * margin is part of the window the page is shown through, so under a padded
+   * crop a destination differs by the padding as well.
    */
   private shownY(index: number, y: number): number {
-    const box = this.cropBoxes[index];
+    const box = this.cropBox(index + 1);
     return box ? y - box.y : y;
   }
 
   /** The inverse: from a point on the shown page back to the document's own. */
   private documentY(index: number, y: number): number {
-    const box = this.cropBoxes[index];
+    const box = this.cropBox(index + 1);
     return box ? y + box.y : y;
   }
 
@@ -842,6 +862,7 @@ export class PdfViewer {
       crop: this.cropRules,
       cropPadding: this.padding,
       bionic: this.bionicOn,
+      bionicDim: this.bionicDimValue,
     });
     return rendered.svg;
   }
@@ -1056,6 +1077,7 @@ export class PdfViewer {
       crop: this.cropRules,
       cropPadding: this.padding,
       bionic: this.bionicOn,
+      bionicDim: this.bionicDimValue,
     };
     try {
       DEBUG('render start', index);

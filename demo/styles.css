@@ -54,21 +54,28 @@ body {
 /* ---------------------------------------------------------------- topbar */
 
 /**
- * Three regions: document + outline + page on the left, the layout zoom level in
- * the middle, search + render cost on the right. The side tracks are equal, so
- * "middle" is actually the middle of the bar rather than whatever the two sides
- * leave over; below ~1080px they stack, because a wrapped bar is better than an
- * overflowing one.
+ * Three regions - the document, its outline and the page number on the left,
+ * the layout zoom level in the middle, finding and the drawing modes on the
+ * right - and one line, whatever the window does. The bar is the only chrome
+ * above the pages, so a second row would cost the document a row of height on
+ * exactly the windows that can least afford it.
+ *
+ * The side tracks are equal, so "middle" is the middle of the bar rather than
+ * whatever the two sides leave over, and they are allowed to shrink
+ * (`minmax(0, …)`) while their contents are laid out `nowrap`: what gives way is
+ * the find box, the one control that still reads when it is short. Below 560px
+ * the page count and the match count drop out (see the media query at the end of
+ * this block), which is what keeps the rest of the bar on one line on a phone.
  */
 .topbar {
   position: sticky;
   top: 0;
   z-index: 10;
   display: grid;
-  grid-template-columns: 1fr auto 1fr;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
   align-items: center;
-  gap: 8px 12px;
-  padding: 8px 12px;
+  gap: 10px;
+  padding: 7px 10px;
   background: var(--bg-elevated);
   border-bottom: 1px solid var(--border);
   flex: none;
@@ -79,12 +86,9 @@ body {
 .bar-right {
   display: flex;
   align-items: center;
+  flex-wrap: nowrap;
   gap: 6px;
   min-width: 0;
-}
-
-.bar-left {
-  flex-wrap: wrap;
 }
 
 .bar-mid {
@@ -93,24 +97,132 @@ body {
 
 .bar-right {
   justify-content: flex-end;
-  gap: 10px;
+  gap: 8px;
 }
 
-@media (max-width: 1080px) {
-  .topbar {
-    grid-template-columns: 1fr;
-  }
-
-  .bar-mid,
-  .bar-right {
-    justify-content: flex-start;
-  }
+/* The find box is the control that shrinks; nothing else in the bar moves. */
+#search-group {
+  flex: 0 1 auto;
+  min-width: 0;
 }
 
+/**
+ * The buttons keep the size they were drawn at, whatever the window does: a
+ * group that is squeezed with `min-width: 0` shrinks its own box and lets the
+ * button inside spill out of it, which is how a bar ends up with its last
+ * control hanging off the right edge. Only the find box gives way.
+ */
+.bar-left > .group,
+.bar-right > .group {
+  flex: none;
+}
+
+/**
+ * Finding and the two drawing modes are different jobs, and a find box being
+ * typed into should not look like it runs into the crop mark beside it: the
+ * space between the pairs is wider than the space inside either one.
+ */
+#crop-group {
+  margin-left: 8px;
+}
+
+/**
+ * A dropdown: the control, and the list it opens, in one positioned box so the
+ * list is anchored to the control whatever the bar does around it.
+ */
+.field {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  min-width: 0;
+}
+
+/* The caret: it opens the list where the face of the control does something. */
+.field-caret {
+  appearance: none;
+  border: 0;
+  background: none;
+  color: var(--text-muted);
+  font: inherit;
+  font-size: 9px;
+  line-height: 1;
+  padding: 4px 3px;
+  cursor: pointer;
+}
+
+.field-caret:hover,
+.field-caret[aria-expanded='true'] {
+  color: var(--text);
+}
+
+/**
+ * The list itself. One look for every dropdown in the bar, because they are all
+ * the same thing to a reader: a set of rows, one of which is in force.
+ */
+.menu {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  z-index: 30;
+  min-width: 100%;
+  max-height: min(60vh, 360px);
+  overflow: auto;
+  padding: 4px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.5);
+}
+
+.menu-option {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  width: 100%;
+  text-align: left;
+  border: 0;
+  background: none;
+  color: var(--text);
+  font: inherit;
+  font-size: 12.5px;
+  padding: 5px 9px;
+  border-radius: 4px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.menu-option.active {
+  background: #262b36;
+}
+
+.menu-option[aria-selected='true'] .menu-name {
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.menu-note {
+  font-size: 11px;
+  color: var(--text-muted);
+  white-space: normal;
+}
+
+/* The value in force: one star per list, on the row it belongs to. */
+.star {
+  margin-left: 6px;
+  color: var(--accent);
+  font-size: 11px;
+}
+
+/**
+ * `.group` is a row of controls that belong together; `min-width: 0` so a
+ * group inside a shrinking track can pass the squeeze on to what is in it.
+ */
 .group {
   display: flex;
   align-items: center;
   gap: 6px;
+  min-width: 0;
 }
 
 .btn {
@@ -157,9 +269,11 @@ body {
 }
 
 .btn.icon {
-  padding: 5px 9px;
-  font-size: 15px;
-  line-height: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  padding: 5px 7px;
 }
 
 .btn.tiny {
@@ -168,8 +282,34 @@ body {
   line-height: 1.2;
 }
 
-select.btn {
-  padding-right: 6px;
+/**
+ * The icons: drawn, not typed. A glyph like `⌕` or `✂` is a different shape in
+ * every font that has one, sits on a text baseline that has nothing to do with
+ * the control it is in, and is missing from plenty of fonts altogether. A
+ * 16-unit SVG with `currentColor` is the same mark everywhere and lines up with
+ * whatever it is next to.
+ *
+ * The class is `glyph` and not `icon` because the *buttons* are `.btn.icon`:
+ * one class cannot mean "a button whose face is a mark" and "the mark", or the
+ * mark's 16px box becomes the button's.
+ */
+.glyph {
+  width: 16px;
+  height: 16px;
+  display: block;
+  flex: none;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.5;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+/* The caret inside a control whose face is the button: same thing, inert. */
+.caret {
+  font-size: 9px;
+  line-height: 1;
+  color: var(--text-muted);
 }
 
 .page-input {
@@ -191,6 +331,26 @@ select.btn {
   outline-offset: -1px;
 }
 
+/* -------------------------------------------------------- example paper */
+
+/**
+ * The example papers, next to the file picker on the empty card: a dropdown of
+ * documents, because which one to read is the reader's choice. It opens upward
+ * or downward as the room allows - the card is in the middle of the window, so
+ * either way there is space - and the rows say where each paper comes from.
+ */
+#example-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.example-menu {
+  left: 0;
+  right: auto;
+  min-width: 300px;
+}
+
 /* ------------------------------------------------------------ zoom level */
 
 /**
@@ -203,11 +363,8 @@ select.btn {
  * (`229% (fit width)`), not the bar's.
  */
 .zoom-field {
-  position: relative;
-  display: flex;
-  align-items: center;
-  gap: 2px;
   padding: 3px 4px 3px 6px;
+  gap: 2px;
   background: var(--bg-sunken);
   border: 1px solid var(--border);
   border-radius: var(--radius);
@@ -237,64 +394,15 @@ select.btn {
   color: var(--text-muted);
 }
 
-.zoom-menu-btn {
-  appearance: none;
-  border: 0;
-  background: none;
-  color: var(--text-muted);
-  font: inherit;
-  font-size: 9px;
-  line-height: 1;
-  padding: 3px 3px 3px 2px;
-  cursor: pointer;
-}
-
-.zoom-menu-btn:hover {
-  color: var(--text);
-}
-
 /**
  * The levels, including the fit modes by the percentage they resolve to. A
  * `<datalist>` cannot do this job: it filters its own suggestions against what is
  * in the field, so a box showing "185" would list exactly one option.
  */
 .zoom-menu {
-  position: absolute;
-  top: calc(100% + 6px);
   left: -1px;
-  z-index: 30;
+  right: auto;
   min-width: max(100%, 156px);
-  max-height: min(60vh, 360px);
-  overflow: auto;
-  padding: 4px;
-  background: var(--bg-elevated);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.5);
-}
-
-.zoom-option {
-  display: block;
-  width: 100%;
-  text-align: left;
-  border: 0;
-  background: none;
-  color: var(--text);
-  font: inherit;
-  font-size: 12.5px;
-  padding: 4px 8px;
-  border-radius: 4px;
-  cursor: pointer;
-  white-space: nowrap;
-}
-
-.zoom-option.active {
-  background: #262b36;
-}
-
-.zoom-option[aria-selected='true'] {
-  color: var(--accent);
-  font-weight: 600;
 }
 
 /* ---------------------------------------------------------------- search */
@@ -302,8 +410,9 @@ select.btn {
 .search {
   display: flex;
   align-items: center;
-  gap: 2px;
-  padding: 2px 3px 2px 7px;
+  gap: 3px;
+  min-width: 0;
+  padding: 2px 3px 2px 6px;
   background: var(--bg-sunken);
   border: 1px solid var(--border);
   border-radius: var(--radius);
@@ -313,15 +422,29 @@ select.btn {
   border-color: var(--accent-dim);
 }
 
+/**
+ * The magnifier is centred on the row and the input's own text is centred in
+ * the input, so the two sit on the same line however tall the row gets. It used
+ * to be a `⌕`, which is a *text* glyph: it carried a text font's side bearings
+ * and baseline, and hung above the words it was supposed to be looking at.
+ */
 .search-icon {
+  width: 13px;
+  height: 13px;
+  display: block;
+  flex: none;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.6;
+  stroke-linecap: round;
   color: var(--text-muted);
-  font-size: 14px;
-  line-height: 1;
 }
 
 .search-input {
   appearance: none;
+  flex: 1 1 auto;
   width: 168px;
+  min-width: 0;
   border: 0;
   background: none;
   color: var(--text);
@@ -352,22 +475,16 @@ select.btn {
   color: #ff9d9d;
 }
 
-.perf {
-  min-width: 54px;
-  text-align: right;
-  font-size: 11.5px;
-  color: var(--text-muted);
-  white-space: nowrap;
-}
-
 /* ----------------------------------------------------------------- crop */
 
 /**
  * A dropdown like the zoom menu, but its rows are toggles rather than a choice,
- * so each one carries a check box and a line saying what it removes.
+ * so each one carries a check box and a line saying what it removes. Its face is
+ * the crop mark, since the bar has no room to spell the word out and the mark is
+ * what the thing is - and it lights up the way bionic reading's does, because
+ * both of them are modes that change how a page is drawn.
  */
 .crop-field {
-  position: relative;
   display: flex;
   align-items: center;
 }
@@ -375,18 +492,17 @@ select.btn {
 .crop-btn {
   display: inline-flex;
   align-items: center;
-  gap: 5px;
+  gap: 4px;
 }
 
-.crop-btn::after {
-  content: '▾';
-  font-size: 9px;
-  color: var(--text-muted);
+.crop-btn[data-on='true'] {
+  background: var(--accent-dim);
+  border-color: var(--accent);
+  color: #fff;
 }
 
-.crop-count {
-  font-size: 10px;
-  color: var(--accent);
+.crop-btn[data-on='true'] .caret {
+  color: #fff;
 }
 
 .crop-menu {
@@ -542,27 +658,37 @@ select.btn {
 /* -------------------------------------------------------- bionic reading */
 
 /**
- * One square, because it is one mode: a fixed width and height, the letter
- * centred in it, and the pressed state carried by `aria-pressed` rather than by
- * a class of its own - the attribute is what a screen reader reads out anyway,
- * so the styling and the state cannot drift apart.
+ * One dropdown, because bionic reading is one choice: off, or a fade at some
+ * strength. The button is the mode's own letter with a caret beside it - the
+ * letter is what the mode is called, and the mark stays legible at 28 px where
+ * an icon would not. `data-on` is the state, and the menu's starred row is what
+ * says which value is in force.
  */
 .bionic-btn {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 28px;
+  gap: 2px;
+  min-width: 30px;
   height: 28px;
-  padding: 0;
+  padding: 0 5px;
   font-size: 13px;
   font-weight: 700;
   line-height: 1;
 }
 
-.bionic-btn[aria-pressed='true'] {
+.bionic-btn[data-on='true'] {
   background: var(--accent-dim);
   border-color: var(--accent);
   color: #fff;
+}
+
+.bionic-btn[data-on='true'] .caret {
+  color: #fff;
+}
+
+.bionic-menu {
+  min-width: 232px;
 }
 
 /* ------------------------------------------------------------ layout */
@@ -771,3 +897,87 @@ body.wpdf-zoomed .toast {
   opacity: 0;
   pointer-events: none;
 }
+
+/* ------------------------------------------------------------ narrow windows */
+
+/**
+ * The bar is one line at every width, and these are what it gives up to stay
+ * that way - in this order, because it is the order of what a reader can do
+ * without: the two counts, then the size of the two number boxes, then the find
+ * box's furniture. They come last in this file on purpose: a media query does
+ * not outrank the rule it overrides, so a base rule written below it would win.
+ */
+@media (max-width: 560px) {
+  .topbar {
+    gap: 4px;
+    padding: 7px 6px;
+  }
+
+  .bar-left,
+  .bar-right {
+    gap: 3px;
+  }
+
+  #crop-group {
+    margin-left: 3px;
+  }
+
+  /* "of 12 pages" and "3/17 matches" are the two readouts that can wait. */
+  .page-total,
+  .search-count {
+    display: none;
+  }
+
+  /* The two number boxes are the last things with room to give. */
+  .page-input {
+    width: 30px;
+    padding: 5px 3px;
+  }
+
+  .zoom-field {
+    padding: 3px 3px 3px 5px;
+  }
+
+  .zoom-input {
+    width: 28px;
+  }
+}
+
+/* On a phone the bar is a row of marks around one small number: nothing left
+   that is not load-bearing. */
+@media (max-width: 460px) {
+  .topbar {
+    gap: 3px;
+    padding: 7px 5px;
+  }
+
+  .btn {
+    padding: 5px 6px;
+  }
+
+  .zoom-input {
+    width: 24px;
+  }
+
+  .page-input {
+    width: 26px;
+  }
+
+  .search {
+    padding: 2px 3px 2px 5px;
+  }
+
+  /**
+   * The find box keeps its room for the query rather than for its furniture: the
+   * magnifier and the two match arrows go, and what is left is a text field with
+   * a placeholder. Neither is lost - Enter still takes the next match and
+   * Shift+Enter the previous one - and a query nobody can see is worse than a
+   * control without an icon.
+   */
+  .search-icon,
+  #search-prev,
+  #search-next {
+    display: none;
+  }
+}
+

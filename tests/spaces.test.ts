@@ -23,7 +23,7 @@ import fs from 'node:fs';
 import * as mupdf from 'mupdf';
 import { PdfEngine } from '../src/core/engine.ts';
 import { isSpaceChar, spaceMarks, type TextChar } from '../src/core/svg/spaces.ts';
-import { BIONIC_DIM, bionicSegments } from '../src/core/svg/bionic.ts';
+import { BIONIC_DIM, BIONIC_MIN_DIM, bionicDim, bionicSegments } from '../src/core/svg/bionic.ts';
 import { scanGlyphPlacements } from '../src/core/svg/glyphs.ts';
 import { upgradeGlyphsToText } from '../src/core/svg/text-upgrade.ts';
 import { PAPERS } from '../demo/papers.mjs';
@@ -295,6 +295,29 @@ test('bionic fades everything that is not a fixation point', () => {
   // and the letter after it crowded.
   assert.equal(bionic.svg.includes('font-weight="bold"'), false);
   assert.equal(fadedOf(plain.svg).length, 0);
+});
+
+test('the fade is a setting, with the default left where it is', () => {
+  const placements = scanGlyphPlacements(HELLO);
+  const spaces = spaceMarks(chars(['h', 0, 0, 0], [' ', 25, 0, 0], ['w', 30, 0, 0]));
+  const faint = upgradeGlyphsToText(HELLO, placements, enc, { spaces, bionic: true, bionicDim: 0.3 });
+  const plain = upgradeGlyphsToText(HELLO, placements, enc, { spaces, bionic: true });
+
+  assert.ok(faint.svg.includes('fill-opacity="0.3"'));
+  assert.equal(faint.svg.includes(`fill-opacity="${BIONIC_DIM}"`), false);
+  // Same page, same characters, same places: only the light changed.
+  assert.deepEqual(xsOf(faint.svg), xsOf(plain.svg));
+  assert.equal(textOf(faint.svg), textOf(plain.svg));
+  assert.deepEqual(fadedOf(faint.svg), fadedOf(plain.svg));
+
+  // A value that is not a number, or one that would draw no word at all, is the
+  // default rather than something the caller has to check for.
+  assert.equal(bionicDim(undefined), BIONIC_DIM);
+  assert.equal(bionicDim(Number.NaN), BIONIC_DIM);
+  assert.equal(bionicDim(0), BIONIC_MIN_DIM);
+  assert.equal(bionicDim(-4), BIONIC_MIN_DIM);
+  assert.equal(bionicDim(3), 1);
+  assert.equal(bionicDim(0.35), 0.35);
 });
 
 /* ------------------------------------------------------ through the engine */

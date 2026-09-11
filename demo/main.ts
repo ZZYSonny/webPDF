@@ -5,15 +5,24 @@
  * doubles as a test that the integration surface is sufficient for a real app
  * (and, by extension, for a browser extension content script).
  *
- * The chrome is one bar and nothing else: the document and its outline on the
- * left, the layout zoom level in the middle, search and the last render cost on
- * the right. There is no status bar - messages float in a toast - so the pages
- * get every pixel below the bar, and the browser's own pinch is never competing
- * with chrome that claims to be fixed.
+ * The chrome is one bar and nothing else, and that bar is one line however
+ * narrow the window is: the document, its outline and the page number on the
+ * left, the layout zoom level in the middle, finding and the two drawing modes
+ * on the right. Everything on it that opens something is a dropdown built from
+ * `menu.ts`; everything else is an icon. There is no status bar - messages float
+ * in a toast, and the last render's cost is not shown at all - so the pages get
+ * every pixel below the bar, and the browser's own pinch is never competing with
+ * chrome that claims to be fixed.
+ *
+ * The bar is the *document's* chrome, so it arrives with the first page: with
+ * nothing open there is nothing for it to hold, and the empty card offers the
+ * two ways to get a document in (`#example-field` is one of them). A scroll of
+ * the pages puts the chrome away the way a pinch does - see `dismissOnScroll`.
  */
 
 import {
   createViewer,
+  BIONIC_DIM,
   DEFAULT_ZOOM_STEPS,
   PdfViewer,
   type DocumentInfo,
@@ -21,8 +30,9 @@ import {
 } from '../src/index.ts';
 import { createSearch, type SearchController, type SearchState } from './search.ts';
 import { createCropMenu, type CropMenu } from './crop.ts';
+import { createMenu, type Menu } from './menu.ts';
 import { scrollIntoPanel } from './panels.ts';
-import { defaultExample, exampleDocuments, type Example } from './examples.ts';
+import { exampleDocuments, type Example } from './examples.ts';
 import { isCurrentLevel, parseZoomInput, zoomLevels, zoomPercent, type ZoomLevel, type ZoomOption } from './zoom.ts';
 
 const $ = <T extends HTMLElement>(id: string): T => {
@@ -38,33 +48,27 @@ const $ = <T extends HTMLElement>(id: string): T => {
 const topbar = document.querySelector<HTMLElement>('.topbar');
 
 const els = {
-  open: $<HTMLButtonElement>('open'),
   file: $<HTMLInputElement>('file'),
-  sample: $<HTMLSelectElement>('sample'),
+  exampleBtn: $<HTMLButtonElement>('example-btn'),
+  exampleMenu: $('example-menu'),
   tocToggle: $<HTMLButtonElement>('toc-toggle'),
   toc: $('toc'),
   tocBody: $('toc-body'),
   tocClose: $<HTMLButtonElement>('toc-close'),
   navGroup: $('nav-group'),
-  prev: $<HTMLButtonElement>('prev'),
-  next: $<HTMLButtonElement>('next'),
   pageno: $<HTMLInputElement>('pageno'),
   pagecount: $('pagecount'),
   zoomGroup: $('zoom-group'),
-  zoomIn: $<HTMLButtonElement>('zoom-in'),
-  zoomOut: $<HTMLButtonElement>('zoom-out'),
   zoomValue: $<HTMLInputElement>('zoom-value'),
   zoomMenu: $('zoom-menu'),
   zoomMenuBtn: $<HTMLButtonElement>('zoom-menu-btn'),
   searchGroup: $('search-group'),
-  searchBox: $('search-box'),
   search: $<HTMLInputElement>('search'),
   searchCount: $('search-count'),
   searchPrev: $<HTMLButtonElement>('search-prev'),
   searchNext: $<HTMLButtonElement>('search-next'),
   cropGroup: $('crop-group'),
   cropBtn: $<HTMLButtonElement>('crop-btn'),
-  cropCount: $('crop-count'),
   cropMenu: $('crop-menu'),
   cropStatus: $('crop-status'),
   cropList: $('crop-list'),
@@ -73,11 +77,10 @@ const els = {
   cropPadding: $<HTMLInputElement>('crop-padding'),
   bionicGroup: $('bionic-group'),
   bionicBtn: $<HTMLButtonElement>('bionic-btn'),
-  stats: $('stats'),
+  bionicMenu: $('bionic-menu'),
   viewer: $('viewer'),
   empty: $('empty'),
   emptyOpen: $<HTMLButtonElement>('empty-open'),
-  emptySample: $<HTMLButtonElement>('empty-sample'),
   progress: $('progress'),
   toast: $('toast'),
 };
@@ -95,6 +98,12 @@ let toastTimer = 0;
  * stop this far short or it parks the target behind the chrome.
  */
 let topbarHeight = 0;
+/**
+ * How the last document was named: a file's own name, or a URL without its
+ * scheme. It is what the tab says when the document declares no title of its
+ * own - see `document-loaded` below.
+ */
+let sourceName = '';
 
 /* ---------------------------------------------------------------- sources */
 
@@ -110,51 +119,108 @@ const BASE = (() => {
 
 const resolve = (url: string): string => new URL(url, BASE).href;
 
-/** Fetch a document from a URL, with the picker saying which one is loading. */
+/**
+ * What to call a document that has no title of its own: the file's name, or the
+ * URL with its scheme taken off - `arxiv.org/pdf/1706.03762v7` says where the
+ * document came from, where `https://arxiv.org/...` mostly says what a browser
+ * tab always says.
+ */
+const nameOf = (source: File | string): string =>
+  typeof source === 'string' ? source.replace(/^[a-z][a-z0-9+.-]*:\/\//i, '') : source.name;
+
+/** Fetch a document from a URL. */
 async function openUrl(url: string): Promise<void> {
   await openSource(resolve(url));
 }
 
-/** The document the empty tray opens - the first public example. */
-let example: Example | null = null;
+/* ----------------------------------------------------------------- menus */
 
-/** The picker lists whatever this page can actually open. */
-function fillSamplePicker(): void {
+/**
+ * The dropdowns in the bar. `createMenu` owns the behaviour they share - one at
+ * a time, arrows to walk, Escape to leave - and each one rebuilds its rows when
+ * it opens, so a menu that depends on the document (the examples) or on the
+ * value in force (the zoom level, bionic's fade) is never stale.
+ */
+const zoomMenu: Menu = createMenu({
+  anchors: [els.zoomMenuBtn],
+  menu: els.zoomMenu,
+  prepare: () => {
+    refreshZoomMenu();
+    markZoomMenu();
+  },
+  items: () => [...els.zoomMenu.querySelectorAll<HTMLElement>('.menu-option')],
+});
+
+const exampleMenu: Menu = createMenu({
+  anchors: [els.exampleBtn],
+  menu: els.exampleMenu,
+  items: () => [...els.exampleMenu.querySelectorAll<HTMLElement>('.menu-option')],
+});
+
+const bionicMenu: Menu = createMenu({
+  anchors: [els.bionicBtn],
+  menu: els.bionicMenu,
+  prepare: fillBionicMenu,
+  items: () => [...els.bionicMenu.querySelectorAll<HTMLElement>('.menu-option')],
+});
+
+/**
+ * Everything that can be open over the pages. A scroll puts all of it away (see
+ * `dismissOnScroll`), and so does a pinch.
+ */
+const menus: readonly Menu[] = [zoomMenu, exampleMenu, bionicMenu];
+
+/* --------------------------------------------------------- examples menu */
+
+/** One row of the example list: the paper, and where it comes from. */
+function exampleOption(item: Example): HTMLButtonElement {
+  const el = document.createElement('button');
+  el.type = 'button';
+  el.className = 'menu-option';
+  el.setAttribute('role', 'option');
+  el.dataset.url = item.url;
+  el.title = item.title;
+  const name = document.createElement('span');
+  name.className = 'menu-name';
+  name.textContent = item.label;
+  const note = document.createElement('span');
+  note.className = 'menu-note';
+  note.textContent = item.note;
+  el.append(name, note);
+  el.addEventListener('click', () => {
+    exampleMenu.close();
+    void openUrl(item.url);
+  });
+  return el;
+}
+
+/** The list behind the control: whatever this page can actually open. */
+function fillExampleMenu(): void {
   const list = exampleDocuments();
-  example = defaultExample() ?? list[0] ?? null;
-  els.sample.replaceChildren(
-    new Option('Example…', ''),
-    ...list.map((item) => {
-      const option = new Option(`${item.label} · ${item.note}`, item.url);
-      // What the document is like, for anyone deciding which one to open.
-      option.title = item.title;
-      return option;
-    }),
-  );
-  els.sample.value = '';
-  els.emptySample.hidden = example === null;
+  els.exampleMenu.replaceChildren(...list.map(exampleOption));
+  els.exampleBtn.disabled = list.length === 0;
 }
 
 /* ------------------------------------------------------------- bootstrap */
 
-// The picker is populated before anything can be clicked, so the page never
+// The menu is populated before anything can be clicked, so the page never
 // offers a document it cannot fetch.
-fillSamplePicker();
+fillExampleMenu();
 
 async function ensureViewer(): Promise<PdfViewer> {
   if (viewer) return viewer;
   viewer = await createViewer({
     container: els.viewer,
     zoom: 'fit-width',
-    // The same ladder the zoom box lists, so the dropdown, the +/- buttons and
-    // Ctrl +/- all offer identical levels.
+    // The same ladder the zoom box lists, so the dropdown and Ctrl +/- all
+    // offer identical levels.
     zoomSteps: DEFAULT_ZOOM_STEPS,
     gap: 16,
     padding: 18,
     keepPages: 1,
     shadowDom: true,
-    // Read at each scroll rather than captured, so a bar that wraps to two rows
-    // on a narrow window keeps the pages clear of it.
+    // Read at each scroll rather than captured, so chrome that changes height
+    // (the outline's own header, a bar that grows a pixel) is accounted for.
     scrollMargin: () => topbarHeight,
     onEvent: onViewerEvent,
   });
@@ -168,9 +234,10 @@ function onViewerEvent(event: ViewerEvent): void {
       info = event.info;
       search?.reset();
       els.empty.hidden = true;
-      // The sample picker is part of getting a document in, so it goes away once
-      // one is open; "Open PDF…" is the way to a different file from here.
-      els.sample.hidden = true;
+      // The bar is the document's chrome: it arrives with the first page, and
+      // with it the controls that only mean something with a document open.
+      if (topbar) topbar.hidden = false;
+      els.tocToggle.hidden = false;
       els.navGroup.hidden = false;
       els.zoomGroup.hidden = false;
       els.searchGroup.hidden = false;
@@ -184,12 +251,13 @@ function onViewerEvent(event: ViewerEvent): void {
       // on; the outline is marked from that, not from the old position.
       currentPage = 1;
       els.search.value = '';
-      els.stats.textContent = '';
-      document.title = event.info.title || 'webpdf';
+      // What the tab says, in order of what the reader would recognise: the
+      // document's own title, then the file's name, then where it came from.
+      document.title = event.info.title || sourceName || 'webpdf';
       renderOutline(event.info);
-      // The outline is a left-hand column, so a document that has one opens with
-      // it showing - on a window wide enough to afford the width.
-      if (event.info.outline.length > 0 && window.innerWidth >= 1024) setOutline(true);
+      // The outline starts closed - the pages are what the page is for - and is
+      // opened from the bar (or from Ctrl+B's panel-scrolling equivalent).
+      setOutline(false);
       // Open one level *below* fit-width rather than at it. Fit-width is the
       // largest level that still shows the page's full width, and starting there
       // leaves the paper touching both edges of the window. Ctrl+0 still means
@@ -220,13 +288,6 @@ function onViewerEvent(event: ViewerEvent): void {
       crop?.setProgress({ measured: event.measured, total: event.total, running: event.running });
       break;
     case 'render':
-      // Only the cost: everything else about a render is a debugging detail.
-      els.stats.textContent = `${Math.round(event.ms)} ms`;
-      els.stats.title =
-        `Page ${event.page}: ${event.ms} ms · ` +
-        `${event.asText.toLocaleString()} glyphs as text` +
-        (event.asOutlines ? ` · ${event.asOutlines.toLocaleString()} as outlines` : '') +
-        (event.spaces ? ` · ${event.spaces.toLocaleString()} spaces written back` : '');
       search?.refresh();
       break;
     case 'link':
@@ -272,18 +333,19 @@ function notify(text: string, kind: 'info' | 'error' = 'info'): void {
  */
 let menuOptions: ZoomOption[] = [];
 let menuKey = '';
-let menuCursor = 0;
 
-function zoomOptionElement(option: ZoomOption, index: number): HTMLButtonElement {
+function zoomOptionElement(option: ZoomOption): HTMLButtonElement {
   const el = document.createElement('button');
   el.type = 'button';
-  el.className = 'zoom-option';
+  el.className = 'menu-option';
   el.setAttribute('role', 'option');
-  el.dataset.index = String(index);
-  el.textContent = option.label;
+  const name = document.createElement('span');
+  name.className = 'menu-name';
+  name.textContent = option.label;
+  el.appendChild(name);
   el.addEventListener('click', () => {
     applyZoomLevel(option.level);
-    closeZoomMenu();
+    zoomMenu.close();
     els.zoomValue.focus();
   });
   return el;
@@ -299,116 +361,15 @@ function refreshZoomMenu(): void {
     menuOptions = zoomLevels(DEFAULT_ZOOM_STEPS, (level) => viewer!.resolveZoom(level));
     els.zoomMenu.replaceChildren(...menuOptions.map(zoomOptionElement));
   }
-  markZoomMenu();
 }
 
 /** Show which rung the viewer is on now. */
 function markZoomMenu(): void {
   if (!viewer || menuOptions.length === 0) return;
   const current = menuOptions.findIndex((option) => isCurrentLevel(option.level, viewer!.zoom, viewer!.zoomMode));
-  els.zoomMenu.querySelectorAll<HTMLElement>('.zoom-option').forEach((el, index) => {
+  els.zoomMenu.querySelectorAll<HTMLElement>('.menu-option').forEach((el, index) => {
     el.setAttribute('aria-selected', String(index === current));
-    el.classList.toggle('active', index === menuCursor);
   });
-}
-
-function openZoomMenu(): void {
-  if (!viewer) return;
-  refreshZoomMenu();
-  const current = menuOptions.findIndex((option) => isCurrentLevel(option.level, viewer!.zoom, viewer!.zoomMode));
-  menuCursor = current >= 0 ? current : 0;
-  markZoomMenu();
-  els.zoomMenu.hidden = false;
-  els.zoomMenuBtn.setAttribute('aria-expanded', 'true');
-  const chosen = els.zoomMenu.querySelectorAll<HTMLElement>('.zoom-option')[menuCursor];
-  if (chosen) scrollIntoPanel(chosen, els.zoomMenu);
-}
-
-function closeZoomMenu(): void {
-  els.zoomMenu.hidden = true;
-  els.zoomMenuBtn.setAttribute('aria-expanded', 'false');
-}
-
-function moveZoomMenu(delta: number): void {
-  if (menuOptions.length === 0) return;
-  menuCursor = Math.min(menuOptions.length - 1, Math.max(0, menuCursor + delta));
-  markZoomMenu();
-  const chosen = els.zoomMenu.querySelectorAll<HTMLElement>('.zoom-option')[menuCursor];
-  if (chosen) scrollIntoPanel(chosen, els.zoomMenu);
-}
-
-/* ------------------------------------------------------------------ crop */
-
-/**
- * The crop dropdown: rules in, a selection out. Applying it is one call - the
- * viewer measures the pages and re-lays them out as the boxes arrive - and the
- * progress it reports back is what the panel's status line shows.
- */
-function ensureCropMenu(v: PdfViewer): CropMenu {
-  if (crop) return crop;
-  crop = createCropMenu({
-    button: els.cropBtn,
-    menu: els.cropMenu,
-    list: els.cropList,
-    status: els.cropStatus,
-    count: els.cropCount,
-    allButton: els.cropAll,
-    noneButton: els.cropNone,
-    padding: els.cropPadding,
-    onChange: (rules, padding) => v.setCrop(rules, padding),
-  });
-  return crop;
-}
-
-/* --------------------------------------------------------------- bionic */
-
-/**
- * Bionic reading is one bit of state, and the button *is* that state: the viewer
- * re-renders what is on screen where it is - fading a stretch of text changes
- * how it is drawn, never where it is - and `aria-pressed` says which of the two
- * modes is in force, so there is no styling class that could disagree with it.
- *
- * It is worth knowing what it needs to work: the words. MuPDF's outline device
- * draws no spaces, so the engine writes them back into the text first
- * (`core/svg/spaces.ts`); without that every line would be one long word and
- * there would be nothing to hold at full strength.
- */
-function toggleBionic(): void {
-  if (!viewer) return;
-  viewer.setBionic(!viewer.bionic);
-  els.bionicBtn.setAttribute('aria-pressed', String(viewer.bionic));
-  els.bionicBtn.title = viewer.bionic
-    ? 'Bionic reading on — click to show the pages as the document sets them'
-    : 'Bionic reading — hold the first letters of every word, and fade the rest'
-}
-
-els.bionicBtn.addEventListener('click', toggleBionic);
-
-/* ---------------------------------------------------------------- panels */
-
-/**
- * Close everything that was opened over the pages - the outline, the zoom
- * dropdown, the crop rules - and take focus out of it.
- *
- * Zoom is the reason this exists rather than an accident of the toggle: a pinch
- * is the browser's page scale, and chrome drawn next to the pages is magnified
- * with them and can be panned out of view. A panel left open behind the zoom is
- * not just invisible, it is still live, and still scrolling itself into view.
- * Dismissing says what is true - while the page is magnified there is nothing
- * on screen to read - and keeps the document the only thing that can move.
- *
- * Cheap enough to call on every `zoom-change`: the common case is three checks.
- */
-function dismissChrome(): void {
-  const active = document.activeElement;
-  const focused = active instanceof HTMLElement && (topbar?.contains(active) === true || els.toc.contains(active));
-  if (els.toc.hidden && els.zoomMenu.hidden && els.cropMenu.hidden && !focused) return;
-  if (!els.toc.hidden) setOutline(false);
-  if (!els.zoomMenu.hidden) closeZoomMenu();
-  if (!els.cropMenu.hidden) crop?.close();
-  // Focus left in a control that the zoom has made invisible would swallow
-  // keystrokes. The viewer's link hit areas are not chrome, and keep theirs.
-  if (focused) active.blur();
 }
 
 function applyZoomLevel(level: ZoomLevel): void {
@@ -426,6 +387,187 @@ function applyZoomInput(): void {
   const level = parseZoomInput(els.zoomValue.value);
   if (level !== null) viewer?.setZoom(level);
   syncZoomBox();
+}
+
+/* ------------------------------------------------------------------ crop */
+
+/**
+ * The crop dropdown: rules in, a selection out. Applying it is one call - the
+ * viewer measures the pages and re-lays them out as the boxes arrive - and the
+ * progress it reports back is what the panel's status line shows.
+ */
+function ensureCropMenu(v: PdfViewer): CropMenu {
+  if (crop) return crop;
+  crop = createCropMenu({
+    button: els.cropBtn,
+    menu: els.cropMenu,
+    list: els.cropList,
+    status: els.cropStatus,
+    allButton: els.cropAll,
+    noneButton: els.cropNone,
+    padding: els.cropPadding,
+    onChange: (rules, padding) => v.setCrop(rules, padding),
+  });
+  return crop;
+}
+
+/* --------------------------------------------------------------- bionic */
+
+/**
+ * Bionic reading is one choice: off, or a fade at some strength. The menu is
+ * where the choice is made - the button is its face - and the star on a row
+ * marks the fade in force, so the value a reader settled on is always the one
+ * the menu opens on and always the one they can see.
+ *
+ * The library's default (a half) is `BIONIC_DIM`; the values either side of it
+ * are here because how much of a word to hold is a matter of taste and of
+ * eyesight. Below 0.3 the remainder reads as a printing fault and above 0.7
+ * there is nothing much left to hold, so that is the range on offer.
+ */
+const BIONIC_CHOICES: ReadonlyArray<{ dim: number; note: string }> = [
+  { dim: 0.3, note: 'the rest of each word is barely there' },
+  { dim: 0.4, note: 'a strong fade' },
+  { dim: BIONIC_DIM, note: 'the default — the balance the eye wants' },
+  { dim: 0.6, note: 'a light fade' },
+  { dim: 0.7, note: 'barely faded at all' },
+];
+
+function bionicOption(
+  label: string,
+  note: string,
+  state: { selected: boolean; starred: boolean },
+  choose: () => void,
+): HTMLButtonElement {
+  const el = document.createElement('button');
+  el.type = 'button';
+  el.className = 'menu-option';
+  el.setAttribute('role', 'option');
+  el.setAttribute('aria-selected', String(state.selected));
+  const name = document.createElement('span');
+  name.className = 'menu-name';
+  name.textContent = label;
+  if (state.starred) {
+    const star = document.createElement('span');
+    star.className = 'star';
+    star.setAttribute('aria-hidden', 'true');
+    star.textContent = '★';
+    star.title = 'the value in force';
+    name.appendChild(star);
+  }
+  const detail = document.createElement('span');
+  detail.className = 'menu-note';
+  detail.textContent = note;
+  el.append(name, detail);
+  el.addEventListener('click', () => {
+    choose();
+    bionicMenu.close();
+  });
+  return el;
+}
+
+function fillBionicMenu(): void {
+  const on = viewer?.bionic ?? false;
+  const dim = viewer?.bionicDim ?? BIONIC_DIM;
+  const rows = [
+    bionicOption('Off', 'the pages as the document sets them', { selected: !on, starred: false }, () => setBionic(false)),
+  ];
+  for (const choice of BIONIC_CHOICES) {
+    const starred = Math.abs(choice.dim - dim) < 1e-9;
+    rows.push(
+      bionicOption(
+        `Fade the rest to ${Math.round(choice.dim * 100)}%`,
+        choice.note,
+        { selected: on && starred, starred },
+        () => setBionic(true, choice.dim),
+      ),
+    );
+  }
+  els.bionicMenu.replaceChildren(...rows);
+  els.bionicBtn.dataset.on = String(on);
+  els.bionicBtn.title = on
+    ? `Bionic reading on — the rest of every word at ${Math.round(dim * 100)}%`
+    : 'Bionic reading — hold the first letters of every word at full strength';
+}
+
+/** The mode, and how faint the rest of a word is drawn. */
+function setBionic(on: boolean, dim?: number): void {
+  if (!viewer) return;
+  viewer.setBionic(on, dim);
+  fillBionicMenu();
+}
+
+/* ---------------------------------------------------------------- panels */
+
+/**
+ * Close everything that was opened over the pages - the outline, the dropdowns,
+ * the crop rules - and take focus out of it.
+ *
+ * Two things do this rather than an accident of a toggle. A pinch is the
+ * browser's page scale, and chrome drawn next to the pages is magnified with
+ * them and can be panned out of view; a scroll of the pages moves the document
+ * out from under an open panel just as surely. A panel left open behind either
+ * one is not just invisible, it is still live, and still scrolling itself into
+ * view. Dismissing says what is true - there is nothing on screen to read - and
+ * keeps the document the only thing that can move.
+ *
+ * Cheap enough to call on every scroll: the common case is four checks.
+ */
+function dismissChrome(): void {
+  const active = document.activeElement;
+  const focused = active instanceof HTMLElement && (topbar?.contains(active) === true || els.toc.contains(active));
+  const open = !els.toc.hidden || menus.some((menu) => menu.isOpen) || crop?.isOpen === true;
+  if (!open && !focused) return;
+  if (!els.toc.hidden) setOutline(false);
+  for (const menu of menus) menu.close();
+  crop?.close();
+  // Focus left in a control that has just been hidden would swallow keystrokes.
+  // The viewer's link hit areas are not chrome, and keep theirs.
+  if (focused) active.blur();
+}
+
+/**
+ * A scroll of the pages is a reader moving the document, and it puts the chrome
+ * away the way a pinch does.
+ *
+ * This listens for the *intent* - a wheel, a touch drag, a scrolling key -
+ * rather than for `scroll` itself, because the viewer scrolls the document
+ * programmatically all the time: a link, a page jump, a crop that re-lays the
+ * pages out. Those are the reader's own commands, and closing the panel they
+ * gave the command from would be the wrong answer. Chrome that scrolls itself
+ * (the outline, an open dropdown) is left alone for the same reason.
+ */
+const SCROLL_KEYS = new Set(['ArrowUp', 'ArrowDown', 'PageUp', 'PageDown', 'Home', 'End', ' ', 'Spacebar']);
+
+function dismissOnScroll(): void {
+  const inPanel = (event: Event): boolean => {
+    const target = event.target;
+    // The bar, the outline, and the card that offers a document: a wheel over
+    // any of them is scrolling *that*, not the pages - and with no document
+    // open there are no pages for a scroll to move in the first place.
+    return target instanceof Element && target.closest('.topbar, .toc, .empty') !== null;
+  };
+  window.addEventListener(
+    'wheel',
+    (event) => {
+      if (!inPanel(event)) dismissChrome();
+    },
+    { passive: true },
+  );
+  window.addEventListener(
+    'touchmove',
+    (event) => {
+      if (!inPanel(event)) dismissChrome();
+    },
+    { passive: true },
+  );
+  window.addEventListener('keydown', (event) => {
+    if (!SCROLL_KEYS.has(event.key) || event.metaKey || event.ctrlKey || event.altKey) return;
+    // A key pressed into a control is that control's: Space activates a button,
+    // an arrow moves the caret in a text field.
+    const target = event.target;
+    if (target instanceof HTMLElement && target.closest('input, textarea, select, button, [contenteditable="true"]')) return;
+    dismissChrome();
+  });
 }
 
 /* ---------------------------------------------------------------- search */
@@ -524,6 +666,8 @@ function highlightOutline(page: number): void {
 
 async function openSource(source: File | string): Promise<void> {
   const label = typeof source === 'string' ? source : source.name;
+  // Read by `document-loaded`, which fires while `load` is still running.
+  sourceName = nameOf(source);
   busy++;
   els.progress.hidden = false;
   try {
@@ -557,70 +701,51 @@ async function openSource(source: File | string): Promise<void> {
 
 /* ---------------------------------------------------------------- events */
 
-els.open.addEventListener('click', () => els.file.click());
 els.emptyOpen.addEventListener('click', () => els.file.click());
+// A file can still be opened once a document is: Ctrl+O, a drop on the pages,
+// or the viewer's own drop target.
 els.file.addEventListener('change', () => {
   const file = els.file.files?.[0];
   if (file) void openSource(file);
   els.file.value = '';
 });
 
-els.sample.addEventListener('change', () => {
-  const url = els.sample.value;
-  if (url) void openUrl(url);
-  els.sample.value = '';
-});
-
-els.emptySample.addEventListener('click', () => {
-  if (example) void openUrl(example.url);
-});
-
-els.prev.addEventListener('click', () => viewer?.prevPage());
-els.next.addEventListener('click', () => viewer?.nextPage());
 els.pageno.addEventListener('change', () => {
   const n = Number.parseInt(els.pageno.value, 10);
   if (Number.isFinite(n)) viewer?.goToPage(n);
   else els.pageno.value = String(currentPage);
 });
 
-els.zoomIn.addEventListener('click', () => viewer?.zoomIn());
-els.zoomOut.addEventListener('click', () => viewer?.zoomOut());
 els.zoomValue.addEventListener('change', applyZoomInput);
 els.zoomValue.addEventListener('blur', syncZoomBox);
 els.zoomValue.addEventListener('keydown', (event) => {
   if (event.key === 'Enter') {
     event.preventDefault();
     // With the list open, Enter takes the highlighted level.
-    if (els.zoomMenu.hidden) applyZoomInput();
-    else if (menuOptions[menuCursor]) applyZoomLevel(menuOptions[menuCursor].level);
-    closeZoomMenu();
+    if (zoomMenu.isOpen) zoomMenu.current()?.click();
+    else applyZoomInput();
+    zoomMenu.close();
   } else if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
     event.preventDefault();
-    if (els.zoomMenu.hidden) openZoomMenu();
-    else moveZoomMenu(event.key === 'ArrowDown' ? 1 : -1);
+    zoomMenu.move(event.key === 'ArrowDown' ? 1 : -1);
   } else if (event.key === 'Escape') {
     event.preventDefault();
-    if (!els.zoomMenu.hidden) closeZoomMenu();
+    if (zoomMenu.isOpen) zoomMenu.close();
     else {
       syncZoomBox();
       els.zoomValue.blur();
     }
   }
 });
-els.zoomMenuBtn.addEventListener('click', () => {
-  if (els.zoomMenu.hidden) openZoomMenu();
-  else closeZoomMenu();
-});
 // A click anywhere else, or a resize that would move the anchor, closes the list.
 document.addEventListener('pointerdown', (event) => {
   const target = event.target as Element | null;
-  if (!els.zoomMenu.hidden && !target?.closest?.('.zoom-field')) closeZoomMenu();
   if (!els.cropMenu.hidden && !target?.closest?.('.crop-field')) crop?.close();
 });
 // A resize moves the fit levels; if the current level is a factor, no zoom event
 // fires, so ask for the rebuild directly.
 window.addEventListener('resize', () => {
-  closeZoomMenu();
+  zoomMenu.close();
   crop?.close();
   refreshZoomMenu();
 });
@@ -651,6 +776,8 @@ els.cropBtn.addEventListener('click', () => crop?.toggle());
 els.tocToggle.addEventListener('click', () => setOutline(els.toc.hidden));
 els.tocClose.addEventListener('click', () => setOutline(false));
 
+dismissOnScroll();
+
 window.addEventListener('keydown', (event) => {
   if (!viewer) return;
   const mod = event.metaKey || event.ctrlKey;
@@ -667,8 +794,9 @@ window.addEventListener('keydown', (event) => {
 });
 
 /**
- * The sticky chrome offsets need to know how tall the topbar actually is (it
- * stacks on narrow windows). Kept in CSS pixels and updated on resize only.
+ * The sticky chrome offsets need to know how tall the topbar actually is. It is
+ * one line at every width now, but a font that loads late can still move it a
+ * pixel, and the viewer reads this on every scroll.
  */
 if (topbar) {
   const measure = (): void => {

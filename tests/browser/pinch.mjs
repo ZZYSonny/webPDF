@@ -46,7 +46,7 @@ const state = () =>
       pageScale: +vv.scale.toFixed(3),
       // The box holds a bare number; the fit modes are named in the dropdown.
       box: document.getElementById('zoom-value')?.value ?? '',
-      presets: [...document.querySelectorAll('#zoom-menu .zoom-option')].map((o) => o.textContent),
+      presets: [...document.querySelectorAll('#zoom-menu .menu-option')].map((o) => o.textContent),
       mode: viewer?.zoomMode ?? '',
       scale: viewer ? +viewer.zoom.toFixed(4) : null,
       statusBar: !!document.querySelector('.statusbar'),
@@ -181,12 +181,14 @@ try {
   // The paper the other tests are written against, wherever this page can get
   // it: the local copy when the cache behind `/pdf` has one, else its public URL.
   const document_ = await page.evaluate(() => {
-    const sel = document.getElementById('sample');
-    const options = [...sel.options].map((o) => o.value).filter(Boolean);
+    // The example papers are a dropdown on the empty card; the rows carry the
+    // URLs they open.
+    const rows = [...document.querySelectorAll('#example-menu .menu-option')];
+    const options = rows.map((el) => el.dataset.url).filter(Boolean);
     const chosen = options.find((value) => value.startsWith('/pdf/')) ?? options.find((value) => value.startsWith('https://arxiv.org/'));
-    if (!chosen) throw new Error('the picker offers no document to open: ' + JSON.stringify(options));
-    sel.value = chosen;
-    sel.dispatchEvent(new Event('change'));
+    if (!chosen) throw new Error('no example to open: ' + JSON.stringify(options));
+    document.getElementById('example-btn').click();
+    rows.find((el) => el.dataset.url === chosen).click();
     return chosen;
   });
   console.log('document: ' + document_);
@@ -341,16 +343,28 @@ try {
   const home = await state();
   check('Ctrl+0 returns to the fit mode', home.mode === 'fit-width', `${home.box} (${home.mode})`);
 
-  console.log('\n— the toolbar buttons walk the same ladder —');
-  const buttons = await measure(async () => {
-    await page.evaluate(() => document.getElementById('zoom-out').click());
+  console.log('\n— the zoom dropdown picks a level —');
+  // The `+`/`-` buttons are gone from the bar; the list is the control, and the
+  // fit modes are named there by what they resolve to.
+  await page.evaluate(() => {
+    document.getElementById('zoom-menu-btn').click();
+    const row = [...document.querySelectorAll('#zoom-menu .menu-option')]
+      .find((el) => /\(fit page\)$/.test(el.textContent));
+    if (!row) throw new Error('the dropdown names no fit-page level');
+    row.click();
   });
-  check('zoom-out steps the ladder', buttons.after.s.scale !== home.scale && buttons.after.s.mode !== 'fit-width',
-    `${home.box} (${home.mode}) -> ${buttons.after.s.box} (${buttons.after.s.mode})`);
-  await page.evaluate(() => document.getElementById('zoom-in').click());
-  await sleep(400);
+  await sleep(500);
+  const chosenPage = await state();
+  check('choosing fit page applies it', chosenPage.mode === 'fit-page', `${home.box} (${home.mode}) -> ${chosenPage.box} (${chosenPage.mode})`);
+  check('the dropdown closed behind the choice', !chosenPage.zoomMenuOpen);
+  await page.evaluate(() => {
+    document.getElementById('zoom-menu-btn').click();
+    const row = [...document.querySelectorAll('#zoom-menu .menu-option')].find((el) => /\(fit width\)$/.test(el.textContent));
+    row.click();
+  });
+  await sleep(500);
   const back = await state();
-  check('zoom-in steps back up', back.mode === 'fit-width', `${buttons.after.s.box} -> ${back.box} (${back.mode})`);
+  check('and fit width comes back', back.mode === 'fit-width', `${chosenPage.box} -> ${back.box} (${back.mode})`);
 
   console.log('\n— typing a level sets it, and the old status bar is gone —');
   check('there is no status bar left to collide with the pages', !back.statusBar);
@@ -380,8 +394,8 @@ try {
   await sleep(250);
   const opened = await page.evaluate(`JSON.stringify({
     open: document.getElementById('zoom-menu').hidden === false,
-    options: [...document.querySelectorAll('#zoom-menu .zoom-option')].map((o) => o.textContent),
-    selected: document.querySelector('#zoom-menu .zoom-option[aria-selected="true"]')?.textContent ?? '',
+    options: [...document.querySelectorAll('#zoom-menu .menu-option')].map((o) => o.textContent),
+    selected: document.querySelector('#zoom-menu .menu-option[aria-selected="true"]')?.textContent ?? '',
   })`);
   const menu = JSON.parse(opened);
   check('the button opens the list', menu.open, `${menu.options.length} options`);
@@ -390,7 +404,7 @@ try {
     menu.options.join(' · '));
   check('the list marks the level the viewer is on', /\(fit page\)$/.test(menu.selected), `"${menu.selected}"`);
   await page.evaluate(`(() => {
-    const option = [...document.querySelectorAll('#zoom-menu .zoom-option')].find((o) => /\\(fit width\\)$/.test(o.textContent));
+    const option = [...document.querySelectorAll('#zoom-menu .menu-option')].find((o) => /\\(fit width\\)$/.test(o.textContent));
     option.click();
   })()`);
   await sleep(500);
@@ -419,9 +433,9 @@ try {
     input.focus();
     input.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true }));
     const opened = document.getElementById('zoom-menu').hidden === false;
-    const start = document.querySelector('#zoom-menu .zoom-option.active')?.textContent ?? '';
+    const start = document.querySelector('#zoom-menu .menu-option.active')?.textContent ?? '';
     input.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true }));
-    const moved = document.querySelector('#zoom-menu .zoom-option.active')?.textContent ?? '';
+    const moved = document.querySelector('#zoom-menu .menu-option.active')?.textContent ?? '';
     input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
     return {
       opened,

@@ -23,8 +23,10 @@ export interface CropMenuOptions {
   menu: HTMLElement;
   list: HTMLElement;
   status: HTMLElement;
-  count: HTMLElement;
-  /** The bulk pair. Each is live only while it would change something. */
+  /**
+   * The bulk pair. Exactly one of them is shown at a time: "Enable all" until
+   * every rule that applies is checked, "Disable all" from there.
+   */
   allButton: HTMLButtonElement;
   noneButton: HTMLButtonElement;
   /** The padding field, in page units. */
@@ -35,6 +37,22 @@ export interface CropMenuOptions {
 
 /** The most padding the field will take: two inches is already all margin. */
 const MAX_PADDING = 144;
+
+/**
+ * The margin kept around the content, in page units, before anyone touches the
+ * field. PaperCutter crops to the content exactly (0), which puts the box on
+ * the ink: a hair of white - six points, a twelfth of an inch - is what stops a
+ * trimmed page from looking cut off, and it is the value the panel starts on.
+ */
+const DEFAULT_PADDING = 6;
+
+/**
+ * The rule the panel stars: the one nearly every paper needs, and the one
+ * PaperCutter's own defaults are about. The star is a recommendation, not a
+ * state - the row starts unchecked like every other, because cropping is
+ * opt-in (see the file header).
+ */
+const RECOMMENDED: CropRuleId = 'page-number';
 
 export interface CropProgress {
   measured: number;
@@ -61,11 +79,11 @@ export interface CropMenu {
 }
 
 export function createCropMenu(opts: CropMenuOptions): CropMenu {
-  const { button, menu, list, status, count, allButton, noneButton, padding: padInput } = opts;
+  const { button, menu, list, status, allButton, noneButton, padding: padInput } = opts;
   const selected = new Set<CropRuleId>();
   const rows = new Map<CropRuleId, HTMLButtonElement>();
   let cursor = 0;
-  let padding = 0;
+  let padding = DEFAULT_PADDING;
   let title = '';
   let progress: CropProgress = { measured: 0, total: 0, running: false };
   let destroyed = false;
@@ -95,6 +113,14 @@ export function createCropMenu(opts: CropMenuOptions): CropMenu {
     const name = document.createElement('span');
     name.className = 'crop-name';
     name.textContent = rule.label;
+    if (rule.id === RECOMMENDED) {
+      const star = document.createElement('span');
+      star.className = 'star';
+      star.setAttribute('aria-hidden', 'true');
+      star.textContent = '★';
+      name.appendChild(star);
+      el.title += '\nThe rule most documents want';
+    }
     const hint = document.createElement('span');
     hint.className = 'crop-hint';
     hint.textContent = rule.hint;
@@ -181,13 +207,17 @@ export function createCropMenu(opts: CropMenuOptions): CropMenu {
       if (hint && rule.needsTitle) hint.textContent = ok ? rule.hint : 'this document declares no title';
     }
     const chosen = selection();
-    // Neither button offers to do what has already been done, and the margin is
-    // only meaningful around a crop.
-    allButton.disabled = allSelected();
-    noneButton.disabled = chosen.length === 0;
+    // One bulk button at a time, and it always says what is left to do rather
+    // than what was just done: "Enable all" is PaperCutter's own behaviour and
+    // is offered until every rule that applies to this document is checked,
+    // and from there the only move left is back.
+    const every = allSelected();
+    allButton.hidden = every;
+    noneButton.hidden = !every;
     padInput.disabled = chosen.length === 0;
-    count.textContent = chosen.length ? String(chosen.length) : '';
-    button.classList.toggle('active', chosen.length > 0);
+    // The same "on" the bionic control carries: an accent background while the
+    // pages are being changed, and nothing but a border while they are not.
+    button.dataset.on = String(chosen.length > 0);
     button.setAttribute(
       'title',
       chosen.length

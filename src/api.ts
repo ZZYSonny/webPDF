@@ -81,6 +81,11 @@ export interface RenderDocumentOptions extends EngineOptions {
   crop?: readonly CropRuleId[] | null;
   /** Bold the first letters of every word, the way bionic reading does. */
   bionic?: boolean;
+  /**
+   * How much strength the faded part of each word keeps, 0..1. Defaults to
+   * `BIONIC_DIM` (a half).
+   */
+  bionicDim?: number;
   onPage?: (page: RenderedPage, index: number) => void | Promise<void>;
   signal?: AbortSignal;
 }
@@ -111,6 +116,7 @@ export async function* renderDocument(
         idPrefix: `p${i}-`,
         crop: opts.crop,
         bionic: opts.bionic,
+        bionicDim: opts.bionicDim,
       });
       await opts.onPage?.(page, i);
       yield page;
@@ -134,6 +140,7 @@ export type { FontAsset } from './core/font/registry.ts';
 export { FontRegistry } from './core/font/registry.ts';
 export { buildFontFromOutlines } from './core/font/build.ts';
 export { upgradeGlyphsToText } from './core/svg/text-upgrade.ts';
+export { BIONIC_DIM } from './core/svg/bionic.ts';
 export { scanGlyphOutlines, scanGlyphPlacements } from './core/svg/glyphs.ts';
 export { PageLayout, computeFitScale } from './viewer/layout.ts';
 export type { ZoomMode } from './viewer/layout.ts';

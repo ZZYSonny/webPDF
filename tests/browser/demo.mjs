@@ -38,16 +38,19 @@ const page = await browser.newPage();
 await page.setViewport(1440, 900);
 
 /**
- * Pick a document from the picker. The value is embedded in the expression
- * because `page.evaluate(fn, args)` takes evaluation options as its second
- * argument, not arguments for the function.
+ * Open one of the example papers, from the dropdown on the empty card. The
+ * value is embedded in the expression because `page.evaluate(fn, args)` takes
+ * evaluation options as its second argument, not arguments for the function.
  */
-const open = (value) =>
-  page.evaluate(`(() => {
-    const sel = document.getElementById('sample');
-    sel.value = ${JSON.stringify(value)};
-    sel.dispatchEvent(new Event('change'));
+const open = async (value) => {
+  await page.evaluate(`document.getElementById('example-btn').click()`);
+  await page.evaluate(`(() => {
+    const url = ${JSON.stringify(value)};
+    const row = [...document.querySelectorAll('#example-menu .menu-option')].find((el) => el.dataset.url === url);
+    if (!row) throw new Error('no example row for ' + url);
+    row.click();
   })()`);
+};
 
 /**
  * The screenshot is a deliverable: `docs/demo.png` is the README's picture of
@@ -191,12 +194,20 @@ try {
 
   console.log('— loading the sample through the UI —');
   const beforeLoad = await page.evaluate(() => ({
-    sampleHidden: document.getElementById('sample')?.hidden === true,
+    // The bar is the *document's* chrome: with no document open there is
+    // nothing for it to hold, and the card that offers one stands alone.
+    barHidden: document.querySelector('.topbar')?.hidden === true,
     emptyHidden: document.getElementById('empty')?.hidden,
-    options: [...document.querySelectorAll('#sample option')].map((o) => o.value).filter(Boolean),
+    offered: ['example-btn', 'empty-open'].map((id) => !!document.getElementById(id)?.offsetParent),
+    // Nothing that opens a document, and none of the controls that were taken
+    // off the bar, is still in the document at all.
+    gone: ['open', 'sample', 'prev', 'next', 'zoom-in', 'zoom-out', 'stats'].filter((id) => document.getElementById(id)),
+    options: [...document.querySelectorAll('#example-menu .menu-option')].map((o) => o.dataset.url).filter(Boolean),
   }));
-  if (beforeLoad.sampleHidden) fail('the sample picker should be offered before a document is open');
+  if (!beforeLoad.barHidden) fail('the bar should not be in the way before a document is open');
   if (beforeLoad.emptyHidden !== false) fail('the empty state should be showing before a document is open');
+  if (beforeLoad.offered.includes(false)) fail('the empty card should offer both a file and the example papers');
+  if (beforeLoad.gone.length) fail(`the bar still carries ${beforeLoad.gone.join(', ')}`);
   if (!beforeLoad.options.includes(PUBLIC_EXAMPLE)) {
     fail(`the picker should offer the public example ${PUBLIC_EXAMPLE}, got ${JSON.stringify(beforeLoad.options)}`);
   }
@@ -235,10 +246,9 @@ try {
     const box = first?.getBoundingClientRect();
     return {
       toast: document.getElementById('toast')?.textContent,
-      perf: document.getElementById('stats')?.textContent,
       pageCount: document.getElementById('pagecount')?.textContent,
       zoom: document.getElementById('zoom-value')?.value,
-      zoomMenu: [...document.querySelectorAll('#zoom-menu .zoom-option')].map((o) => o.textContent),
+      zoomMenu: [...document.querySelectorAll('#zoom-menu .menu-option')].map((o) => o.textContent),
       zoomMenuOpen: document.getElementById('zoom-menu')?.hidden === false,
       // Any element of the bar that says "fit width"/"fit page" while neither
       // being the (closed) dropdown nor containing it.
@@ -248,7 +258,17 @@ try {
       tocEntries: document.querySelectorAll('#toc-body .toc-item').length,
       tocOpen: document.getElementById('toc')?.hidden === false,
       emptyHidden: document.getElementById('empty')?.hidden,
-      sampleHidden: document.getElementById('sample')?.hidden,
+      barHidden: document.querySelector('.topbar')?.hidden,
+      barHeight: Math.round(document.querySelector('.topbar')?.getBoundingClientRect().height ?? 0),
+      barOverflow: Math.round((document.querySelector('.topbar')?.scrollWidth ?? 0) - (document.querySelector('.topbar')?.clientWidth ?? 0)),
+      // Every control that is only a mark: no word spelled out on the bar.
+      iconButtons: [...document.querySelectorAll('.topbar .btn.icon')].map((el) => ({
+        id: el.id,
+        words: (el.textContent ?? '').replace(/[^A-Za-z]/g, ''),
+        mark: !!el.querySelector('svg'),
+      })),
+      title: document.title,
+      icon: document.querySelector('link[rel="icon"]')?.getAttribute('href') ?? '',
       hasStatusBar: !!document.querySelector('.statusbar'),
       hasExport: !!document.getElementById('export'),
       hasSearch: !!document.getElementById('search'),
@@ -317,13 +337,19 @@ try {
   if (report.selectable < 4) fail('text is not selectable');
   if (report.tocEntries < 5) fail('outline did not populate');
   if (report.emptyHidden !== true) fail('empty state still visible');
-  if (report.sampleHidden !== true) fail('the sample picker should be gone once a document is open');
+  if (report.barHidden !== false) fail('the bar should be there once a document is open');
+  if (report.iconButtons.some((b) => !b.mark)) fail(`an icon button has no mark: ${JSON.stringify(report.iconButtons)}`);
+  if (report.iconButtons.some((b) => b.words)) fail(`an icon button spells itself out: ${JSON.stringify(report.iconButtons)}`);
+  if (!report.icon) fail('the page declares no icon');
+  // The tab names the document: its own title, else the file, else where it
+  // came from - never a URL with its scheme on.
+  if (!report.title || /:\/\//.test(report.title)) fail(`the tab title should name the document, got ${JSON.stringify(report.title)}`);
+  if (!report.title.endsWith(document_.split('/').pop())) {
+    fail(`the tab title should name ${JSON.stringify(document_)}, got ${JSON.stringify(report.title)}`);
+  }
   if (report.hasStatusBar) fail('the status bar should be gone');
   if (report.hasExport) fail('the export button should be gone');
   if (report.hasSearch !== true) fail('the search box is missing');
-  if (!/^\d+ ms$/.test(report.perf ?? '')) {
-    fail(`the perf readout should be nothing but a time, got ${JSON.stringify(report.perf)}`);
-  }
   if (!/^\d+$/.test(report.zoom ?? '')) {
     fail(`the zoom box should hold a bare number, got ${JSON.stringify(report.zoom)}`);
   }
@@ -357,7 +383,7 @@ try {
     fail(`the starting level should be below fit width (${startLevel.fitWidth}), got ${startLevel.zoom}`);
   }
   // Nothing sits between: one step up must land exactly on fit width.
-  await page.evaluate(() => document.getElementById('zoom-in').click());
+  await page.evaluate(() => window.webpdf.viewer().zoomIn());
   await new Promise((r) => setTimeout(r, 500));
   const steppedUp = await page.evaluate(() => {
     const v = window.webpdf.viewer();
@@ -369,7 +395,7 @@ try {
   console.log(`start ${Math.round(startLevel.zoom * 100)}% (${startLevel.mode}) -> fit width ${Math.round(startLevel.fitWidth * 100)}%`);
   // Back to the level a document opens at: the state everything below assumes,
   // and the level the screenshot ends up showing.
-  await page.evaluate(() => document.getElementById('zoom-out').click());
+  await page.evaluate(() => window.webpdf.viewer().zoomOut());
   await new Promise((r) => setTimeout(r, 500));
 
   // The outline floats over the pages: toggling it must not touch the document's
@@ -386,7 +412,12 @@ try {
         return r ? Math.round(r.width) : 0;
       })(),
     }));
+  const closedByDefault = await outlineState();
+  if (closedByDefault.open) fail('the outline should start closed');
+  await page.evaluate(() => document.getElementById('toc-toggle').click());
+  await new Promise((r) => setTimeout(r, 500));
   const openOutline = await outlineState();
+  if (!openOutline.open) fail('the outline toggle did not open it');
   if (openOutline.position !== 'fixed') fail(`the outline should float, got position: ${openOutline.position}`);
   await page.evaluate(() => document.getElementById('toc-close').click());
   await new Promise((r) => setTimeout(r, 500));
@@ -400,9 +431,9 @@ try {
   }
 
   // Also check that switching pages works and unloads far-away pages.
-  await page.evaluate(() => document.getElementById('next').click());
+  await page.evaluate(() => window.webpdf.viewer().nextPage());
   await new Promise((r) => setTimeout(r, 1200));
-  await page.evaluate(() => document.getElementById('next').click());
+  await page.evaluate(() => window.webpdf.viewer().nextPage());
   await new Promise((r) => setTimeout(r, 1200));
   const after = await page.evaluate(() => {
     const sr = document.getElementById('viewer').shadowRoot;
@@ -431,7 +462,7 @@ try {
     // one.
     console.log('— searching the document —');
     for (const wait of [600, 1200]) {
-      await page.evaluate(() => document.getElementById('prev').click());
+      await page.evaluate(() => window.webpdf.viewer().prevPage());
       await new Promise((r) => setTimeout(r, wait));
     }
     await page.evaluate(() => {
@@ -699,14 +730,18 @@ try {
         // Where the control lives: the instruction was "after the search".
         afterSearch: !!(search.compareDocumentPosition(button) & Node.DOCUMENT_POSITION_FOLLOWING),
         rows: items.map((el) => el.dataset.id),
-        names: items.map((el) => el.querySelector('.crop-name')?.textContent ?? ''),
+        // The star is a recommendation, not part of the rule's name.
+        names: items.map((el) => (el.querySelector('.crop-name')?.textContent ?? '').replace('★', '')),
         checked: items.filter((el) => el.getAttribute('aria-selected') === 'true').map((el) => el.dataset.id),
         disabledRows: items.filter((el) => el.getAttribute('aria-disabled') === 'true').map((el) => el.dataset.id),
         menuOpen: !document.getElementById('crop-menu').hidden,
-        count: document.getElementById('crop-count').textContent,
+        lit: document.getElementById('crop-btn').dataset.on,
+        face: document.getElementById('crop-btn').textContent,
         status: document.getElementById('crop-status').textContent,
-        enableAllOff: document.getElementById('crop-all').disabled,
-        disableAllOff: document.getElementById('crop-none').disabled,
+        allHidden: document.getElementById('crop-all').hidden,
+        noneHidden: document.getElementById('crop-none').hidden,
+        // The rule the menu recommends: starred, and still unchecked.
+        starred: items.filter((el) => el.querySelector('.star')).map((el) => el.dataset.id),
         padding: document.getElementById('crop-padding').value,
         paddingOff: document.getElementById('crop-padding').disabled,
         page: shown,
@@ -772,11 +807,14 @@ try {
   // Nothing is selected, and nothing has happened to the document.
   if (start.checked.length) fail(`cropping should start with nothing selected, got ${JSON.stringify(start.checked)}`);
   if (!/shown whole/.test(start.status)) fail(`the menu should say the pages are untouched, got ${JSON.stringify(start.status)}`);
-  if (!start.disableAllOff || start.enableAllOff) fail('with nothing checked, only "Disable all" should be greyed out');
+  if (start.lit !== 'false') fail(`the crop control should be plain while nothing is checked, got ${JSON.stringify(start.lit)}`);
+  // One bulk button at a time, and it says what is left to do.
+  if (start.allHidden || !start.noneHidden) fail('with nothing checked, "Enable all" should be the only bulk action');
+  if (start.starred.join() !== 'page-number') fail(`the menu should star the page-number rule, got ${JSON.stringify(start.starred)}`);
   if (!/^0 0 /.test(start.viewBox ?? '')) fail(`an untouched page should keep its own viewBox, got ${start.viewBox}`);
   // Padding is a margin around a crop, so with no crop there is nothing to pad.
-  if (start.padding !== '0' || !start.paddingOff) {
-    fail(`the padding field should start at 0 and inert, got ${JSON.stringify({ value: start.padding, disabled: start.paddingOff })}`);
+  if (start.padding !== '6' || !start.paddingOff) {
+    fail(`the padding field should start at 6pt and inert, got ${JSON.stringify({ value: start.padding, disabled: start.paddingOff })}`);
   }
 
   // Where the reader is, and what is in front of them: the crop has to leave
@@ -808,7 +846,10 @@ try {
 
   const [px, py, pw, ph] = (cropped.viewBox ?? '').split(/\s+/).map(Number);
   if (!cropped.checked.length) fail('"Enable all" checked nothing');
-  if (cropped.count !== String(cropped.checked.length)) fail(`the button should show how many rules are on, got ${JSON.stringify(cropped.count)}`);
+  // The face of the control says "on" the way bionic reading's does, and says
+  // nothing about how many rules that took.
+  if (cropped.lit !== 'true') fail(`the crop control should light up while it is cropping, got ${JSON.stringify(cropped.lit)}`);
+  if (/\d/.test(cropped.face)) fail(`the crop control should not count its rules on the bar, got ${JSON.stringify(cropped.face)}`);
   // A crop is a smaller window onto the page: inside it, and smaller than it.
   if (!(px > 0 && py >= 0 && pw > 0 && ph > 0)) fail(`the cropped viewBox is not a box: ${cropped.viewBox}`);
   if (!(px + pw <= 612.001 && py + ph <= 792.001)) fail(`the crop is not inside the page: ${cropped.viewBox}`);
@@ -853,45 +894,66 @@ try {
   // The reader kept their page, and their place on it.
   if (cropped.page !== here.page) fail(`the reader moved from page ${here.page} to ${cropped.page}`);
   if (Math.abs(cropped.pageTop - here.pageTop) > 6) fail(`the page moved on screen by ${Math.abs(cropped.pageTop - here.pageTop)}px`);
-  // The bulk buttons say what they can still do.
-  if (!cropped.enableAllOff) fail('"Enable all" should be greyed out once every usable rule is on');
-  if (cropped.disableAllOff) fail('"Disable all" should be live once something is checked');
+  // The bulk button says what is left to do: with everything on, the only move
+  // left is back.
+  if (!cropped.allHidden || cropped.noneHidden) fail('once every usable rule is on, "Disable all" should be the only bulk action');
+  if (!/\+6 pt/.test(cropped.status)) fail(`the default margin should be 6pt, got ${JSON.stringify(cropped.status)}`);
 
   // The margin is a control, not a re-measurement: it grows the box the SVG is
   // given and the pages re-lay-out around the reader.
   console.log('— a margin around the content —');
-  const setPadding = async (value, expect) => {
+  const setPadding = async (value) => {
     await page.evaluate(`(() => {
       const input = document.getElementById('crop-padding');
       input.value = ${JSON.stringify(String(value))};
       input.dispatchEvent(new Event('input', { bubbles: true }));
       input.dispatchEvent(new Event('change', { bubbles: true }));
     })()`);
-    const box = await waitUntil(
+    return waitUntil(
       `(() => {
+        const status = document.getElementById('crop-status').textContent;
+        const want = ${JSON.stringify(value)} > 0 ? ', +${value} pt' : 'minus';
+        if (status.startsWith('Cropping') || !status.includes(want)) return false;
         const shown = document.getElementById('pageno').value;
         const svg = document.getElementById('viewer').shadowRoot.querySelector('.wpdf-page[data-page="' + shown + '"] svg');
-        return svg && svg.getAttribute('viewBox').startsWith(${JSON.stringify(expect)}) ? svg.getAttribute('viewBox') : false;
+        return svg ? svg.getAttribute('viewBox') : false;
       })()`,
       `the ${value}pt margin to be applied`,
       60000,
     );
-    return box;
   };
 
-  const padded = await setPadding(8, `${(px - 8).toFixed(3)} ${(py - 8).toFixed(3)}`);
+  // No margin at all is the content box itself, which is where the arithmetic
+  // below starts: the default 6 is that box grown on every side.
+  const exact = (await setPadding(0)).split(/\s+/).map(Number);
+  const defaulted = (await setPadding(6)).split(/\s+/).map(Number);
+  const [ex, ey, ew, eh] = exact;
+  const [dx, dy, dw, dh] = defaulted;
+  console.log('margin 0 vs 6: ' + JSON.stringify({ content: exact, padded: defaulted }));
+  if (Math.abs(dx - Math.max(0, ex - 6)) > 0.01 || Math.abs(dy - Math.max(0, ey - 6)) > 0.01) {
+    fail(`6pt should grow the content box on every side, got ${defaulted} from ${exact}`);
+  }
+  if (Math.abs(dw - (ew + (ex - dx) + 6)) > 0.01 || Math.abs(dh - (eh + (ey - dy) + 6)) > 0.01) {
+    fail(`6pt should add 6pt on every side, got ${defaulted} from ${exact}`);
+  }
+
+  const padded = await setPadding(8);
   const withMargin = await cropState();
   console.log('padded by 8 : ' + JSON.stringify({ viewBox: padded, box: [withMargin.pageWidth, withMargin.pageHeight], status: withMargin.status }));
   const [qx, qy, qw, qh] = padded.split(/\s+/).map(Number);
-  if (Math.abs(qx - (px - 8)) > 0.01 || Math.abs(qy - (py - 8)) > 0.01) fail(`padding should grow the box on every side, got ${padded} from ${cropped.viewBox}`);
-  if (Math.abs(qw - (pw + 16)) > 0.01 || Math.abs(qh - (ph + 16)) > 0.01) fail(`padding should add 8pt on every side, got ${padded} from ${cropped.viewBox}`);
+  if (Math.abs(qx - Math.max(0, ex - 8)) > 0.01 || Math.abs(qy - Math.max(0, ey - 8)) > 0.01) {
+    fail(`padding should grow the box on every side, got ${padded} from ${exact}`);
+  }
+  if (Math.abs(qw - (ew + (ex - qx) + 8)) > 0.01 || Math.abs(qh - (eh + (ey - qy) + 8)) > 0.01) {
+    fail(`padding should add 8pt on every side, got ${padded} from ${exact}`);
+  }
   if (!(withMargin.pageWidth > cropped.pageWidth && withMargin.pageHeight > cropped.pageHeight)) fail('the page box did not follow the margin');
   if (withMargin.elements !== cropped.elements || withMargin.texts !== cropped.texts) fail('padding changed what is in the page');
   if (withMargin.page !== cropped.page || Math.abs(withMargin.pageTop - cropped.pageTop) > 6) fail('padding moved the reader');
   if (!/\+8 pt/.test(withMargin.status)) fail(`the menu should say what the margin is, got ${JSON.stringify(withMargin.status)}`);
-  // And back to nothing at all, exactly where it started.
-  const unpadded = await setPadding(0, cropped.viewBox);
-  if (unpadded !== cropped.viewBox) fail(`a margin of 0 should be the crop itself (${cropped.viewBox} -> ${unpadded})`);
+  // And back to the content box, exactly where it started.
+  const unpadded = await setPadding(0);
+  if (unpadded !== exact.join(' ')) fail(`a margin of 0 should be the crop itself (${exact.join(' ')} -> ${unpadded})`);
 
   console.log('— one rule off, then all of them —');
   await page.evaluate(() => document.querySelector('#crop-list .crop-option[data-id="page-number"]').click());
@@ -993,7 +1055,39 @@ try {
   })()`);
   await waitForPage(1);
 
-  /** The toggle, and the page in front of the reader, character by character. */
+  /**
+   * Choose a row of the bionic menu by what it says. The control is a dropdown
+   * - off, or a fade - so this is how the mode is turned on, turned off, and
+   * moved to another value.
+   */
+  const chooseBionic = async (match) => {
+    await page.evaluate(`document.getElementById('bionic-btn').click()`);
+    await page.evaluate(`(() => {
+      const want = ${JSON.stringify(match)};
+      const row = [...document.querySelectorAll('#bionic-menu .menu-option')]
+        .find((el) => el.querySelector('.menu-name').textContent.includes(want));
+      if (!row) throw new Error('no bionic row matching ' + want);
+      row.click();
+    })()`);
+  };
+
+  /** The value in force, and what the menu says about it. */
+  const bionicMenu = async () => {
+    await page.evaluate(`document.getElementById('bionic-btn').click()`);
+    const state = await page.evaluate(`(() => {
+      const rows = [...document.querySelectorAll('#bionic-menu .menu-option')];
+      const name = (el) => el.querySelector('.menu-name').textContent.replace('★', '').trim();
+      return {
+        rows: rows.map(name),
+        star: name(rows.find((el) => el.querySelector('.star')) ?? rows[0]),
+        chosen: rows.filter((el) => el.getAttribute('aria-selected') === 'true').map(name),
+      };
+    })()`);
+    await page.evaluate(`document.getElementById('bionic-btn').click()`);
+    return state;
+  };
+
+  /** The control, and the page in front of the reader, character by character. */
   const bionicState = () =>
     page.evaluate(`(() => {
       const sr = document.getElementById('viewer').shadowRoot;
@@ -1026,8 +1120,9 @@ try {
         exists: !document.getElementById('bionic-group').hidden,
         afterSearch: rect.left > search.left,
         afterCrop: rect.left > crop.left,
-        square: Math.abs(rect.width - rect.height) <= 1 && rect.width >= 20,
-        pressed: button.getAttribute('aria-pressed'),
+        face: button.textContent.trim(),
+        on: window.webpdf.viewer().bionic,
+        dim: window.webpdf.viewer().bionicDim,
         viewBox: svg ? svg.getAttribute('viewBox') : null,
         texts: texts.length,
         chars: all.length,
@@ -1050,26 +1145,35 @@ try {
   console.log(
     'bionic off : ' +
       JSON.stringify({
-        square: plainText.square,
+        face: plainText.face,
         afterCrop: plainText.afterCrop,
-        pressed: plainText.pressed,
+        on: plainText.on,
         texts: plainText.texts,
         words: plainText.words,
         perWord: plainText.perWord,
         prose: plainText.prose,
       }),
   );
-  if (!plainText.exists) fail('the bionic toggle is not in the bar');
-  if (!plainText.afterSearch || !plainText.afterCrop) fail('the bionic toggle should sit after the crop control');
-  if (!plainText.square) fail('the bionic toggle should be a square button');
-  if (plainText.pressed !== 'false') fail(`bionic reading should start off, got aria-pressed=${plainText.pressed}`);
+  if (!plainText.exists) fail('the bionic control is not in the bar');
+  if (!plainText.afterSearch || !plainText.afterCrop) fail('the bionic control should sit after the crop control');
+  if (!/^B/.test(plainText.face)) fail(`the bionic control should be its own letter, got ${JSON.stringify(plainText.face)}`);
+  if (plainText.on !== false || plainText.face !== 'B▾') fail(`bionic reading should start off, got ${JSON.stringify({ on: plainText.on, face: plainText.face })}`);
+  // The menu of values, before anything is faded: off is what is in force, and
+  // the star is on the default fade.
+  const beforeMenu = await bionicMenu();
+  console.log('bionic menu: ' + JSON.stringify(beforeMenu));
+  if (beforeMenu.rows[0] !== 'Off' || !beforeMenu.rows.some((r) => /^Fade the rest to \d+%$/.test(r))) {
+    fail(`the bionic menu should offer off and a set of fades, got ${JSON.stringify(beforeMenu.rows)}`);
+  }
+  if (beforeMenu.chosen.join() !== 'Off') fail(`nothing is faded yet, so "Off" is the value in force, got ${JSON.stringify(beforeMenu.chosen)}`);
+  if (beforeMenu.star !== 'Fade the rest to 50%') fail(`the default fade should be starred, got ${JSON.stringify(beforeMenu.star)}`);
   if (plainText.faded) fail(`nothing should be faded before it is asked for (${plainText.faded} runs)`);
   // The words, which is what bionic reading needs and what a reader copies.
   if (plainText.words < 100) fail(`page 1 should have real words in it, found ${plainText.words}`);
   if (plainText.perWord > 12) fail(`the page averages ${plainText.perWord} characters per word: the spaces are missing`);
   if (!/\bthe\b/.test(plainText.full)) fail(`page 1 does not read as prose: ${JSON.stringify(plainText.prose)}`);
 
-  await page.evaluate(() => document.getElementById('bionic-btn').click());
+  await chooseBionic('50%');
   await waitUntil(
     `(() => {
       const shown = document.getElementById('pageno').value;
@@ -1080,11 +1184,49 @@ try {
     60000,
   );
   const marked = await bionicState();
-  console.log('bionic on  : ' + JSON.stringify({ pressed: marked.pressed, faded: marked.faded, opacity: marked.opacity, weighted: marked.weighted, texts: marked.texts }));
-  if (marked.pressed !== 'true') fail(`the toggle should report itself pressed, got ${marked.pressed}`);
+  console.log('bionic on  : ' + JSON.stringify({ on: marked.on, dim: marked.dim, faded: marked.faded, opacity: marked.opacity, weighted: marked.weighted, texts: marked.texts }));
+  if (marked.on !== true || marked.face !== 'B▾') fail(`the control should report the mode on, got ${JSON.stringify({ on: marked.on, face: marked.face })}`);
   if (marked.faded < 100) fail(`bionic reading faded ${marked.faded} runs, which is not the rest of every word`);
-  // The fade has to be a real one, at the strength the module names.
+  // The fade has to be a real one, at the strength the library defaults to.
   if (Number(marked.opacity) > 0.6 || Number(marked.opacity) < 0.4) fail(`the faded text is drawn at ${marked.opacity}`);
+  if (Math.abs(marked.dim - 0.5) > 1e-9) fail(`the default fade should be a half, got ${marked.dim}`);
+
+  // The fade is a setting, and the star follows it: 30% is a different page
+  // drawn from the same characters.
+  console.log('— the fade is configurable —');
+  await chooseBionic('30%');
+  await waitUntil(
+    `(() => {
+      const shown = document.getElementById('pageno').value;
+      const svg = document.getElementById('viewer').shadowRoot.querySelector('.wpdf-page[data-page="' + shown + '"] svg');
+      const faded = svg?.querySelector('tspan[fill-opacity]');
+      return !!faded && Number(getComputedStyle(faded).fillOpacity) < 0.4;
+    })()`,
+    'the 30% fade',
+    60000,
+  );
+  const fainter = await bionicState();
+  const fainterMenu = await bionicMenu();
+  console.log('bionic 30% : ' + JSON.stringify({ dim: fainter.dim, opacity: fainter.opacity, star: fainterMenu.star, chosen: fainterMenu.chosen }));
+  if (Math.abs(fainter.dim - 0.3) > 1e-9) fail(`choosing 30% should set the fade to 0.3, got ${fainter.dim}`);
+  if (Math.abs(Number(fainter.opacity) - 0.3) > 0.02) fail(`the faded text should be drawn at 0.3, got ${fainter.opacity}`);
+  if (fainterMenu.star !== 'Fade the rest to 30%') fail(`the star should have moved to 30%, got ${JSON.stringify(fainterMenu.star)}`);
+  if (fainterMenu.chosen.join() !== 'Fade the rest to 30%') fail(`30% should be the value in force, got ${JSON.stringify(fainterMenu.chosen)}`);
+  if (fainter.chars !== marked.chars || JSON.stringify(fainter.starts) !== JSON.stringify(marked.starts)) {
+    fail('changing the fade changed the text or moved a character');
+  }
+  // Back to the default for the ink measurements below.
+  await chooseBionic('50%');
+  await waitUntil(
+    `(() => {
+      const shown = document.getElementById('pageno').value;
+      const svg = document.getElementById('viewer').shadowRoot.querySelector('.wpdf-page[data-page="' + shown + '"] svg');
+      const faded = svg?.querySelector('tspan[fill-opacity]');
+      return !!faded && Math.abs(Number(getComputedStyle(faded).fillOpacity) - 0.5) < 0.02;
+    })()`,
+    'the default fade to come back',
+    60000,
+  );
   // And nothing is emboldened: a synthetic bold would smear the letterforms and
   // crowd the character after it.
   if (marked.weighted) fail(`${marked.weighted} element(s) were emboldened`);
@@ -1158,7 +1300,7 @@ try {
     })()`);
 
   const fadedInk = await ink();
-  await page.evaluate(() => document.getElementById('bionic-btn').click());
+  await chooseBionic('Off');
   await waitUntil(
     `(() => {
       const shown = document.getElementById('pageno').value;
@@ -1182,7 +1324,7 @@ try {
       fail(`bionic reading changed where the page's ink is (${edge}: ${plainInk.box[i]} -> ${fadedInk.box[i]})`);
     }
   }
-  if (turnedOff.pressed !== 'false' || turnedOff.faded) fail('the toggle should put the page back exactly as it was');
+  if (turnedOff.on !== false || turnedOff.face !== 'B▾' || turnedOff.faded) fail('choosing "Off" should put the page back exactly as it was');
   if (JSON.stringify(turnedOff.starts) !== JSON.stringify(plainText.starts)) fail('turning it off did not restore the page');
 
   // The crop and bionic controls are independent: a crop is a window onto the
@@ -1198,7 +1340,7 @@ try {
     'the crop',
     60000,
   );
-  await page.evaluate(() => document.getElementById('bionic-btn').click());
+  await chooseBionic('50%');
   await waitUntil(
     `(() => {
       const shown = document.getElementById('pageno').value;
@@ -1212,7 +1354,7 @@ try {
   console.log('cropped + faded: ' + JSON.stringify({ viewBox: croppedBox, fadedViewBox: croppedFaded.viewBox }));
   if (croppedFaded.viewBox !== croppedBox) fail(`bionic reading changed the crop (${croppedBox} -> ${croppedFaded.viewBox})`);
   // Back to nothing at all, which is where the next section finds the reader.
-  await page.evaluate(() => document.getElementById('bionic-btn').click());
+  await chooseBionic('Off');
   await page.evaluate(() => document.getElementById('crop-none').click());
   await waitUntil(
     `(() => {
@@ -1223,6 +1365,92 @@ try {
     'the page and the text to come back',
     60000,
   );
+
+  // ------------------------------------------------------------- the bar
+  /**
+   * The bar is one line at every width. It is the only chrome above the pages,
+   * so a bar that wrapped would cost the document a row of height on exactly the
+   * windows that can least afford one - and it holds no way to open a document,
+   * in either case: that lives on the card, where a reader who has none is
+   * looking (see the check on the empty state above).
+   */
+  console.log('— the bar, at every width —');
+  const barAt = async (width) => {
+    await page.setViewport(width, 820);
+    await new Promise((r) => setTimeout(r, 450));
+    return page.evaluate(() => {
+      const bar = document.querySelector('.topbar');
+      const r = bar.getBoundingClientRect();
+      const bionic = document.getElementById('bionic-btn').getBoundingClientRect();
+      return {
+        width: innerWidth,
+        height: Math.round(r.height),
+        overflow: Math.round(bar.scrollWidth - bar.clientWidth),
+        right: Math.round(bionic.right),
+      };
+    });
+  };
+  for (const width of [1440, 1024, 768, 560, 430, 360]) {
+    const state = await barAt(width);
+    console.log(`  ${width}px: ${state.height}px tall, ${state.overflow}px of overflow`);
+    if (state.height > 52) fail(`the bar wrapped to ${state.height}px at ${width}px`);
+    if (state.overflow > 1) fail(`the bar overflows its window by ${state.overflow}px at ${width}px`);
+    if (state.right > width) fail(`the controls run past the right edge at ${width}px (${state.right})`);
+  }
+  await page.setViewport(1440, 900);
+  await new Promise((r) => setTimeout(r, 450));
+
+  // ------------------------------------------------- scrolling and chrome
+  /**
+   * A scroll of the pages puts the chrome away, the way a pinch does. What
+   * counts is the reader's *intent*: the viewer scrolls the document itself for
+   * a link, a page jump or a crop, and closing the panel the reader gave that
+   * command from would be the wrong answer.
+   */
+  console.log('— a scroll puts the chrome away —');
+  const chromeState = () =>
+    page.evaluate(() => ({
+      outline: document.getElementById('toc').hidden === false,
+      zoom: document.getElementById('zoom-menu').hidden === false,
+      crop: document.getElementById('crop-menu').hidden === false,
+      bionic: document.getElementById('bionic-menu').hidden === false,
+    }));
+  await page.evaluate(`(() => {
+    document.getElementById('toc-toggle').click();
+    document.getElementById('zoom-menu-btn').click();
+  })()`);
+  await new Promise((r) => setTimeout(r, 250));
+  const chromeOpen = await chromeState();
+  if (!chromeOpen.outline || !chromeOpen.zoom) fail(`the outline and the dropdown should both be open, got ${JSON.stringify(chromeOpen)}`);
+  await page.evaluate(() => window.webpdf.viewer().goToPage(3));
+  await waitForPage(3);
+  const afterJump = await chromeState();
+  if (!afterJump.outline || !afterJump.zoom) fail('a page jump the reader asked for should leave the chrome alone');
+  await page.evaluate(`window.dispatchEvent(new WheelEvent('wheel', { deltaY: 320, bubbles: true }))`);
+  await new Promise((r) => setTimeout(r, 250));
+  const afterWheel = await chromeState();
+  console.log('after a wheel: ' + JSON.stringify(afterWheel));
+  if (afterWheel.outline || afterWheel.zoom) fail('a scroll should put the outline and the dropdown away');
+  // The keyboard scrolls too, and the same rule applies to it.
+  await page.evaluate(`(() => {
+    document.getElementById('toc-toggle').click();
+    document.body.dispatchEvent(new KeyboardEvent('keydown', { key: 'PageDown', bubbles: true }));
+  })()`);
+  await new Promise((r) => setTimeout(r, 250));
+  if ((await chromeState()).outline) fail('PageDown should put the outline away too');
+
+  // ------------------------------------------------------------- the icon
+  console.log('— the site icon —');
+  const icon = await page.evaluate(async () => {
+    const link = document.querySelector('link[rel="icon"][type="image/svg+xml"]') ?? document.querySelector('link[rel="icon"]');
+    if (!link) return { href: null };
+    const res = await fetch(link.href);
+    const body = await res.text();
+    return { href: link.getAttribute('href'), ok: res.ok, svg: body.includes('<svg') };
+  });
+  console.log('icon: ' + JSON.stringify(icon));
+  if (!icon.href) fail('the page declares no icon');
+  else if (!icon.ok || !icon.svg) fail(`the icon did not load: ${JSON.stringify(icon)}`);
 
   // ------------------------------------------------------- the public example
   // The shipped page has no documents of its own, so this is the path a reader

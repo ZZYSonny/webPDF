@@ -105,6 +105,12 @@ export interface RenderOptions {
    * like the document.
    */
   bionic?: boolean;
+  /**
+   * How much strength the faded part of each word keeps, 0..1. `BIONIC_DIM` (a
+   * half) when omitted, which is the balance the eye wants; only meaningful
+   * while `bionic` is on.
+   */
+  bionicDim?: number;
 }
 
 export interface RenderStats {
@@ -623,7 +629,7 @@ export class PdfEngine implements PdfEngineLike {
             familyFor: (fontId) => plan.fonts.get(fontId)?.family ?? null,
             codeFor: (fontId, gid) => plan.fonts.get(fontId)?.codes.get(gid) ?? null,
           },
-          { spaces: text.spaces, bionic: opts.bionic },
+          { spaces: text.spaces, bionic: opts.bionic, bionicDim: opts.bionicDim },
         );
         svg = upgraded.svg;
         debug('renderPage: upgraded', upgraded.stats);

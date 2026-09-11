@@ -40,12 +40,6 @@ export function paperFor(url: string): Paper | null {
   return PAPERS.find((paper) => paper.url === url) ?? null;
 }
 
-/** The document the empty state opens: the first paper, from its public URL. */
-export function defaultExample(): Example | null {
-  const [first] = PAPERS;
-  return first ? toExample(first, first.url, first.note) : null;
-}
-
 function toExample(paper: Paper, url: string, note: string): Example {
   return {
     label: url === paper.url ? paper.label : `${paper.label} (cached)`,

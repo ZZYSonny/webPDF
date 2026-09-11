@@ -10,7 +10,7 @@ const viewer = await createViewer({ container: '#viewer', source: file });
 viewer.setZoom('fit-width');
 ```
 
-![the demo: a paper downloaded from arXiv, rendered as SVG with its real fonts, its outline floating on the left, and every match of a search boxed](docs/demo.png)
+![the demo: a paper downloaded from arXiv, rendered as SVG with its real fonts, one line of chrome above it, and every match of a search boxed](docs/demo.png)
 
 ---
 
@@ -191,8 +191,10 @@ which is the batch case the original script exists for.
 The margin is in page units - 1/72 inch - and is stopped by the page's own edges.
 It costs nothing to change: the rules decide where the content is, the margin is
 added to that box at render time, so the field in the demo re-lays-out the pages
-without reading a single one of them again. Zero is the default, which is exactly
-what the reference script crops to.
+without reading a single one of them again. Zero is the library's default, which
+is exactly what the reference script crops to; the demo's own field starts at 6pt
+- a twelfth of an inch, which is enough that a trimmed page does not look cut
+off.
 
 Two properties are worth stating plainly, because they are the difference between
 this and "delete what is outside the box":
@@ -220,17 +222,23 @@ lands where it says.
 #### Bionic reading
 
 ```ts
-viewer.setBionic(true);   // every word's first letters at full strength
-viewer.bionic;            // false: a document opens looking like itself
+viewer.setBionic(true);        // every word's first letters at full strength
+viewer.setBionic(true, 0.3);   // ...with the rest of each word fainter still
+viewer.bionicDim;              // 0.5: `BIONIC_DIM`, until a host says otherwise
+viewer.setBionic(false);       // the document's own page again
 ```
 
 Bionic reading gives every word a *fixation point* - its first letters, so the eye
 has somewhere to land and the brain finishes the word on its own. Which letters is
 not a guess of ours: [`text-vide`](https://github.com/Gumball12/text-vide) decides
 it from the word's length, and the engine holds exactly those glyphs at the
-document's own strength while everything else in the word is drawn back at half
-opacity (`core/svg/bionic.ts`). `renderDocument(source, { bionic: true })` does
-the same thing headlessly, and an exported SVG carries it.
+document's own strength while everything else in the word is drawn back at a
+reduced opacity (`core/svg/bionic.ts`). How far back is a setting - the
+`bionicDim` render option, `0..1`, with `BIONIC_DIM` (a half) as the default and
+`BIONIC_MIN_DIM` as the floor - because how much of a word to hold is a matter of
+taste and of eyesight; the demo offers 30% to 70% and stars the value in force.
+`renderDocument(source, { bionic: true, bionicDim: 0.4 })` does the same thing
+headlessly, and an exported SVG carries it.
 
 **Faded, not bold** - and that is the part worth reading. The fonts here are
 rebuilt from the page's own outlines and have one weight, so `font-weight: bold`
@@ -244,6 +252,7 @@ glyphs exactly as they were.
 It is a text-level effect rather than a word-level one: anything `text-vide` finds
 no word in - a bare number, a formula, a run of symbols - is faded like a word's
 tail, so a page of prose reads as intended and a table reads as uniformly light.
+Whitespace between two words is never faded: the attribute would draw no pixel.
 
 A word is counted in *letters*, not in glyphs. `fi` is one glyph in most text
 faces and two letters to a reader, and the letters are what the fixation point is
@@ -418,31 +427,50 @@ createViewer({
 is deliberately thin, because everything about the pages' zoom belongs to the
 viewer:
 
-* **The example documents are fetched, not shipped.** Every entry in the picker is
-  a public URL - the first is *Attention Is All You Need* on arXiv, a pdfTeX paper
-  whose Type 1 fonts are exactly the case this library exists for. A published page
-  therefore carries no PDFs at all: the browser downloads the example from whoever
-  hosts it (arXiv serves it with `access-control-allow-origin: *`, so no proxy of
-  ours sits in the middle) and opens it like any other file. On a local dev or
-  preview server, the papers the tests have cached are *also* offered, from
+* **Opening a document happens on the card, not on the bar.** With no document
+  open there is nothing for the bar to hold, so it is not there: the empty card
+  offers the file picker and a dropdown of the example papers. Every example is a
+  public URL - the first is *Attention Is All You Need* on arXiv, a pdfTeX paper
+  whose Type 1 fonts are exactly the case this library exists for - so a published
+  page carries no PDFs at all: the browser downloads one from whoever hosts it
+  (arXiv serves it with `access-control-allow-origin: *`, so no proxy of ours sits
+  in the middle) and opens it like any other file. On a local dev or preview
+  server the papers the tests have cached are *also* offered, from
   `/pdf/<name>`; a build has no cache behind it, so the published site lists the
-  public URLs and nothing else.
-* **One bar, no status bar.** Messages float in a toast instead, so the pages own
-  every pixel below the bar and there is no chrome pretending to stay put while
-  the browser magnifies the document.
+  public URLs and nothing else. Once a document is open the card is gone, and
+  another file arrives by drag and drop over the pages or by Ctrl+O - the bar
+  itself never carries a way to open one.
+* **One bar, one line, no status bar.** The bar is the document's chrome and it
+  arrives with the first page; it stays a single row at every window width, and
+  what gives way to keep it there is the find box: below 560px the page count and
+  the match count go, and below 460px the magnifier and the two match arrows go
+  with them - a query nobody can see is worse than a control without an icon, and
+  Enter still steps the matches. The rest of the controls are marks rather than
+  words, and keep the size they were drawn at. Messages float in a toast instead
+  of a status bar, and the last render's cost is not shown at all, so the pages
+  own every pixel below the bar and there is no chrome pretending to stay put
+  while the browser magnifies the document.
+* **The tab names the document**: its own title if it declares one, else the
+  file's name, else the URL it came from with the scheme taken off
+  (`arxiv.org/pdf/1706.03762v7`). The page carries an icon - a page whose lines
+  are held at the front and faded behind, which is the effect this reader is
+  built around - as an SVG with a PNG beside it for the crawlers that will not
+  take one.
 * **The zoom box holds a bare number.** `%` is the control's unit and nobody types
   it; the levels - including the fit modes, listed as the percentage they resolve
-  to (`229% (fit width)`) - live in the dropdown, and `+`/`-` and Ctrl +/- step
-  that same ladder with the box left free for typing `150` or `1.5`. A document
-  opens one rung *below* fit-width (200% at the sizes above): fit-width is the
-  widest level that still shows the page in full, and starting there leaves the
-  paper touching both edges of the window. Ctrl+0 still means fit width.
+  to (`229% (fit width)`) - live in the dropdown, which is the only zoom control
+  on the bar, and Ctrl +/- steps that same ladder with the box left free for
+  typing `150` or `1.5`. A document opens one rung *below* fit-width (200% at the
+  sizes above): fit-width is the widest level that still shows the page in full,
+  and starting there leaves the paper touching both edges of the window. Ctrl+0
+  still means fit width.
 * **The outline floats** over the pages rather than taking a column. A column
   would change the viewer's width every time it opened, and a fit-width layout
   would re-fit - visibly re-zooming the document - for a navigation panel. It
-  marks the entry for the page a document opens on, follows the current page by
-  scrolling its own list and nothing else, and is dismissed the moment the
-  browser magnifies the page, when there is nothing on screen to read.
+  starts closed - the pages are what the page is for - marks the entry for the
+  page a document opens on, follows the current page by scrolling its own list
+  and nothing else, and is put away the moment the reader scrolls the pages or
+  the browser magnifies them, when there is nothing on screen to read.
 * **Search behaves like the browser's find bar.** Typing boxes every match on the
   pages in front of you and jumps straight to the first one - no Enter needed -
   while the background index fills in from page one, so the count and the boxes
@@ -462,20 +490,26 @@ viewer:
 * **Cropping is opt-in, and never edits the page.** The *Crop* dropdown, after the
   search box, lists the marks PaperCutter removes from a page before it measures
   what is left: the arXiv stamp, a publisher's header, a bare page number, a
-  numbered heading, `PRIME AI paper`, and the document's own running title.
-  Nothing is checked to begin with and nothing is checked by *default* - the
-  pages are shown whole until a rule is switched on, and *Disable all* puts them
-  back. *Enable all* is what the reference script does. Each row carries the test
+  numbered heading, `PRIME AI paper`, and the document's own running title. The
+  **Page number** row is starred - it is the mark nearly every paper needs - but
+  a star is a recommendation and not a state: the pages are shown whole until a
+  rule is switched on, and nothing is ever cropped on the document's behalf. One
+  bulk button is offered at a time, and it says what is left to do: *Enable all*
+  (what the reference script does) until every rule that applies is checked, and
+  *Disable all* from there, which puts the pages back. Each row carries the test
   it runs, so what a rule removes is never a guess. A **Padding** field above the
   list keeps a margin around what is left, in points, from 0 (the reference
-  script's own crop) to two inches.
-* **Bionic reading is one square button, after the crop control.** `B` presses in
-  and every word in front of you keeps its first letters dark while the rest of it
-  fades; press it again and the page is the document's own again. It is a mode
-  rather than a menu, so it is a button rather than a dropdown, and nothing is
-  emboldened: each word's remainder is drawn at half opacity, which the demo test
-  checks along with every character in every run keeping the exact position it
-  had.
+  script's own crop) to two inches; it starts at 6pt, which is a hair of white
+  between the ink and the edge rather than a box drawn on it.
+* **Bionic reading is a dropdown, after the crop control, and it is one choice.**
+  `B` opens a menu of values: *Off*, or a fade at 30% to 70% of the document's own
+  strength. Choosing one turns the mode on with the faded part of every word at
+  that opacity, and the value in force carries a star, so the menu opens on the
+  setting the reader settled on. Nothing is emboldened: each word's remainder is
+  drawn at that one opacity, which the demo test checks along with every character
+  in every run keeping the exact position it had. The two modes on the bar light
+  up the same way - an accent background while they are changing how a page is
+  drawn - and neither counts anything on its face.
 * **Links are the viewer's, and the demo just says what happened.** Clicking an
   external link opens it in a new tab and the toast names the URI; a link a
   browser cannot follow (the *GPT-4 Technical Report* links to a local file) gets
@@ -589,11 +623,17 @@ src/
     layout.ts               page geometry + visible-range maths
     viewer.ts               virtualised scrolling viewer (browser-owned pinch)
 demo/                       the demo application
+  main.ts                   the bar, the card, and everything wired to them
   papers.mjs                the corpus: public URLs, and where they are cached
   papers-client.ts          which of them this page has a local copy of
   examples.ts               the picker's entries, cached copies first
+  menu.ts                   a dropdown in the bar: open, close, arrows, Escape
+  search.ts                 indexing the document, and boxing what matches
   crop.ts                   the crop dropdown: one toggle per rule
+  zoom.ts                   the ladder, and what the box will accept
   panels.ts                 scrolling a panel without moving the document
+  styles.css                the chrome's own stylesheet
+  icon.svg, icon.png        the site icon: a page, held at the front and faded
 tests/
   *.test.ts                 Node tests (real PDFs through the real wasm)
   pdf-cache.mjs             fetches the corpus, lists it, clears it
@@ -622,7 +662,7 @@ npm run build:pages  # the published site, in dist/demo
 No PDF is stored in this repository, and none is generated: `demo/papers.mjs`
 lists the corpus - four papers, at the time of writing - by public URL, and
 everything refers to that one list: the Node tests, the browser tests, and the
-demo's picker on a local origin. Nothing needs a document to be checked in,
+demo's example list on a local origin. Nothing needs a document to be checked in,
 reviewed as a binary, or replaced when it goes stale; `git ls-files '*.pdf'` is
 empty, and the tests cannot drift from what a reader would actually download.
 

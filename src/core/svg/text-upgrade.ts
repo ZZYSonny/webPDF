@@ -29,7 +29,7 @@
 
 import type { GlyphPlacement, Attribute } from './glyphs.ts';
 import { ANCHOR_EPSILON, type SpaceMark } from './spaces.ts';
-import { BIONIC_DIM, bionicSegments } from './bionic.ts';
+import { bionicDim, bionicSegments } from './bionic.ts';
 
 export interface GlyphEncoding {
   /**
@@ -60,6 +60,11 @@ export interface UpgradeOptions {
    * the rest, so the eye has somewhere to land.
    */
   bionic?: boolean;
+  /**
+   * How much strength the faded part of a word keeps, 0..1. `BIONIC_DIM` (a
+   * half) when omitted; only meaningful while `bionic` is on.
+   */
+  bionicDim?: number;
 }
 
 export interface UpgradeStats {
@@ -234,12 +239,18 @@ function anchorSpaces(
  * Normally one, with every position in a single list. With bionic reading on,
  * one per stretch `text-vide` marked: the fixation points stay the text as the
  * document set it, and everything between them is drawn back at a reduced
- * opacity (`bionic.ts` says why fading rather than bolding). Either way each
- * tspan carries its own slice of the position lists, so a character is drawn
- * exactly where it was - nothing is emboldened into its neighbour, and nothing
- * moves.
+ * opacity (`bionic.ts` says why fading rather than bolding, and how faint a
+ * fade can usefully be). Either way each tspan carries its own slice of the
+ * position lists, so a character is drawn exactly where it was - nothing is
+ * emboldened into its neighbour, and nothing moves.
  */
-function tspans(chars: readonly string[], xs: readonly string[], ys: readonly string[], bionic: boolean): string {
+function tspans(
+  chars: readonly string[],
+  xs: readonly string[],
+  ys: readonly string[],
+  bionic: boolean,
+  dim: number,
+): string {
   const whole = (): string => `<tspan x="${xs.join(' ')}" y="${ys.join(' ')}">${chars.join('')}</tspan>`;
   if (!bionic) return whole();
 
@@ -260,7 +271,7 @@ function tspans(chars: readonly string[], xs: readonly string[], ys: readonly st
       // one: fading it would be an attribute that draws no pixel.
       const fade = !segment.fixation && segment.text.trim() !== '';
       out +=
-        `<tspan${fade ? ` fill-opacity="${BIONIC_DIM}"` : ''}` +
+        `<tspan${fade ? ` fill-opacity="${String(dim)}"` : ''}` +
         ` x="${xs.slice(at, end).join(' ')}" y="${ys.slice(at, end).join(' ')}">${segment.text}</tspan>`;
     }
     at = end;
@@ -277,6 +288,7 @@ export function upgradeGlyphsToText(
   const simpleOnly = opts.simpleTextOnly ?? true;
   const precise = opts.preciseTextRendering ?? true;
   const bionic = opts.bionic ?? false;
+  const dim = bionicDim(opts.bionicDim);
 
   // What each placement is going to become, decided before anything is written
   // because the spaces depend on it: a space the page drew is already text only
@@ -337,7 +349,7 @@ export function upgradeGlyphsToText(
     let out = `<text${r.attrs} transform="matrix(${fmt(A)} ${fmt(B)} ${fmt(C)} ${fmt(D)} 0 0)" font-size="${fmt(K)}" font-family="${r.family}" font-weight="normal" font-style="normal"`;
     if (precise) out += ' text-rendering="geometricPrecision"';
     out += ' xml:space="preserve">';
-    out += tspans(chars, xs, ys, bionic);
+    out += tspans(chars, xs, ys, bionic, dim);
     out += '</text>';
     pieces.push(out);
     stats.runs++;
