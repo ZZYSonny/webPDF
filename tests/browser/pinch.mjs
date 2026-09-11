@@ -5,6 +5,9 @@
  *
  *   - a touch pinch is the browser's page scale: the page must not re-lay-out,
  *     must not change the page box geometry, and must not move the document;
+ *   - a pinch owns the whole screen, chrome included: panels that were open are
+ *     dismissed rather than left floating behind the zoom, and nothing the
+ *     chrome does afterwards may move the magnified view;
  *   - panning while zoomed chains into the document scroller, so the
  *     virtualisation window keeps up;
  *   - Ctrl +/-/0 walk the layout zoom ladder and override the browser shortcut,
@@ -51,7 +54,15 @@ const state = () =>
       chromeOpacity: getComputedStyle(document.querySelector('.topbar')).opacity,
       outlineOpacity: getComputedStyle(document.getElementById('toc')).opacity,
       outlineOpen: document.getElementById('toc').hidden === false,
+      zoomMenuOpen: document.getElementById('zoom-menu').hidden === false,
+      page: Number(document.getElementById('pageno').value),
+      tocActive: document.querySelector('#toc-body .toc-item.active')?.textContent ?? '',
+      scrollX: Math.round(window.scrollX),
       scrollY: Math.round(window.scrollY),
+      // Where the magnified view sits over the layout, in CSS pixels.
+      vvLeft: Math.round(vv.offsetLeft),
+      vvTop: Math.round(vv.offsetTop),
+      hostLeft: Math.round(host.getBoundingClientRect().left),
       docH: document.scrollingElement.scrollHeight,
       innerHeight,
       dpr: +devicePixelRatio.toFixed(3),
@@ -117,6 +128,35 @@ async function pan({ dy = -900, steps = 30 } = {}) {
   await touch('touchEnd', []);
 }
 
+/**
+ * One finger dragging: pans the visual viewport across the page and then chains
+ * into the document scroller, which is what a reader does after a pinch. One
+ * finger on purpose - a second touch point is a pinch gesture, and Chromium
+ * re-derives the page scale from it, ending the zoom under test.
+ */
+async function swipe({ dx = 0, dy = 0, steps = 24 } = {}) {
+  const point = (i) => [{ x: W / 2 + (dx * i) / steps, y: H / 2 + (dy * i) / steps, id: 1 }];
+  await touch('touchStart', point(0));
+  await sleep(16);
+  for (let i = 1; i <= steps; i++) {
+    await touch('touchMove', point(i));
+    await sleep(16);
+  }
+  await touch('touchEnd', []);
+}
+
+/** Scroll the document until the current page changes; reports both ends. */
+async function crossPage() {
+  const before = await state();
+  for (let i = 0; i < 8; i++) {
+    await page.evaluate(() => window.scrollBy(0, 700));
+    await sleep(350);
+    const now = await state();
+    if (now.page !== before.page) return { before, after: now };
+  }
+  return { before, after: await state() };
+}
+
 async function chord(key, code, vk) {
   const base = { modifiers: 2, key, code, windowsVirtualKeyCode: vk, nativeVirtualKeyCode: vk };
   await page.send('Input.dispatchKeyEvent', { ...base, type: 'rawKeyDown' });
@@ -165,6 +205,20 @@ try {
   check('no page scale yet', Math.abs(start.pageScale - 1) < 0.01, `scale ${start.pageScale}`);
 
   console.log("\n— a pinch is the browser's, and costs no layout —");
+  // Both panels open first: a pinch magnifies the chrome along with the pages,
+  // so what happens to an open panel is part of the contract.
+  const panelsOpen = await page
+    .evaluate(
+      `JSON.stringify((() => {
+        const toc = document.getElementById('toc');
+        if (toc.hidden) document.getElementById('toc-toggle').click();
+        document.getElementById('zoom-menu-btn').click();
+        return { outline: toc.hidden === false, menu: document.getElementById('zoom-menu').hidden === false };
+      })())`,
+    )
+    .then(JSON.parse);
+  check('the outline and the zoom list are open to start with', panelsOpen.outline && panelsOpen.menu, JSON.stringify(panelsOpen));
+
   const pinched = await measure(() => pinch());
   check('the browser magnified the page', pinched.after.s.pageScale > 1.4, `page scale ${pinched.before.s.pageScale} -> ${pinched.after.s.pageScale}`);
   check('page geometry is untouched', pinched.after.s.pageBox === pinched.before.s.pageBox, `${pinched.before.s.pageBox} -> ${pinched.after.s.pageBox}`);
@@ -174,10 +228,13 @@ try {
   check('the document barely moved (gesture anchoring only)', drift < 40, `scrollY ${pinched.before.s.scrollY} -> ${pinched.after.s.scrollY} (${drift}px)`);
   check('no re-layout of the pages', pinched.layoutMs < 10, `${pinched.layoutCount} layouts, ${pinched.layoutMs} ms`);
   check('chrome is hidden while zoomed', pinched.after.s.zoomedClass && pinched.after.s.chromeOpacity === '0', `opacity ${pinched.after.s.chromeOpacity}`);
-  // The outline floats over the pages, so it is chrome too: magnified and panned
-  // out of view by a pinch exactly like the bar.
-  check('the floating outline fades with it', !pinched.after.s.outlineOpen || pinched.after.s.outlineOpacity === '0',
-    `open ${pinched.after.s.outlineOpen}, opacity ${pinched.after.s.outlineOpacity}`);
+  // Faded is not enough: an open panel keeps scrolling its own items into view,
+  // and the browser answers that by dragging the magnified view to reveal it.
+  check(
+    'the open panels are dismissed, not left behind the zoom',
+    !pinched.after.s.outlineOpen && !pinched.after.s.zoomMenuOpen,
+    `outline ${pinched.after.s.outlineOpen}, zoom list ${pinched.after.s.zoomMenuOpen}`,
+  );
 
   console.log('\n— panning while zoomed chains into the document —');
   const panned = await measure(() => pan());
@@ -187,6 +244,75 @@ try {
   const unzoomed = await state();
   check('and the chrome comes back when the pinch is over', !unzoomed.zoomedClass && unzoomed.chromeOpacity === '1' && unzoomed.outlineOpacity === '1',
     `bar ${unzoomed.chromeOpacity}, outline ${unzoomed.outlineOpacity}`);
+  check('the dismissed outline stays dismissed until it is asked for', !unzoomed.outlineOpen, `open ${unzoomed.outlineOpen}`);
+
+  console.log('\n— a magnified view is never dragged sideways by the chrome —');
+  // The outline floats at the left edge and the zoom list sits in the sticky
+  // bar, so both are "off screen" once the visual viewport is panned over them.
+  // `scrollIntoView` used to answer that by scrolling the magnified view back to
+  // reveal the panel - a 554 px sideways jump of the page the moment the current
+  // page changed. The panels scroll themselves now; the pages do not move.
+  await page.send('Emulation.setPageScaleFactor', { pageScaleFactor: 2.5 });
+  await sleep(400);
+  await swipe({ dx: -420 });
+  await sleep(400);
+  const pannedClear = await state();
+  check('the magnified view is panned clear of the left edge', pannedClear.vvLeft > 100, `visualViewport.offsetLeft ${pannedClear.vvLeft}`);
+  // Reopen the panel behind the zoom on purpose: a host that does not dismiss
+  // its chrome must still not have its document moved under it.
+  await page.evaluate(() => {
+    if (document.getElementById('toc').hidden) document.getElementById('toc-toggle').click();
+  });
+  const listed = await state();
+  const crossed = await crossPage();
+  check('the current page changed while magnified', crossed.after.page !== crossed.before.page, `page ${crossed.before.page} -> ${crossed.after.page}`);
+  // Chromium nudges the visual viewport a few pixels as a zoomed scroll chains
+  // into the document; the bug this guards was a 554 px snap back to the left
+  // edge, so the bound is about "did not move", not about rounding.
+  const sidewaysMove = Math.abs(crossed.after.vvLeft - listed.vvLeft);
+  check('the magnified view did not move sideways', sidewaysMove <= 24,
+    `visualViewport.offsetLeft ${listed.vvLeft} -> ${crossed.after.vvLeft} (${sidewaysMove}px)`);
+  check('and the document did not scroll sideways', crossed.after.scrollX === listed.scrollX && crossed.after.hostLeft === listed.hostLeft,
+    `scrollX ${listed.scrollX} -> ${crossed.after.scrollX}, page left edge ${listed.hostLeft} -> ${crossed.after.hostLeft}`);
+  check('the panel still followed the page, it just did not move the view', crossed.after.tocActive !== '',
+    `active entry "${crossed.after.tocActive}"`);
+
+  // The list has to scroll *itself* to the entry it just marked. Shortening it
+  // is the only way to see that on a paper whose outline fits in the panel: a
+  // max-height, not a height, because `flex: 1` grows an explicit height back.
+  await page.evaluate(`(() => {
+    const body = document.getElementById('toc-body');
+    body.style.maxHeight = '40px';
+    body.scrollTop = 0;
+  })()`);
+  const second = await crossPage();
+  const panel = await page.evaluate(`JSON.stringify((() => {
+    const body = document.getElementById('toc-body');
+    const box = body.getBoundingClientRect();
+    const active = document.querySelector('#toc-body .toc-item.active');
+    const item = active?.getBoundingClientRect();
+    return {
+      page: Number(document.getElementById('pageno').value),
+      entry: active?.textContent ?? '',
+      overflowing: body.scrollHeight > body.clientHeight,
+      scrollTop: Math.round(body.scrollTop),
+      visible: !!item && item.top >= box.top - 1 && item.bottom <= box.bottom + 1,
+      vvLeft: Math.round(visualViewport.offsetLeft),
+      scrollX: Math.round(window.scrollX),
+    };
+  })())`).then(JSON.parse);
+  check('a page further on was reached', second.after.page > crossed.after.page, `page ${crossed.after.page} -> ${second.after.page}`);
+  check('the panel scrolled its own list to the marked entry', panel.overflowing && panel.scrollTop > 0 && panel.visible,
+    `"${panel.entry}", scrollTop ${panel.scrollTop}, visible ${panel.visible}, overflowing ${panel.overflowing}`);
+  check('and the magnified view still did not move', Math.abs(panel.vvLeft - crossed.after.vvLeft) <= 32 && panel.scrollX === 0,
+    `visualViewport.offsetLeft ${crossed.after.vvLeft} -> ${panel.vvLeft}, scrollX ${panel.scrollX}`);
+
+  await page.evaluate(() => {
+    document.getElementById('toc-body').style.maxHeight = '';
+    document.getElementById('toc-close').click();
+    window.scrollTo(0, 0);
+  });
+  await resetScale();
 
   console.log('\n— Ctrl +/- walk the layout zoom ladder, not the browser\'s —');
   const dprBefore = (await state()).dpr;

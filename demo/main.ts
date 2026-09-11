@@ -29,6 +29,12 @@ const $ = <T extends HTMLElement>(id: string): T => {
   return el as T;
 };
 
+/**
+ * The sticky bar. It is chrome: its height feeds every scroll the viewer makes
+ * (`scrollMargin` below), and its controls are focused and scrolled by hand.
+ */
+const topbar = document.querySelector<HTMLElement>('.topbar');
+
 const els = {
   open: $<HTMLButtonElement>('open'),
   file: $<HTMLInputElement>('file'),
@@ -156,6 +162,9 @@ function onViewerEvent(event: ViewerEvent): void {
       els.searchGroup.hidden = false;
       els.pagecount.textContent = String(event.info.pageCount);
       els.pageno.value = '1';
+      // A new document starts on page one, whatever page the last one was left
+      // on; the outline is marked from that, not from the old position.
+      currentPage = 1;
       els.search.value = '';
       els.stats.textContent = '';
       document.title = event.info.title || 'webpdf';
@@ -183,6 +192,10 @@ function onViewerEvent(event: ViewerEvent): void {
       if (document.activeElement !== els.zoomValue) syncZoomBox();
       refreshZoomMenu();
       document.body.classList.toggle('wpdf-zoomed', event.zoomed);
+      // A pinch owns the whole screen: it magnifies the chrome along with the
+      // document and can pan the visual viewport over it, so anything left open
+      // is gone from view but still live - see `dismissChrome`.
+      if (event.zoomed) dismissChrome();
       break;
     case 'render':
       // Only the cost: everything else about a render is a debugging detail.
@@ -284,7 +297,8 @@ function openZoomMenu(): void {
   markZoomMenu();
   els.zoomMenu.hidden = false;
   els.zoomMenuBtn.setAttribute('aria-expanded', 'true');
-  els.zoomMenu.querySelectorAll<HTMLElement>('.zoom-option')[menuCursor]?.scrollIntoView({ block: 'nearest' });
+  const chosen = els.zoomMenu.querySelectorAll<HTMLElement>('.zoom-option')[menuCursor];
+  if (chosen) scrollIntoPanel(chosen, els.zoomMenu);
 }
 
 function closeZoomMenu(): void {
@@ -296,7 +310,59 @@ function moveZoomMenu(delta: number): void {
   if (menuOptions.length === 0) return;
   menuCursor = Math.min(menuOptions.length - 1, Math.max(0, menuCursor + delta));
   markZoomMenu();
-  els.zoomMenu.querySelectorAll<HTMLElement>('.zoom-option')[menuCursor]?.scrollIntoView({ block: 'nearest' });
+  const chosen = els.zoomMenu.querySelectorAll<HTMLElement>('.zoom-option')[menuCursor];
+  if (chosen) scrollIntoPanel(chosen, els.zoomMenu);
+}
+
+/* ---------------------------------------------------------------- panels */
+
+/**
+ * Bring an element into view *inside the panel that scrolls it*, and nowhere
+ * else. The behaviour is `block: 'nearest'`, the only mode either caller wants.
+ *
+ * `Element.scrollIntoView` walks the entire ancestor chain and ends at the
+ * document viewport, which is wrong twice over here: the outline is
+ * `position: fixed` and the zoom list sits in the sticky bar, so as soon as the
+ * browser is magnified and the visual viewport is panned over the page, both
+ * count as off screen. Scrolling past a page then made the browser drag the
+ * magnified view sideways to "reveal" a panel the reader could not even see -
+ * the browser test measures a 657 px jump of the view the moment the current
+ * page changes. The panel is scrolled by hand instead, and the document stays
+ * exactly where the reader put it.
+ */
+function scrollIntoPanel(el: HTMLElement, panel: HTMLElement): void {
+  const item = el.getBoundingClientRect();
+  const box = panel.getBoundingClientRect();
+  // A scrollport is the padding box, which is what `block: 'nearest'` measures
+  // against: `clientTop` is the border, `clientHeight` the padding box height.
+  const top = box.top + panel.clientTop;
+  const bottom = top + panel.clientHeight;
+  if (item.top < top) panel.scrollTop -= top - item.top;
+  else if (item.bottom > bottom) panel.scrollTop += item.bottom - bottom;
+}
+
+/**
+ * Close everything that was opened over the pages - the outline, the zoom
+ * dropdown - and take focus out of it.
+ *
+ * Zoom is the reason this exists rather than an accident of the toggle: a pinch
+ * is the browser's page scale, and chrome drawn next to the pages is magnified
+ * with them and can be panned out of view. A panel left open behind the zoom is
+ * not just invisible, it is still live, and still scrolling itself into view.
+ * Dismissing says what is true - while the page is magnified there is nothing
+ * on screen to read - and keeps the document the only thing that can move.
+ *
+ * Cheap enough to call on every `zoom-change`: the common case is three checks.
+ */
+function dismissChrome(): void {
+  const active = document.activeElement;
+  const focused = active instanceof HTMLElement && (topbar?.contains(active) === true || els.toc.contains(active));
+  if (els.toc.hidden && els.zoomMenu.hidden && !focused) return;
+  if (!els.toc.hidden) setOutline(false);
+  if (!els.zoomMenu.hidden) closeZoomMenu();
+  // Focus left in a control that the zoom has made invisible would swallow
+  // keystrokes. The viewer's link hit areas are not chrome, and keep theirs.
+  if (focused) active.blur();
 }
 
 function applyZoomLevel(level: ZoomLevel): void {
@@ -393,6 +459,9 @@ function renderOutline(doc: DocumentInfo): void {
     }
   };
   add(doc.outline, 0);
+  // Mark where the reader already is: a document opens on a page, and an outline
+  // that highlights nothing until the first page change looks broken.
+  highlightOutline(currentPage);
 }
 
 function highlightOutline(page: number): void {
@@ -401,7 +470,8 @@ function highlightOutline(page: number): void {
     if (entry.page > 0 && entry.page <= page) match = entry;
   }
   for (const entry of tocEntries) entry.el.classList.toggle('active', entry === match);
-  match?.el.scrollIntoView({ block: 'nearest' });
+  // The list follows the current page; the pages themselves do not move.
+  if (match && !els.toc.hidden) scrollIntoPanel(match.el, els.tocBody);
 }
 
 /* ------------------------------------------------------------------ load */
@@ -549,7 +619,6 @@ window.addEventListener('keydown', (event) => {
  * The sticky chrome offsets need to know how tall the topbar actually is (it
  * stacks on narrow windows). Kept in CSS pixels and updated on resize only.
  */
-const topbar = document.querySelector<HTMLElement>('.topbar');
 if (topbar) {
   const measure = (): void => {
     topbarHeight = topbar.offsetHeight;

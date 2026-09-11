@@ -187,7 +187,15 @@ Two consequences of letting the browser own the pinch:
 * Everything in the document is magnified together, so **chrome next to the
   pages is magnified too** and can pan out of view. `zoom-change` carries
   `zoomed` so a host can hide its chrome; the demo fades it with an opacity
-  toggle (no layout involved).
+  toggle (no layout involved) and **closes whatever was open** - the outline and
+  the zoom dropdown. Closing matters as much as hiding: a panel left open still
+  scrolls its own items into view when the page changes, and a magnified browser
+  answers that by scrolling the *visual viewport* to reveal it, which drags the
+  reader's view sideways - the pinch test measures 657 px the moment the current
+  page changes, with `visualViewport.offsetLeft` snapping from 657 to 0. A host
+  that keeps its panels open must scroll them by hand, as the demo's
+  `scrollIntoPanel` does, and never let `scrollIntoView` walk out of the panel it
+  was aimed at.
 
 The same event carries `layoutScale`, `mode` and `pageScale`, so a zoom control
 can show the level the *layout* is at without re-deriving it from the effective
@@ -296,7 +304,10 @@ viewer:
   paper touching both edges of the window. Ctrl+0 still means fit width.
 * **The outline floats** over the pages rather than taking a column. A column
   would change the viewer's width every time it opened, and a fit-width layout
-  would re-fit - visibly re-zooming the document - for a navigation panel.
+  would re-fit - visibly re-zooming the document - for a navigation panel. It
+  marks the entry for the page a document opens on, follows the current page by
+  scrolling its own list and nothing else, and is dismissed the moment the
+  browser magnifies the page, when there is nothing on screen to read.
 * **Search behaves like the browser's find bar.** Typing boxes every match on the
   pages in front of you and jumps straight to the first one - no Enter needed -
   while the background index fills in from page one, so the count and the boxes

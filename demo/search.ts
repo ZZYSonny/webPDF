@@ -316,7 +316,12 @@ export function createSearch({ viewer, onChange }: SearchOptions): SearchControl
       }
     }
     if (scroll) {
-      // The first band of the active match.
+      // The first band of the active match. This is the one deliberate
+      // `scrollIntoView` left in the demo: the band lives *in the page*, and a
+      // magnified page can only be brought to it by moving the view. It runs
+      // for a jump the reader asked for (typing, Enter, prev/next) and never
+      // from `refresh`, so it can never move the view on its own. Everything
+      // that scrolls a *panel* goes through `scrollIntoPanel` instead.
       painted.find((el) => el.dataset.wpdfSearch === 'active')?.scrollIntoView({ block: 'center', inline: 'nearest' });
     }
   }

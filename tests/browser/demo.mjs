@@ -629,6 +629,12 @@ try {
         { label: 'GPT-4 report render', timeout: 120000 },
       );
       await new Promise((r) => setTimeout(r, 1200));
+      // An outline that highlights nothing until the reader happens to change
+      // page looks broken; this report's first entry is on page one, so opening
+      // it is the moment to check that the panel says where the reader is.
+      const marked = await page.evaluate("document.querySelector('#toc-body .toc-item.active')?.textContent ?? ''");
+      if (!marked) fail('the outline should mark the entry for the page a document opens on');
+      else console.log(`outline marks: ${JSON.stringify(marked)}`);
       await page.evaluate('window.__opened = []');
       // That link is at the foot of the title page, well below the fold at this
       // zoom: bring the bottom-most external link into view before clicking it.
