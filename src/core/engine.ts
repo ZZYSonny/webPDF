@@ -15,6 +15,17 @@ import { FontRegistry, type FontAsset } from './font/registry.ts';
 import { debug } from './debug.ts';
 import { inlineFontCss, namespaceSvgIds, readSvgDimensions, rewriteSvgRoot, stripXmlProlog } from './svg/package.ts';
 import { injectSvgLinks, type PageLink } from './links.ts';
+import {
+  contentBox,
+  cropViewBox,
+  normaliseRules,
+  padBox,
+  quadBox,
+  unionBox,
+  type CropRect,
+  type CropRuleId,
+  type CropSpan,
+} from './crop.ts';
 
 export type PdfSource =
   | ArrayBuffer
@@ -69,6 +80,21 @@ export interface RenderOptions {
    * carries the same links as data either way.
    */
   links?: boolean;
+  /**
+   * Crop the page to its content, minus the marks these rules name (see
+   * `crop.ts`). The crop is a `viewBox`, so the SVG keeps every element it had
+   * and only shows a smaller part of the page - nothing is removed, and the
+   * result is still the whole page's text, selectable and searchable.
+   * Empty or omitted: no crop, the page as it is.
+   */
+  crop?: readonly CropRuleId[] | null;
+  /**
+   * Page units to grow the crop by, on every side, without measuring anything
+   * again: the content box is what the rules produce, and this is how much of
+   * the margin around it to keep. Stopped by the page's own edges. Default 0,
+   * which is what the reference script crops to.
+   */
+  cropPadding?: number;
 }
 
 export interface RenderStats {
@@ -86,6 +112,8 @@ export interface RenderedPage {
   svg: string;
   width: number;
   height: number;
+  /** The crop the SVG was given, in page units, or null when it is uncropped. */
+  crop: CropRect | null;
   fonts: FontAsset[];
   /** The page's link annotations, in the page's own coordinates. */
   links: PageLink[];
@@ -108,6 +136,15 @@ export interface EngineOptions {
 export interface PdfEngineLike {
   open(source: PdfSource, password?: string): Promise<DocumentInfo>;
   renderPage(index: number, opts?: RenderOptions): Promise<RenderedPage>;
+  /**
+   * The box a page would be cropped to under these rules, without rendering it.
+   * A viewer needs this ahead of the render, because the cropped size of every
+   * page is what its scroll layout is built from.
+   *
+   * Optional: an engine that cannot read page content boxes this way is still a
+   * usable engine, and a viewer that gets no answer simply does not crop.
+   */
+  measureCrop?(index: number, rules: readonly CropRuleId[]): Promise<CropRect | null>;
   drainNewFonts(): FontAsset[];
   /** Optional: drop everything outside `keep` so memory stays bounded. */
   trimCaches?(keep: readonly number[]): void;
@@ -122,6 +159,20 @@ export class PasswordRequiredError extends Error {
     this.name = 'PasswordRequiredError';
   }
 }
+
+/**
+ * What the text pass asks MuPDF for: the vectors and the images as well as the
+ * text, so one walk of a page answers everything the crop rules need. (The key
+ * is `vectors`, not the `FZ_STEXT_COLLECT_VECTORS` name it comes from.)
+ */
+const TEXT_OPTIONS = 'vectors=1,preserve-images=1';
+
+/**
+ * How often a long measurement hands memory back. Reading every page of a
+ * 756-page document one after another runs the wasm store out of room long
+ * before the last page otherwise - the same reason `trimCaches` exists.
+ */
+const SHRINK_EVERY = 32;
 
 export class DocumentNotOpenError extends Error {
   constructor() {
@@ -176,6 +227,113 @@ function toOutline(items: RawOutlineItem[] | null): OutlineNode[] {
  * - deciding what is safe to open is `links.ts`'s job, at the point where an
  * `href` would be written.
  */
+/**
+ * Every text run on a page, with the box it occupies.
+ *
+ * MuPDF reports characters, not spans; a span is the run of characters that
+ * share a font, a size and a colour, which is how PyMuPDF groups them and
+ * therefore how PaperCutter's rules see the page. Grouping them the same way
+ * matters: "3.1." and the heading it introduces are one span when they are set
+ * in one style, and the rule for a section number then takes the whole heading
+ * out of the box - exactly as the reference script does.
+ */
+function readSpans(page: mupdf.Page): CropSpan[] {
+  const spans: CropSpan[] = [];
+  let run: CropSpan | null = null;
+  let key = '';
+  const stext = page.toStructuredText(TEXT_OPTIONS);
+  try {
+    stext.walk({
+      beginLine() {
+        run = null;
+      },
+      onChar: (c, _origin, font, size, quad, color) => {
+        const style = `${font.getName()}|${size}|${color.join(',')}`;
+        if (!run || style !== key) {
+          key = style;
+          run = { text: '', box: quadBox(quad) };
+          spans.push(run);
+        }
+        run.text += c;
+        // A quad is four corners, and a span is the box around all of them.
+        run.box = unionBox(run.box, quadBox(quad));
+      },
+      endLine() {
+        run = null;
+      },
+    });
+  } finally {
+    stext.destroy();
+  }
+  return spans;
+}
+
+/** The box a rectangle in one space occupies in another, corners and all. */
+function mappedBox(rect: readonly number[], ctm: mupdf.Matrix): CropRect {
+  const [a, b, c, d, e, f] = ctm;
+  const xs: number[] = [];
+  const ys: number[] = [];
+  for (const [x, y] of [
+    [rect[0], rect[1]],
+    [rect[2], rect[1]],
+    [rect[0], rect[3]],
+    [rect[2], rect[3]],
+  ]) {
+    xs.push(a * x + c * y + e);
+    ys.push(b * x + d * y + f);
+  }
+  const x = Math.min(...xs);
+  const y = Math.min(...ys);
+  return { x, y, width: Math.max(...xs) - x, height: Math.max(...ys) - y };
+}
+
+/**
+ * The boxes of everything the page draws - the `get_bboxlog()` half of
+ * PaperCutter, which keeps a figure or a table frame in the crop while a
+ * hairline or a clipped-away path stays out of it.
+ *
+ * A device rather than a display list, because the kinds that matter
+ * (`fill-path`, `stroke-path`, `fill-image`, `fill-shade`) are the device's own
+ * callbacks, and each one arrives with the full transform already applied.
+ * `image` and `shade` belong to the caller for the length of the call and must
+ * not be dropped here; `path` and `stroke` are kept for us, and are.
+ */
+function readDrawings(page: mupdf.Page): CropRect[] {
+  const boxes: CropRect[] = [];
+  // A fill has no stroke state, and the runtime takes `null` for exactly that
+  // ("if (strokeState !== null) checkType(...)"), but the published typings ask
+  // for a `StrokeState`. One cast, here, rather than a wrong stroke width.
+  const noStroke = null as unknown as mupdf.StrokeState;
+  const device = new mupdf.Device({
+    fillPath(path, _evenOdd, ctm) {
+      boxes.push(boxOf(path.getBounds(noStroke, ctm)));
+      path.destroy();
+    },
+    strokePath(path, stroke, ctm) {
+      boxes.push(boxOf(path.getBounds(stroke, ctm)));
+      path.destroy();
+      stroke.destroy();
+    },
+    fillImage(_image, ctm) {
+      boxes.push(mappedBox([0, 0, 1, 1], ctm));
+    },
+    fillShade(shade, ctm) {
+      boxes.push(mappedBox(shade.getBounds(), ctm));
+    },
+  });
+  try {
+    page.runPageContents(device, mupdf.Matrix.identity);
+  } finally {
+    device.close();
+    device.destroy();
+  }
+  return boxes;
+}
+
+function boxOf(rect: readonly number[]): CropRect {
+  return { x: rect[0], y: rect[1], width: rect[2] - rect[0], height: rect[3] - rect[1] };
+}
+
 function readLinks(doc: mupdf.Document, page: mupdf.Page): PageLink[] {
   const out: PageLink[] = [];
   let links: mupdf.Link[];
@@ -219,6 +377,9 @@ export class PdfEngine implements PdfEngineLike {
   private doc: mupdf.Document | null = null;
   private registry: FontRegistry;
   private pageCache = new Map<number, mupdf.Page>();
+  /** Measured crop boxes, keyed by rule set and page. Small: four numbers each. */
+  private boxCache = new Map<string, CropRect | null>();
+  private measured = 0;
   private info: DocumentInfo | null = null;
   private readonly opts: EngineOptions;
 
@@ -305,6 +466,55 @@ export class PdfEngine implements PdfEngineLike {
     return page;
   }
 
+  /**
+   * The box this page's content occupies under `rules` - before any padding,
+   * which is a render-time matter (`cropPadding`) and costs nothing to change.
+   *
+   * Reading a page costs a few milliseconds and is asked for once per page per
+   * rule set, so the answers are kept: toggling a rule off and on again is then
+   * free rather than a second pass over the document. `null` means "nothing to
+   * crop to" - an empty page, or no rules - and the page keeps its own size.
+   */
+  async measureCrop(index: number, rules: readonly CropRuleId[]): Promise<CropRect | null> {
+    const wanted = normaliseRules(rules);
+    if (wanted.length === 0) return null;
+    const key = `${wanted.join(',')}|${index}`;
+    const cached = this.boxCache.get(key);
+    if (cached !== undefined) return cached;
+
+    const page = this.loadPage(index);
+    const bounds = page.getBounds('CropBox');
+    const box = contentBox({
+      spans: readSpans(page),
+      drawings: readDrawings(page),
+      page: boxOf(bounds),
+      title: this.info?.title ?? '',
+      rules: wanted,
+    });
+    debug('measureCrop', index, wanted.join(','), box);
+    // A document's worth of pages is the normal case, so the store is handed
+    // back periodically rather than only when a caller asks.
+    if (++this.measured % SHRINK_EVERY === 0) this.shrink();
+    // Two rule sets is the common case (one on, one off); anything past a few
+    // means a host is cycling through selections, and the oldest go first.
+    if (this.boxCache.size > this.info!.pageCount * 4) {
+      for (const oldest of this.boxCache.keys()) {
+        this.boxCache.delete(oldest);
+        if (this.boxCache.size <= this.info!.pageCount * 2) break;
+      }
+    }
+    this.boxCache.set(key, box);
+    return box;
+  }
+
+  private shrink(): void {
+    try {
+      mupdf.shrinkStore(50);
+    } catch {
+      /* not fatal */
+    }
+  }
+
   /** Render one page to SVG, upgrading glyphs to text where it is provably safe. */
   async renderPage(index: number, opts: RenderOptions = {}): Promise<RenderedPage> {
     const started = Date.now();
@@ -313,6 +523,10 @@ export class PdfEngine implements PdfEngineLike {
     if (!doc) throw new DocumentNotOpenError();
     const page = this.loadPage(index);
     const links = opts.links === false ? [] : readLinks(doc, page);
+    const content = await this.measureCrop(index, opts.crop ?? []);
+    // Padding is applied here rather than in `measureCrop`, so changing it is a
+    // re-render and never a re-measure.
+    const crop = content ? padBox(content, opts.cropPadding ?? 0, boxOf(page.getBounds('CropBox'))) : null;
 
     debug('renderPage: mupdf render', index);
     // MuPDF objects are only finalised on GC, which is far too late when a long
@@ -376,12 +590,21 @@ export class PdfEngine implements PdfEngineLike {
     if (opts.embedFonts && fonts.length) {
       svg = inlineFontCss(svg, fonts.map((f) => f.css).join('\n'));
     }
-    svg = rewriteSvgRoot(svg, { className: opts.className, responsive: opts.responsive });
+    // The crop is a `viewBox` on the root: the page keeps every element it had,
+    // and the reader sees a window onto it. Applied last, so nothing above had
+    // to know about it - coordinates inside the SVG are the page's own either
+    // way, which is also what keeps the link hit areas and the search bands
+    // where they were.
+    svg = rewriteSvgRoot(svg, {
+      className: opts.className,
+      responsive: opts.responsive,
+      viewBox: crop ? cropViewBox(crop) : undefined,
+    });
 
     const dims = readSvgDimensions(svg) ?? { width: 612, height: 792, viewBox: '' };
     stats.ms = Date.now() - started;
 
-    return { index, svg, width: dims.width, height: dims.height, fonts, links, stats };
+    return { index, svg, width: dims.width, height: dims.height, crop, fonts, links, stats };
   }
 
   /** Release a page and its cached resources. */
@@ -403,11 +626,7 @@ export class PdfEngine implements PdfEngineLike {
     for (const index of [...this.pageCache.keys()]) {
       if (!keepSet.has(index)) this.releasePage(index);
     }
-    try {
-      mupdf.shrinkStore(50);
-    } catch {
-      /* not fatal */
-    }
+    this.shrink();
   }
 
   close(): void {
@@ -419,6 +638,8 @@ export class PdfEngine implements PdfEngineLike {
       }
     }
     this.pageCache.clear();
+    this.boxCache.clear();
+    this.measured = 0;
     if (this.doc) {
       try {
         this.doc.destroy();

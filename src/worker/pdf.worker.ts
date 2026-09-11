@@ -20,10 +20,11 @@
  */
 
 import type { PdfEngineLike, PdfSource, RenderOptions } from '../core/engine.ts';
+import type { CropRuleId } from '../core/crop.ts';
 
 interface Request {
   id: number;
-  method: 'probe' | 'open' | 'renderPage' | 'drainNewFonts' | 'trimCaches' | 'close';
+  method: 'probe' | 'open' | 'renderPage' | 'measureCrop' | 'drainNewFonts' | 'trimCaches' | 'close';
   args: unknown[];
 }
 
@@ -39,6 +40,8 @@ const handlers = {
   open: (e: PdfEngineLike, args: unknown[]) => e.open(args[0] as PdfSource, args[1] as string | undefined),
   renderPage: (e: PdfEngineLike, args: unknown[]) =>
     e.renderPage(args[0] as number, args[1] as RenderOptions | undefined),
+  measureCrop: (e: PdfEngineLike, args: unknown[]) =>
+    e.measureCrop?.(args[0] as number, args[1] as CropRuleId[]) ?? null,
   drainNewFonts: (e: PdfEngineLike) => e.drainNewFonts(),
   trimCaches: (e: PdfEngineLike, args: unknown[]) => e.trimCaches?.(args[0] as number[]),
   close: (e: PdfEngineLike) => e.close(),

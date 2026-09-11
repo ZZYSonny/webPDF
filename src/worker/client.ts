@@ -7,6 +7,7 @@
  */
 
 import type { DocumentInfo, PdfEngineLike, PdfSource, RenderOptions, RenderedPage } from '../core/engine.ts';
+import type { CropRect, CropRuleId } from '../core/crop.ts';
 import type { FontAsset } from '../core/font/registry.ts';
 
 interface Pending {
@@ -66,6 +67,10 @@ export class WorkerEngine implements PdfEngineLike {
     const page = await this.call<RenderedPage>('renderPage', [index, opts]);
     if (page.fonts.length) this.fonts.push(...page.fonts);
     return page;
+  }
+
+  async measureCrop(index: number, rules: readonly CropRuleId[]): Promise<CropRect | null> {
+    return this.call<CropRect | null>('measureCrop', [index, rules]);
   }
 
   /**

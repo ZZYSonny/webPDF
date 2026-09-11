@@ -55,6 +55,7 @@ const state = () =>
       outlineOpacity: getComputedStyle(document.getElementById('toc')).opacity,
       outlineOpen: document.getElementById('toc').hidden === false,
       zoomMenuOpen: document.getElementById('zoom-menu').hidden === false,
+      cropMenuOpen: document.getElementById('crop-menu').hidden === false,
       page: Number(document.getElementById('pageno').value),
       tocActive: document.querySelector('#toc-body .toc-item.active')?.textContent ?? '',
       scrollX: Math.round(window.scrollX),
@@ -205,7 +206,7 @@ try {
   check('no page scale yet', Math.abs(start.pageScale - 1) < 0.01, `scale ${start.pageScale}`);
 
   console.log("\n— a pinch is the browser's, and costs no layout —");
-  // Both panels open first: a pinch magnifies the chrome along with the pages,
+  // Every panel open first: a pinch magnifies the chrome along with the pages,
   // so what happens to an open panel is part of the contract.
   const panelsOpen = await page
     .evaluate(
@@ -213,11 +214,20 @@ try {
         const toc = document.getElementById('toc');
         if (toc.hidden) document.getElementById('toc-toggle').click();
         document.getElementById('zoom-menu-btn').click();
-        return { outline: toc.hidden === false, menu: document.getElementById('zoom-menu').hidden === false };
+        document.getElementById('crop-btn').click();
+        return {
+          outline: toc.hidden === false,
+          menu: document.getElementById('zoom-menu').hidden === false,
+          crop: document.getElementById('crop-menu').hidden === false,
+        };
       })())`,
     )
     .then(JSON.parse);
-  check('the outline and the zoom list are open to start with', panelsOpen.outline && panelsOpen.menu, JSON.stringify(panelsOpen));
+  check(
+    'the outline, the zoom list and the crop rules are open to start with',
+    panelsOpen.outline && panelsOpen.menu && panelsOpen.crop,
+    JSON.stringify(panelsOpen),
+  );
 
   const pinched = await measure(() => pinch());
   check('the browser magnified the page', pinched.after.s.pageScale > 1.4, `page scale ${pinched.before.s.pageScale} -> ${pinched.after.s.pageScale}`);
@@ -232,8 +242,8 @@ try {
   // and the browser answers that by dragging the magnified view to reveal it.
   check(
     'the open panels are dismissed, not left behind the zoom',
-    !pinched.after.s.outlineOpen && !pinched.after.s.zoomMenuOpen,
-    `outline ${pinched.after.s.outlineOpen}, zoom list ${pinched.after.s.zoomMenuOpen}`,
+    !pinched.after.s.outlineOpen && !pinched.after.s.zoomMenuOpen && !pinched.after.s.cropMenuOpen,
+    `outline ${pinched.after.s.outlineOpen}, zoom list ${pinched.after.s.zoomMenuOpen}, crop ${pinched.after.s.cropMenuOpen}`,
   );
 
   console.log('\n— panning while zoomed chains into the document —');

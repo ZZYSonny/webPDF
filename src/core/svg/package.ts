@@ -78,6 +78,12 @@ export interface SvgRootOptions {
   className?: string;
   /** Make the root fill its container instead of using MuPDF's pixel size. */
   responsive?: boolean;
+  /**
+   * Replace the root `viewBox`. The page's own coordinates are untouched - a
+   * viewBox is a window onto the drawing, not a rewrite of it - which is how a
+   * crop is applied here: the same SVG, showing less of the page.
+   */
+  viewBox?: string;
 }
 
 /** Rewrite the root `<svg>` tag so it can be dropped into a DOM container. */
@@ -88,6 +94,10 @@ export function rewriteSvgRoot(svg: string, opts: SvgRootOptions = {}): string {
   if (opts.responsive !== false) {
     tag = tag.replace(/\swidth="[^"]*"/, ' width="100%"').replace(/\sheight="[^"]*"/, ' height="100%"');
     if (!/\bpreserveAspectRatio=/.test(tag)) tag = tag.replace(/<svg\b/, '<svg preserveAspectRatio="xMidYMid meet"');
+  }
+  if (opts.viewBox !== undefined) {
+    if (/\bviewBox="/.test(tag)) tag = tag.replace(/\bviewBox="[^"]*"/, `viewBox="${opts.viewBox}"`);
+    else tag = tag.replace(/<svg\b/, `<svg viewBox="${opts.viewBox}"`);
   }
   if (opts.className) {
     if (/\bclass="/.test(tag)) tag = tag.replace(/\bclass="([^"]*)"/, `class="$1 ${opts.className}"`);

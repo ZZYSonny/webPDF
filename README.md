@@ -156,6 +156,55 @@ Only the pages touching the viewport, plus one on each side, are ever in the DOM
 Everyone else is an absolutely positioned box whose geometry was computed up
 front, so zooming restyles boxes and never re-renders a page.
 
+#### Cropping pages to their content
+
+```ts
+import { CROP_RULES, type CropRuleId } from 'webpdf';
+
+viewer.setCrop(['arxiv', 'page-number']);       // trim to content, minus those marks
+viewer.setCrop(['arxiv', 'page-number'], 8);    // ...keeping 8pt of margin around it
+viewer.setCrop(null);                           // show the pages whole again
+viewer.cropBox(1);                              // { x, y, width, height } | null
+```
+
+The rules are [PaperCutter](https://github.com/zzysonny/PaperCutter)'s: a page is
+reduced to the bounding box of its text and its larger drawings, with the spans
+that match an enabled rule left out of that box. A rule is a test on one text run
+- `s.startsWith("arXiv:")`, `s.lstrip().rstrip().isdigit()`, `re.match("CHAPTER
+[0-9]\.", s)` - and `CROP_RULES` publishes them with the source line each came
+from, so a host can render its own control from the same table the engine uses.
+`renderDocument(source, { crop, cropPadding })` does the same thing headlessly,
+which is the batch case the original script exists for.
+
+The margin is in page units - 1/72 inch - and is stopped by the page's own edges.
+It costs nothing to change: the rules decide where the content is, the margin is
+added to that box at render time, so the field in the demo re-lays-out the pages
+without reading a single one of them again. Zero is the default, which is exactly
+what the reference script crops to.
+
+Two properties are worth stating plainly, because they are the difference between
+this and "delete what is outside the box":
+
+* **The crop is a `viewBox`.** Every element the page had is still in the SVG -
+  the text is still there to be selected and searched, and the link hit areas are
+  still where they were. The reader sees a smaller window onto the same drawing,
+  which is exactly what a PDF crop box is. (The page's *layout* size follows the
+  crop, so the scroll height is right.)
+* **A rule may not slice a line of text.** The box is the union of whole text
+  runs, measured from all four corners of each glyph's quad, so a mark is either
+  inside the window or outside it - never half in. A run measured from a single
+  corner collapses to a line and takes the bottom line of the page with it; that
+  is a bug this code had, and `tests/crop.test.ts` and the demo test both pin it.
+
+Measuring a page costs a few milliseconds, and the scroll layout cannot be built
+until the boxes are known, so `setCrop` reads the document in the background and
+lets the layout follow: the reader's own page is measured first, one re-layout per
+frame at most, and `crop-change` reports the progress. The reader keeps their page
+and their place on it throughout. An engine keeps what it measured, so toggling a
+rule off and on again is free. Internal link destinations are points on the
+*uncropped* page and are translated to the crop before the jump, so a link still
+lands where it says.
+
 #### Who owns the zoom
 
 Zoom is split by gesture, because the two gestures have completely different
@@ -320,6 +369,16 @@ viewer:
 * **Search ignores whitespace on both sides.** Runs are one positioned string
   each and a space glyph has no outline to build a font from, so a page's text can
   read `AttentionIsAllYouNeed` (see the limitations).
+* **Cropping is opt-in, and never edits the page.** The *Crop* dropdown, after the
+  search box, lists the marks PaperCutter removes from a page before it measures
+  what is left: the arXiv stamp, a publisher's header, a bare page number, a
+  numbered heading, `PRIME AI paper`, and the document's own running title.
+  Nothing is checked to begin with and nothing is checked by *default* - the
+  pages are shown whole until a rule is switched on, and *Disable all* puts them
+  back. *Enable all* is what the reference script does. Each row carries the test
+  it runs, so what a rule removes is never a guess. A **Padding** field above the
+  list keeps a margin around what is left, in points, from 0 (the reference
+  script's own crop) to two inches.
 * **Links are the viewer's, and the demo just says what happened.** Clicking an
   external link opens it in a new tab and the toast names the URI; a link a
   browser cannot follow (the *GPT-4 Technical Report* links to a local file) gets
@@ -344,6 +403,10 @@ for await (const page of renderDocument(bytes, { embedFonts: true })) {
   writeFileSync(`page-${page.index}.svg`, page.svg);
 }
 ```
+
+`crop: ['arxiv', 'page-number']` trims each page to its content as it is
+exported, changing only the root `viewBox` - the file still contains the whole
+page, the way a PDF with a crop box does.
 
 `embedFonts: true` puts the `@font-face` rules inside the SVG, which is what
 makes an exported file self-contained — required for `<img src="…svg">`, for a
@@ -394,7 +457,7 @@ The library was written with content scripts in mind:
 `PdfEngineLike` is exported, and `WorkerEngine` is the reference implementation
 of it, so a different transport (an extension's offscreen document, a shared
 worker, a remote renderer) only needs `open` / `renderPage` / `drainNewFonts` /
-`close`.
+`close` - plus `measureCrop`, without which a viewer simply does not crop.
 
 ---
 
@@ -405,6 +468,7 @@ src/
   api.ts                    createViewer, renderDocument, public types
   core/
     engine.ts               MuPDF document + page rendering (DOM-free)
+    crop.ts                 PaperCutter's rules, and the box they leave
     debug.ts                opt-in pipeline tracing
     links.ts                link annotations → data, and → SVG hit areas
     svg/
@@ -427,6 +491,8 @@ demo/                       the demo application
   papers.mjs                the corpus: public URLs, and where they are cached
   papers-client.ts          which of them this page has a local copy of
   examples.ts               the picker's entries, cached copies first
+  crop.ts                   the crop dropdown: one toggle per rule
+  panels.ts                 scrolling a panel without moving the document
 tests/
   *.test.ts                 Node tests (real PDFs through the real wasm)
   pdf-cache.mjs             fetches the corpus, lists it, clears it
@@ -525,6 +591,16 @@ is referenced relatively.
   boundaries and the space between them is dropped: copy-paste (and naive search)
   sees `AttentionIsAllYouNeed`. Emitting U+0020 from the PDF's advance widths
   would fix it; the demo's search strips whitespace from both sides instead.
+* **Cropping reads every page to lay the document out.** A crop changes each
+  page's height, so the scroll height is only correct once every box is known:
+  switching a rule on measures the whole document in the background (about 5 ms
+  a page - a second or two for a 756-page specification, a few hundred
+  milliseconds for a paper, and free the second time). Applying it page by page
+  as the reader scrolls would be faster and would make the scrollbar jump.
+* **A crop hides text without removing it.** A search match inside a cropped-away
+  margin - a page number, say - is still found and still boxed, but the box is
+  outside the window the page is showing, so jumping to it shows nothing. Removing
+  the marks instead would break every coordinate the SVG shares with the page.
 * **The worker path is verified in Chromium only.** It relies on module workers
   and `CompressionStream`, both of which are widely available, but the fallback
   exists precisely because worker startup can be blocked by a host's CSP.

@@ -33,6 +33,7 @@ import type { DocumentInfo, PdfEngineLike, PdfSource, RenderOptions } from '../c
 import type { FontAsset } from '../core/font/registry.ts';
 import { linkTargetOf, type LinkTarget } from '../core/links.ts';
 import { debug as DEBUG } from '../core/debug.ts';
+import { normaliseRules, padBox, type CropRect, type CropRuleId } from '../core/crop.ts';
 import {
   computeFitScale,
   PageLayout,
@@ -57,6 +58,13 @@ export type ViewerEvent =
       zoomed: boolean;
     }
   | { type: 'render'; page: number; ms: number; asText: number; asOutlines: number }
+  /**
+   * Cropping advanced: `measured` of `total` pages have a box. A crop changes
+   * every page's height, so it cannot be applied in one go without reading the
+   * whole document first - the boxes arrive a page at a time and the layout
+   * follows them, which is what `running` reports the end of.
+   */
+  | { type: 'crop-change'; rules: readonly CropRuleId[]; measured: number; total: number; running: boolean }
   | { type: 'error'; error: unknown; page?: number }
   | { type: 'drop-accepted'; name: string }
   /**
@@ -201,7 +209,21 @@ export class PdfViewer {
   private readonly inFlight = new Set<number>();
 
   private info: DocumentInfo | null = null;
+  /** The pages as the document has them, whatever crop is in force. */
+  private baseGeometry: PageGeometry[] = [];
+  /** The pages as they are laid out: the same, cropped where a box is known. */
   private geometry: PageGeometry[] = [];
+  /** Measured crop boxes, one entry per page; null for "not cropped". */
+  private cropBoxes: (CropRect | null)[] = [];
+  /** The rules in force, empty for no crop at all. */
+  private cropRules: CropRuleId[] = [];
+  /** Page units kept around the content box, on every side. */
+  private padding = 0;
+  /** Bumped whenever the selection changes, so a running pass gives up. */
+  private cropEpoch = 0;
+  private cropMeasured = 0;
+  private cropRunning = false;
+  private cropFrame = 0;
   private layout: PageLayout;
   /** Zoom baked into the layout, in CSS pixels per page unit. */
   private scale = 1;
@@ -330,7 +352,14 @@ export class PdfViewer {
   setDocument(info: DocumentInfo): void {
     this.info = info;
     this.docSeq++;
-    this.geometry = info.pages.map((p) => ({ width: p.width, height: p.height }));
+    this.baseGeometry = info.pages.map((p) => ({ width: p.width, height: p.height }));
+    // A crop belongs to the document it was measured on; the rules are the
+    // reader's and stay, so a selection made on one paper applies to the next.
+    this.cropEpoch++;
+    this.cropBoxes = [];
+    this.cropMeasured = 0;
+    this.cropRunning = false;
+    this.applyCropGeometry();
     this.clearSlots();
     // A newly opened document starts at the level the `zoom` option asks for,
     // whatever the previous document was left at - and the mode has to say so, or
@@ -343,6 +372,7 @@ export class PdfViewer {
     this.emit({ type: 'document-loaded', info });
     this.emitZoom();
     this.update();
+    if (this.cropRules.length > 0) this.measureCrop();
   }
 
   get document(): DocumentInfo | null {
@@ -392,7 +422,7 @@ export class PdfViewer {
   setZoom(value: number | 'fit-width' | 'fit-page'): void {
     const anchorPage = Math.max(0, this.currentPage - 1);
     const before = this.layout.offsetOf(anchorPage);
-    const delta = this.scrollOffset() - before;
+    const delta = this.readingOffset() - before;
 
     if (typeof value === 'number') {
       this.mode = 'custom';
@@ -483,6 +513,201 @@ export class PdfViewer {
     this.pagesEl.style.height = `${this.layout.height}px`;
   }
 
+  /* --------------------------------------------------------------- crop */
+
+  /**
+   * Show every page cropped to its content, with the marks `rules` name left
+   * out of the box (see `core/crop.ts` - the rules are PaperCutter's). `null`
+   * or an empty list turns cropping off again, which is where a viewer starts.
+   *
+   * A crop changes the *size* of every page, so the scroll layout cannot be
+   * built until the boxes are known - and knowing them means reading every page
+   * of the document, which is far too much to do before the first paint. So the
+   * pages are measured in the background, the reader's own page first, and the
+   * layout follows the answers as they arrive. `crop-change` reports the
+   * progress; a second visit to the same selection is instant, because an
+   * engine keeps what it measured.
+   */
+  setCrop(rules: readonly CropRuleId[] | null, padding = 0): void {
+    const next = normaliseRules(rules);
+    const pad = Number.isFinite(padding) && padding > 0 ? padding : 0;
+    const sameRules = next.join(',') === this.cropRules.join(',');
+    if (sameRules && Math.abs(pad - this.padding) < 1e-3) return;
+    if (sameRules) {
+      // Only the margin moved. Nothing has to be measured again - every page
+      // has been measured already - so the pages are re-laid-out and re-rendered
+      // straight away, which is what makes the field feel like a control.
+      this.padding = pad;
+      this.applyCropGeometry();
+      this.invalidateAll();
+      this.relayout();
+      this.emitCrop(true);
+      return;
+    }
+    this.padding = pad;
+    this.cropRules = next;
+    // Whatever pass was running is now measuring for the wrong selection.
+    this.cropEpoch++;
+    this.cropRunning = false;
+    if (next.length === 0) {
+      this.cropBoxes = [];
+      this.cropMeasured = 0;
+      this.applyCropGeometry();
+      this.invalidateAll();
+      this.relayout();
+      this.emitCrop(true);
+      return;
+    }
+    // Boxes already measured are kept: they were measured with a different
+    // selection, but they are a crop, and a page whose new box has not arrived
+    // is better off adjusting than snapping back to full size and back again.
+    this.measureCrop();
+  }
+
+  /** The rules in force. Empty means the pages are shown whole. */
+  get crop(): readonly CropRuleId[] {
+    return this.cropRules;
+  }
+
+  /** How far the measuring pass has got, for a host that shows progress. */
+  get cropProgress(): { measured: number; total: number; running: boolean } {
+    return { measured: this.cropMeasured, total: this.geometry.length, running: this.cropRunning };
+  }
+
+  /**
+   * The box a page is currently shown through, in the page's own coordinates,
+   * or null when it is shown whole. A host that places something on a page -
+   * an annotation, a synced highlight - needs it, because the page it is
+   * looking at starts at the top of the crop rather than at the top of the page.
+   */
+  cropBox(page: number): CropRect | null {
+    const content = this.cropBoxes[page - 1];
+    const base = this.baseGeometry[page - 1];
+    if (!content || !base) return null;
+    return padBox(content, this.padding, { x: 0, y: 0, width: base.width, height: base.height });
+  }
+
+  /** Page units kept around the content box on every side. 0 by default. */
+  get cropPadding(): number {
+    return this.padding;
+  }
+
+  private measureCrop(): void {
+    const measure = this.engine.measureCrop?.bind(this.engine);
+    const rules = this.cropRules;
+    const epoch = ++this.cropEpoch;
+    const count = this.baseGeometry.length;
+    this.cropMeasured = 0;
+    this.cropRunning = count > 0 && measure !== undefined;
+    this.emitCrop(!this.cropRunning);
+    if (!measure) return;
+
+    // The reader's own page comes first: a rule should show what it does where
+    // they are looking, not after the rest of a long document has been read.
+    const here = Math.max(0, Math.min(count - 1, this.currentPage - 1));
+    const order: number[] = [];
+    if (count > 0) order.push(here);
+    for (let i = 0; i < count; i++) if (i !== here) order.push(i);
+
+    void (async () => {
+      for (const index of order) {
+        if (this.destroyed || epoch !== this.cropEpoch) return;
+        let box: CropRect | null = null;
+        try {
+          box = await measure(index, rules);
+        } catch (error) {
+          // A page that cannot be read stays whole; the rest of the pass runs.
+          DEBUG('measureCrop failed', index, String(error));
+        }
+        if (this.destroyed || epoch !== this.cropEpoch) return;
+        this.cropMeasured++;
+        if (this.setCropBox(index, box)) this.scheduleCropLayout();
+        this.emitCrop(false);
+      }
+      if (this.destroyed || epoch !== this.cropEpoch) return;
+      this.cropRunning = false;
+      // The last boxes may have arrived with a frame still pending.
+      this.applyCropGeometry();
+      this.emitCrop(true);
+    })();
+  }
+
+  /** Record one page's box. Returns true when it changes the page's size. */
+  private setCropBox(index: number, box: CropRect | null): boolean {
+    const page = this.baseGeometry[index];
+    if (!page) return false;
+    const previous = this.cropBoxes[index] ?? null;
+    const width = box ? box.width : page.width;
+    const height = box ? box.height : page.height;
+    this.cropBoxes[index] = box;
+    const changed = !previous || Math.abs(previous.width - width) > 1e-3 || Math.abs(previous.height - height) > 1e-3;
+    // What is on screen was rendered through the old window onto the page.
+    if (changed) this.invalidateSlot(index);
+    return changed;
+  }
+
+  private applyCropGeometry(): void {
+    this.geometry = this.baseGeometry.map((page, index) => {
+      const box = this.cropBox(index + 1);
+      return box ? { width: box.width, height: box.height } : { ...page };
+    });
+  }
+
+  /**
+   * Re-lay-out without moving the reader: whatever page they are on stays where
+   * it is on screen, at the same point inside it.
+   */
+  private relayout(): void {
+    if (this.geometry.length === 0) {
+      this.rebuildLayout();
+      return;
+    }
+    const anchor = Math.max(0, Math.min(this.geometry.length - 1, this.currentPage - 1));
+    const delta = this.readingOffset() - this.layout.offsetOf(anchor);
+    this.rebuildLayout();
+    this.scrollToOffset(this.layout.offsetOf(anchor) + delta);
+    this.update();
+  }
+
+  /**
+   * Boxes arrive once per page, and every arrival would otherwise re-lay-out the
+   * whole document. One per frame is plenty, and the reader never sees a page
+   * size change twice in a frame.
+   */
+  private scheduleCropLayout(): void {
+    if (this.cropFrame || this.destroyed) return;
+    this.cropFrame = requestAnimationFrame(() => {
+      this.cropFrame = 0;
+      if (this.destroyed) return;
+      this.applyCropGeometry();
+      this.relayout();
+    });
+  }
+
+  /** Drop a rendered page, so it is rendered again through the current crop. */
+  private invalidateSlot(index: number): void {
+    const slot = this.slots.get(index);
+    if (!slot || slot.state === 'empty') return;
+    slot.generation++;
+    slot.el.innerHTML = '';
+    slot.svg = null;
+    slot.state = 'empty';
+  }
+
+  private invalidateAll(): void {
+    for (const index of [...this.slots.keys()]) this.invalidateSlot(index);
+  }
+
+  private emitCrop(done: boolean): void {
+    this.emit({
+      type: 'crop-change',
+      rules: this.cropRules,
+      measured: done ? this.geometry.length : this.cropMeasured,
+      total: this.geometry.length,
+      running: !done,
+    });
+  }
+
   /* ----------------------------------------------------------- navigation */
 
   goToPage(page: number): void {
@@ -500,9 +725,30 @@ export class PdfViewer {
   goToDestination(page: number, y: number | null = null): void {
     if (!this.info) return;
     const index = Math.max(0, Math.min(this.info.pageCount - 1, Math.round(page) - 1));
-    const offset = y === null ? this.layout.offsetOf(index) : this.layout.offsetOfPoint(index, y, this.scale);
+    const offset =
+      y === null ? this.layout.offsetOf(index) : this.layout.offsetOfPoint(index, this.shownY(index, y), this.scale);
     this.scrollToOffset(offset);
     this.update();
+  }
+
+  /**
+   * A point on a page, in the coordinates of the page *as it is shown*.
+   *
+   * Destinations arrive in the document's own coordinates - a link annotation's
+   * target is a point on the uncropped page, and so is a remembered position -
+   * while the layout measures from the top of whatever the reader is actually
+   * looking at. With a crop in force those two differ by the top of the crop,
+   * and a jump that ignored it lands a whole margin too far down the page.
+   */
+  private shownY(index: number, y: number): number {
+    const box = this.cropBoxes[index];
+    return box ? y - box.y : y;
+  }
+
+  /** The inverse: from a point on the shown page back to the document's own. */
+  private documentY(index: number, y: number): number {
+    const box = this.cropBoxes[index];
+    return box ? y + box.y : y;
   }
 
   /* -------------------------------------------------------------- history */
@@ -512,8 +758,11 @@ export class PdfViewer {
     // Measured from the top of the *page area*, not of the window: a host's
     // chrome covers the first `scrollMargin` pixels, and restoring uses the same
     // margin, so the two cancel out and the position comes back exactly.
-    const point = this.layout.pointAt(this.scrollOffset() + this.scrollMargin(), this.scale);
-    return { doc: this.docSeq, page: point.index + 1, y: point.y };
+    const point = this.layout.pointAt(this.readingOffset(), this.scale);
+    // Back into the document's coordinates, so a position remembered under one
+    // crop still means the same point under another.
+    const y = point.y === null ? null : this.documentY(point.index, point.y);
+    return { doc: this.docSeq, page: point.index + 1, y };
   }
 
   /**
@@ -560,6 +809,8 @@ export class PdfViewer {
       responsive: false,
       idPrefix: `p${page - 1}-`,
       className: 'wpdf-page-svg',
+      crop: this.cropRules,
+      cropPadding: this.padding,
     });
     return rendered.svg;
   }
@@ -575,9 +826,20 @@ export class PdfViewer {
     return Number.isFinite(raw) && raw > 0 ? raw : 0;
   }
 
-  /** Offset of the viewport's top edge within the laid-out pages. */
+  /** Offset of the *window's* top edge within the laid-out pages. */
   private scrollOffset(): number {
     return -this.host.getBoundingClientRect().top;
+  }
+
+  /**
+   * Where the reader actually is: the top of the visible page area, which is
+   * `scrollMargin` below the top of the window because the host's chrome covers
+   * that much. Anything that re-lays-out and then puts the reader back has to
+   * measure from here - `scrollOffset` alone is short by the margin, and the
+   * difference accumulates over a layout that changes repeatedly.
+   */
+  private readingOffset(): number {
+    return this.scrollOffset() + this.scrollMargin();
   }
 
   private scrollToOffset(offset: number): void {
@@ -760,6 +1022,8 @@ export class PdfViewer {
       idPrefix: `p${index}-`,
       responsive: true,
       className: 'wpdf-page-svg',
+      crop: this.cropRules,
+      cropPadding: this.padding,
     };
     try {
       DEBUG('render start', index);
@@ -955,10 +1219,13 @@ export class PdfViewer {
 
   destroy(): void {
     this.destroyed = true;
+    this.cropEpoch++;
     if (this.frameRequest) cancelAnimationFrame(this.frameRequest);
     if (this.zoomFrame) cancelAnimationFrame(this.zoomFrame);
+    if (this.cropFrame) cancelAnimationFrame(this.cropFrame);
     this.frameRequest = 0;
     this.zoomFrame = 0;
+    this.cropFrame = 0;
     this.resizeObserver?.disconnect();
     this.resizeObserver = null;
     document.removeEventListener('scroll', this.onScroll, { capture: true });

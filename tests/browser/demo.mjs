@@ -127,12 +127,17 @@ const landed = (page_, y) =>
   page.evaluate(`(() => {
     const sr = document.getElementById('viewer').shadowRoot;
     const box = sr.querySelector('.wpdf-page[data-page="${page_}"]');
-    const scale = window.webpdf.viewer().zoom;
+    const viewer = window.webpdf.viewer();
+    const scale = viewer.zoom;
+    // Destinations are points on the document's own page; a cropped page starts
+    // at the top of its crop, so the two differ by that much.
+    const crop = viewer.cropBox(${page_});
+    const point = crop ? Math.max(0, ${y} - crop.y) : ${y};
     return {
       pageno: document.getElementById('pageno').value,
       scrollY: Math.round(window.scrollY),
       // The destination point, measured in the viewport it was supposed to land in.
-      top: box ? Math.round(box.getBoundingClientRect().top + ${y} * scale) : null,
+      top: box ? Math.round(box.getBoundingClientRect().top + point * scale) : null,
       chrome: document.querySelector('.topbar')?.offsetHeight ?? 0,
       hash: location.hash,
       href: location.href,
@@ -665,6 +670,308 @@ try {
       }
     }
   }
+
+
+  // -------------------------------------------------------------- cropping
+  /**
+   * Cropping changes the size of every page, so it is the one control here that
+   * can move the reader without being asked to. The checks are therefore about
+   * both halves: the pages really are trimmed to their content, and nothing else
+   * about the document changed - not its elements, not the text in it, and not
+   * where the reader was.
+   */
+  console.log('— cropping pages to their content —');
+  await open(document_);
+  await waitForPage(1);
+
+  /** Everything about the crop control and the page in front of the reader. */
+  const cropState = () =>
+    page.evaluate(`(() => {
+      const sr = document.getElementById('viewer').shadowRoot;
+      const host = document.getElementById('viewer');
+      const shown = document.getElementById('pageno').value;
+      const box = sr.querySelector('.wpdf-page[data-page="' + shown + '"]');
+      const svg = box?.querySelector('svg');
+      const items = [...document.querySelectorAll('#crop-list .crop-option')];
+      const search = document.getElementById('search-box');
+      const button = document.getElementById('crop-btn');
+      return {
+        // Where the control lives: the instruction was "after the search".
+        afterSearch: !!(search.compareDocumentPosition(button) & Node.DOCUMENT_POSITION_FOLLOWING),
+        rows: items.map((el) => el.dataset.id),
+        names: items.map((el) => el.querySelector('.crop-name')?.textContent ?? ''),
+        checked: items.filter((el) => el.getAttribute('aria-selected') === 'true').map((el) => el.dataset.id),
+        disabledRows: items.filter((el) => el.getAttribute('aria-disabled') === 'true').map((el) => el.dataset.id),
+        menuOpen: !document.getElementById('crop-menu').hidden,
+        count: document.getElementById('crop-count').textContent,
+        status: document.getElementById('crop-status').textContent,
+        enableAllOff: document.getElementById('crop-all').disabled,
+        disableAllOff: document.getElementById('crop-none').disabled,
+        padding: document.getElementById('crop-padding').value,
+        paddingOff: document.getElementById('crop-padding').disabled,
+        page: shown,
+        scrollY: Math.round(window.scrollY),
+        pageTop: box ? Math.round(box.getBoundingClientRect().top) : null,
+        pageWidth: box ? Math.round(box.offsetWidth) : null,
+        pageHeight: box ? Math.round(box.offsetHeight) : null,
+        viewBox: svg ? svg.getAttribute('viewBox') : null,
+        elements: svg ? svg.querySelectorAll('path,use,image,text,g,rect').length : 0,
+        texts: svg ? svg.querySelectorAll('text').length : 0,
+        docHeight: Math.round(host.offsetHeight),
+      };
+    })()`);
+
+  /**
+   * Text that a crop sliced through: a glyph partly inside the window and
+   * partly out of it. A mark left *outside* the box is the whole point of the
+   * exercise, but a line that is half in and half out means the page lost
+   * something a reader needed. Every glyph is measured through the SVG's own
+   * matrix, so this is the geometry the browser itself uses to draw.
+   */
+  const cutText = () =>
+    page.evaluate(`(() => {
+      const sr = document.getElementById('viewer').shadowRoot;
+      const shown = document.getElementById('pageno').value;
+      const svg = sr.querySelector('.wpdf-page[data-page="' + shown + '"] svg');
+      if (!svg) return null;
+      const [x, y, w, h] = svg.getAttribute('viewBox').split(/\\s+/).map(Number);
+      const toPage = (el, dx, dy) =>
+        new DOMPoint(dx, dy).matrixTransform(el.getScreenCTM()).matrixTransform(svg.getScreenCTM().inverse());
+      const cut = [];
+      for (const el of svg.querySelectorAll('text, use')) {
+        let box;
+        try { box = el.getBBox(); } catch { continue; }
+        if (!box.width && !box.height) continue;
+        const a = toPage(el, box.x, box.y);
+        const b = toPage(el, box.x + box.width, box.y + box.height);
+        const left = Math.min(a.x, b.x), right = Math.max(a.x, b.x);
+        const top = Math.min(a.y, b.y), bottom = Math.max(a.y, b.y);
+        // A text element's box is its *advance* box, and the font the renderer
+        // rebuilt rounds its advances a little differently from MuPDF's own, so
+        // a run can stick out sideways by a fraction of an em without a glyph
+        // being lost. Sideways, half an em is therefore tolerated; vertically,
+        // a run is a line of text and a point of it outside is a sliced line.
+        const em = Number.parseFloat(el.getAttribute('font-size') ?? '10') || 10;
+        const slackX = Math.max(1, em * 0.5);
+        const slackY = 1;
+        const inside = left >= x - slackX && right <= x + w + slackX && top >= y - slackY && bottom <= y + h + slackY;
+        const outside = right < x || bottom < y || left > x + w || top > y + h;
+        if (!inside && !outside) cut.push([(el.textContent ?? '').slice(0, 20), Math.round(top), Math.round(bottom)]);
+      }
+      return { box: [x, y, w, h].map((v) => Math.round(v * 10) / 10), cut: cut.slice(0, 6), cutCount: cut.length };
+    })()`);
+
+  const start = await cropState();
+  console.log('crop control: ' + JSON.stringify({ names: start.names, afterSearch: start.afterSearch }));
+  console.log('before crop : ' + JSON.stringify({ page: start.page, viewBox: start.viewBox, box: [start.pageWidth, start.pageHeight], elements: start.elements }));
+  if (!start.afterSearch) fail('the crop control should sit after the search box');
+  if (start.rows.length < 6) fail(`the crop menu should list the rules, got ${JSON.stringify(start.rows)}`);
+  for (const name of ['arXiv stamp', 'Conference header', 'Page number', 'Section number', 'Chapter heading', 'PRIME AI watermark', 'Running title']) {
+    if (!start.names.includes(name)) fail(`the crop menu is missing the rule named ${JSON.stringify(name)}`);
+  }
+  // Nothing is selected, and nothing has happened to the document.
+  if (start.checked.length) fail(`cropping should start with nothing selected, got ${JSON.stringify(start.checked)}`);
+  if (!/shown whole/.test(start.status)) fail(`the menu should say the pages are untouched, got ${JSON.stringify(start.status)}`);
+  if (!start.disableAllOff || start.enableAllOff) fail('with nothing checked, only "Disable all" should be greyed out');
+  if (!/^0 0 /.test(start.viewBox ?? '')) fail(`an untouched page should keep its own viewBox, got ${start.viewBox}`);
+  // Padding is a margin around a crop, so with no crop there is nothing to pad.
+  if (start.padding !== '0' || !start.paddingOff) {
+    fail(`the padding field should start at 0 and inert, got ${JSON.stringify({ value: start.padding, disabled: start.paddingOff })}`);
+  }
+
+  // Where the reader is, and what is in front of them: the crop has to leave
+  // both alone apart from the page's size.
+  await page.evaluate(`(() => {
+    const input = document.getElementById('pageno');
+    input.value = '3';
+    input.dispatchEvent(new Event('change'));
+  })()`);
+  await waitForPage(3);
+  const here = await cropState();
+
+  console.log('— a rule is checked —');
+  await page.evaluate(() => document.getElementById('crop-btn').click());
+  const opened = await cropState();
+  if (!opened.menuOpen) fail('the crop button should open the dropdown');
+  await page.evaluate(() => document.getElementById('crop-all').click());
+  const all = await waitUntil(
+    `(() => {
+      const status = document.getElementById('crop-status').textContent;
+      return status.startsWith('Cropping') ? false : status;
+    })()`,
+    'the crop to finish measuring',
+    60000,
+  );
+  const cropped = await cropState();
+  console.log('after crop  : ' + JSON.stringify({ status: all, page: cropped.page, viewBox: cropped.viewBox, box: [cropped.pageWidth, cropped.pageHeight], elements: cropped.elements }));
+  console.log('kept in place: ' + JSON.stringify({ was: { page: here.page, top: here.pageTop, scrollY: here.scrollY }, now: { page: cropped.page, top: cropped.pageTop, scrollY: cropped.scrollY } }));
+
+  const [px, py, pw, ph] = (cropped.viewBox ?? '').split(/\s+/).map(Number);
+  if (!cropped.checked.length) fail('"Enable all" checked nothing');
+  if (cropped.count !== String(cropped.checked.length)) fail(`the button should show how many rules are on, got ${JSON.stringify(cropped.count)}`);
+  // A crop is a smaller window onto the page: inside it, and smaller than it.
+  if (!(px > 0 && py >= 0 && pw > 0 && ph > 0)) fail(`the cropped viewBox is not a box: ${cropped.viewBox}`);
+  if (!(px + pw <= 612.001 && py + ph <= 792.001)) fail(`the crop is not inside the page: ${cropped.viewBox}`);
+  if (!(pw < 612 && ph < 792)) fail(`the crop did not trim the page: ${cropped.viewBox}`);
+  if (!(cropped.pageWidth < here.pageWidth && cropped.pageHeight < here.pageHeight)) fail('the page box did not follow the crop');
+  if (!(cropped.docHeight < here.docHeight)) fail('the document is no shorter than before the crop');
+  // Nothing was removed to achieve it: same elements, same text runs.
+  if (cropped.elements !== here.elements) fail(`cropping changed the page's elements (${here.elements} -> ${cropped.elements})`);
+  if (cropped.texts !== here.texts || !cropped.texts) fail(`cropping changed the page's text (${here.texts} -> ${cropped.texts})`);
+  const slicedAll = await cutText();
+  console.log('text sliced by the crop: ' + JSON.stringify(slicedAll));
+  if (slicedAll?.cutCount) fail(`the crop cut through ${slicedAll.cutCount} piece(s) of text: ${JSON.stringify(slicedAll.cut)}`);
+
+  // A link's destination is a point on the *uncropped* page while the layout now
+  // measures from the top of the crop, so a jump that ignored the difference
+  // would land a margin too far down every page.
+  console.log('— a link clicked while the pages are cropped —');
+  await page.evaluate(`(() => {
+    const input = document.getElementById('pageno');
+    input.value = '2';
+    input.dispatchEvent(new Event('change'));
+  })()`);
+  await waitForPage(2);
+  const jumpy = (await linkCandidates('internal')).filter((l) => Number(l.dest) > 0 && Number(l.page) !== 2);
+  if (!jumpy.length) {
+    fail('page 2 of the paper should offer an internal link with a destination');
+  } else {
+    const link = jumpy[0];
+    await mouseClick(link.cx, link.cy);
+    await waitUntil(`document.getElementById('pageno').value === ${JSON.stringify(link.page)}`, `jump to page ${link.page}`);
+    await new Promise((r) => setTimeout(r, 400));
+    const after = await landed(Number(link.page), Number(link.dest));
+    console.log(`cropped jump to page ${link.page} (y=${link.dest}): ` + JSON.stringify({ top: after.top, chrome: after.chrome }));
+    if (after.pageno !== link.page) fail(`the jump should land on page ${link.page}, got ${after.pageno}`);
+    if (after.top === null) fail(`page ${link.page} is not rendered after the jump`);
+    else if (Math.abs(after.top - after.chrome) > 3) {
+      fail(`a cropped destination should still sit just below the bar (${after.chrome}px), it is at ${after.top}px`);
+    }
+    await page.evaluate(() => window.webpdf.viewer().goToPage(3));
+    await waitForPage(3);
+  }
+  // The reader kept their page, and their place on it.
+  if (cropped.page !== here.page) fail(`the reader moved from page ${here.page} to ${cropped.page}`);
+  if (Math.abs(cropped.pageTop - here.pageTop) > 6) fail(`the page moved on screen by ${Math.abs(cropped.pageTop - here.pageTop)}px`);
+  // The bulk buttons say what they can still do.
+  if (!cropped.enableAllOff) fail('"Enable all" should be greyed out once every usable rule is on');
+  if (cropped.disableAllOff) fail('"Disable all" should be live once something is checked');
+
+  // The margin is a control, not a re-measurement: it grows the box the SVG is
+  // given and the pages re-lay-out around the reader.
+  console.log('— a margin around the content —');
+  const setPadding = async (value, expect) => {
+    await page.evaluate(`(() => {
+      const input = document.getElementById('crop-padding');
+      input.value = ${JSON.stringify(String(value))};
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      input.dispatchEvent(new Event('change', { bubbles: true }));
+    })()`);
+    const box = await waitUntil(
+      `(() => {
+        const shown = document.getElementById('pageno').value;
+        const svg = document.getElementById('viewer').shadowRoot.querySelector('.wpdf-page[data-page="' + shown + '"] svg');
+        return svg && svg.getAttribute('viewBox').startsWith(${JSON.stringify(expect)}) ? svg.getAttribute('viewBox') : false;
+      })()`,
+      `the ${value}pt margin to be applied`,
+      60000,
+    );
+    return box;
+  };
+
+  const padded = await setPadding(8, `${(px - 8).toFixed(3)} ${(py - 8).toFixed(3)}`);
+  const withMargin = await cropState();
+  console.log('padded by 8 : ' + JSON.stringify({ viewBox: padded, box: [withMargin.pageWidth, withMargin.pageHeight], status: withMargin.status }));
+  const [qx, qy, qw, qh] = padded.split(/\s+/).map(Number);
+  if (Math.abs(qx - (px - 8)) > 0.01 || Math.abs(qy - (py - 8)) > 0.01) fail(`padding should grow the box on every side, got ${padded} from ${cropped.viewBox}`);
+  if (Math.abs(qw - (pw + 16)) > 0.01 || Math.abs(qh - (ph + 16)) > 0.01) fail(`padding should add 8pt on every side, got ${padded} from ${cropped.viewBox}`);
+  if (!(withMargin.pageWidth > cropped.pageWidth && withMargin.pageHeight > cropped.pageHeight)) fail('the page box did not follow the margin');
+  if (withMargin.elements !== cropped.elements || withMargin.texts !== cropped.texts) fail('padding changed what is in the page');
+  if (withMargin.page !== cropped.page || Math.abs(withMargin.pageTop - cropped.pageTop) > 6) fail('padding moved the reader');
+  if (!/\+8 pt/.test(withMargin.status)) fail(`the menu should say what the margin is, got ${JSON.stringify(withMargin.status)}`);
+  // And back to nothing at all, exactly where it started.
+  const unpadded = await setPadding(0, cropped.viewBox);
+  if (unpadded !== cropped.viewBox) fail(`a margin of 0 should be the crop itself (${cropped.viewBox} -> ${unpadded})`);
+
+  console.log('— one rule off, then all of them —');
+  await page.evaluate(() => document.querySelector('#crop-list .crop-option[data-id="page-number"]').click());
+  const one = await waitUntil(
+    `(() => {
+      const status = document.getElementById('crop-status').textContent;
+      const svg = document.getElementById('viewer').shadowRoot.querySelector('svg.wpdf-page-svg');
+      return status.startsWith('Cropping') ? false : svg?.getAttribute('viewBox') ?? false;
+    })()`,
+    'the second measurement to finish',
+    60000,
+  );
+  const single = await cropState();
+  console.log('one rule off: ' + JSON.stringify({ viewBox: one, checked: single.checked.length }));
+  if (single.checked.includes('page-number')) fail('clicking a checked rule should uncheck it');
+  if (single.enableAllOff) fail('"Enable all" should be live again once a rule is off');
+  if (one === cropped.viewBox) fail('removing a rule should change the box it produced');
+
+  await page.evaluate(() => document.getElementById('crop-none').click());
+  const back = await waitUntil(
+    `(() => {
+      const shown = document.getElementById('pageno').value;
+      const svg = document.getElementById('viewer').shadowRoot.querySelector('.wpdf-page[data-page="' + shown + '"] svg');
+      const viewBox = svg?.getAttribute('viewBox') ?? '';
+      return viewBox.startsWith('0 0 ') && svg.querySelectorAll('text').length > 0 ? viewBox : false;
+    })()`,
+    'the pages to come back',
+    60000,
+  );
+  const restored = await cropState();
+  console.log('disable all : ' + JSON.stringify({ viewBox: back, box: [restored.pageWidth, restored.pageHeight], elements: restored.elements }));
+  if (restored.checked.length) fail('"Disable all" left rules checked');
+  if (back !== here.viewBox) fail(`disabling every rule should restore the page exactly (${here.viewBox} -> ${back})`);
+  if (restored.pageWidth !== here.pageWidth || restored.pageHeight !== here.pageHeight) fail('the page box did not come back');
+  if (restored.docHeight !== here.docHeight) fail(`the document height did not come back (${here.docHeight} -> ${restored.docHeight})`);
+
+  // The reported failure, exactly as it was reported: the page-number rule on
+  // its own, on page 5 of this paper, cut the foot off the text. A rule that
+  // removes a mark must remove the mark and nothing else.
+  console.log('— the page-number rule on its own —');
+  await page.evaluate(`(() => {
+    const input = document.getElementById('pageno');
+    input.value = '5';
+    input.dispatchEvent(new Event('change'));
+  })()`);
+  await waitForPage(5);
+  await page.evaluate(() => document.querySelector('#crop-list .crop-option[data-id="page-number"]').click());
+  await waitUntil(
+    `(() => {
+      const shown = document.getElementById('pageno').value;
+      const svg = document.getElementById('viewer').shadowRoot.querySelector('.wpdf-page[data-page="' + shown + '"] svg');
+      return document.getElementById('crop-status').textContent.startsWith('Cropping')
+        ? false
+        : !!svg && svg.getAttribute('viewBox').startsWith('0 0 ') === false;
+    })()`,
+    'the page-number crop',
+    60000,
+  );
+  const numbered = await cropState();
+  const sliced = await cutText();
+  console.log('page-number only: ' + JSON.stringify({ page: numbered.page, viewBox: numbered.viewBox, sliced }));
+  if (numbered.page !== '5') fail(`expected to be on page 5, got ${numbered.page}`);
+  if (sliced?.cutCount) fail(`the crop cut through ${sliced.cutCount} piece(s) of text: ${JSON.stringify(sliced.cut)}`);
+
+  await page.evaluate(() => document.getElementById('crop-none').click());
+  await waitUntil(
+    `(() => {
+      const shown = document.getElementById('pageno').value;
+      const svg = document.getElementById('viewer').shadowRoot.querySelector('.wpdf-page[data-page="' + shown + '"] svg');
+      return !!svg && (svg.getAttribute('viewBox') ?? '').startsWith('0 0 ');
+    })()`,
+    'the page to come back',
+    60000,
+  );
+  // Leave the dropdown as it was found, whatever left it open in between (a
+  // click on a page closes it, and the toggle would then open it again).
+  await page.evaluate(`(() => {
+    if (!document.getElementById('crop-menu').hidden) document.getElementById('crop-btn').click();
+  })()`);
+  await new Promise((r) => setTimeout(r, 200));
 
   // ------------------------------------------------------- the public example
   // The shipped page has no documents of its own, so this is the path a reader

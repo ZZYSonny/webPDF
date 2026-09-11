@@ -148,6 +148,14 @@ body {
   border-color: var(--accent-dim);
 }
 
+/* "Enable all" with everything already checked has nothing to offer. */
+.btn:disabled,
+.btn:disabled:hover {
+  opacity: 0.4;
+  background: #1e222b;
+  cursor: default;
+}
+
 .btn.icon {
   padding: 5px 9px;
   font-size: 15px;
@@ -350,6 +358,185 @@ select.btn {
   font-size: 11.5px;
   color: var(--text-muted);
   white-space: nowrap;
+}
+
+/* ----------------------------------------------------------------- crop */
+
+/**
+ * A dropdown like the zoom menu, but its rows are toggles rather than a choice,
+ * so each one carries a check box and a line saying what it removes.
+ */
+.crop-field {
+  position: relative;
+  display: flex;
+  align-items: center;
+}
+
+.crop-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.crop-btn::after {
+  content: '▾';
+  font-size: 9px;
+  color: var(--text-muted);
+}
+
+.crop-count {
+  font-size: 10px;
+  color: var(--accent);
+}
+
+.crop-menu {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  z-index: 30;
+  width: 330px;
+  max-height: min(70vh, 420px);
+  overflow: auto;
+  padding: 6px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.5);
+}
+
+.crop-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 2px 4px 7px;
+  border-bottom: 1px solid var(--border);
+}
+
+.crop-status {
+  flex: 1;
+  min-width: 0;
+  font-size: 11.5px;
+  color: var(--text-muted);
+}
+
+.crop-actions {
+  display: flex;
+  gap: 5px;
+  flex: none;
+}
+
+.crop-pad {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 8px 6px;
+  border-bottom: 1px solid var(--border);
+}
+
+.crop-pad-label {
+  font-size: 12.5px;
+  color: var(--text);
+}
+
+.crop-pad-input {
+  width: 52px;
+  background: var(--bg-sunken);
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: var(--radius);
+  padding: 3px 6px;
+  font: inherit;
+  font-size: 12px;
+  text-align: right;
+}
+
+.crop-pad-input:focus {
+  outline: 2px solid var(--accent);
+  outline-offset: -1px;
+}
+
+.crop-pad-input:disabled {
+  opacity: 0.45;
+}
+
+.crop-pad-unit {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.crop-pad-hint {
+  flex: 1;
+  min-width: 0;
+  text-align: right;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.crop-option {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  width: 100%;
+  text-align: left;
+  border: 0;
+  background: none;
+  color: var(--text);
+  font: inherit;
+  padding: 6px 8px;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.crop-option.active {
+  background: #262b36;
+}
+
+.crop-option.disabled {
+  opacity: 0.5;
+}
+
+.crop-check {
+  flex: none;
+  width: 14px;
+  height: 14px;
+  margin-top: 1px;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  background: var(--bg-sunken);
+  color: #fff;
+  font-size: 11px;
+  line-height: 13px;
+  text-align: center;
+}
+
+.crop-option[aria-selected='true'] .crop-check {
+  background: var(--accent-dim);
+  border-color: #3a6bc4;
+}
+
+.crop-option[aria-selected='true'] .crop-check::after {
+  content: '✓';
+}
+
+.crop-text {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.crop-name {
+  font-size: 12.5px;
+}
+
+.crop-option[aria-selected='true'] .crop-name {
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.crop-hint {
+  font-size: 11px;
+  color: var(--text-muted);
+  white-space: normal;
 }
 
 /* ------------------------------------------------------------ layout */

@@ -84,10 +84,53 @@
             <button id="search-next" class="btn tiny" type="button" title="Next match (Enter)" hidden>↓</button>
           </div>
         </div>
+        <div class="group" id="crop-group" hidden>
+          <!--
+            Cropping is off until a rule is checked: nothing about a document
+            changes on its own (see demo/crop.ts).
+          -->
+          <div class="crop-field">
+            <button
+              id="crop-btn"
+              class="btn crop-btn"
+              type="button"
+              aria-haspopup="listbox"
+              aria-expanded="false"
+              aria-controls="crop-menu"
+            >
+              Crop<span id="crop-count" class="crop-count mono"></span>
+            </button>
+            <div id="crop-menu" class="crop-menu" hidden>
+              <div class="crop-head">
+                <span id="crop-status" class="crop-status">Nothing checked — pages are shown whole.</span>
+                <span class="crop-actions">
+                  <button id="crop-all" class="btn tiny" type="button" title="Check every rule — what PaperCutter does">Enable all</button>
+                  <button id="crop-none" class="btn tiny" type="button" title="Uncheck every rule — show the pages as they are">Disable all</button>
+                </span>
+              </div>
+              <div class="crop-pad">
+                <label class="crop-pad-label" for="crop-padding">Padding</label>
+                <input
+                  id="crop-padding"
+                  class="crop-pad-input mono"
+                  type="number"
+                  min="0"
+                  max="144"
+                  step="1"
+                  value="0"
+                  inputmode="numeric"
+                  title="Page units (1/72 inch) kept around the content on every side — 0 crops exactly to it, as PaperCutter does"
+                />
+                <span class="crop-pad-unit" aria-hidden="true">pt</span>
+                <span class="crop-pad-hint">kept around the content</span>
+              </div>
+              <div id="crop-list" class="crop-list" role="listbox" aria-multiselectable="true" aria-label="Crop rules"></div>
+            </div>
+          </div>
+        </div>
         <span id="stats" class="perf mono" title="Time the last page render took"></span>
       </div>
     </header>
-
     <main class="layout">
       <aside id="toc" class="toc" hidden>
         <div class="toc-head">

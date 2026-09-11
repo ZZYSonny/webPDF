@@ -21,6 +21,7 @@ import {
   type EngineOptions,
 } from './core/engine.ts';
 import { DEFAULT_ZOOM_STEPS, PdfViewer, type PdfViewerOptions, type ViewerEvent } from './viewer/viewer.ts';
+import type { CropRuleId } from './core/crop.ts';
 import { createWorkerEngine } from './worker/client.ts';
 
 export interface CreateViewerOptions extends Omit<PdfViewerOptions, 'container' | 'engine'> {
@@ -72,6 +73,12 @@ export interface RenderDocumentOptions extends EngineOptions {
   embedFonts?: boolean;
   /** Add a clickable hit area for every link annotation. Default true. */
   links?: boolean;
+  /**
+   * Crop each page to its content, minus the marks these rules name - the
+   * batch-export half of `PdfViewer.setCrop`, for building a trimmed set of
+   * SVGs without a viewer.
+   */
+  crop?: readonly CropRuleId[] | null;
   onPage?: (page: RenderedPage, index: number) => void | Promise<void>;
   signal?: AbortSignal;
 }
@@ -100,6 +107,7 @@ export async function* renderDocument(
         links: opts.links ?? true,
         responsive: false,
         idPrefix: `p${i}-`,
+        crop: opts.crop,
       });
       await opts.onPage?.(page, i);
       yield page;
@@ -114,6 +122,8 @@ export { PdfEngine, PdfViewer, DEFAULT_ZOOM_STEPS };
 export { WorkerEngine, createWorkerEngine } from './worker/client.ts';
 export { DocumentNotOpenError, PasswordRequiredError } from './core/engine.ts';
 export type { PdfEngineLike, RenderOptions, RenderStats, OutlineNode, PageGeometry, TextMode } from './core/engine.ts';
+export { CROP_RULES, MIN_DRAWING_HEIGHT, contentBox, cropRule, cropViewBox, normaliseRules } from './core/crop.ts';
+export type { CropRect, CropRule, CropRuleId, CropSpan } from './core/crop.ts';
 export { isOpenableUri } from './core/links.ts';
 export type { PageLink, InternalLink, ExternalLink, LinkRect, LinkTarget } from './core/links.ts';
 export type { PdfViewerOptions };

@@ -20,6 +20,8 @@ import {
   type ViewerEvent,
 } from '../src/index.ts';
 import { createSearch, type SearchController, type SearchState } from './search.ts';
+import { createCropMenu, type CropMenu } from './crop.ts';
+import { scrollIntoPanel } from './panels.ts';
 import { defaultExample, exampleDocuments, type Example } from './examples.ts';
 import { isCurrentLevel, parseZoomInput, zoomLevels, zoomPercent, type ZoomLevel, type ZoomOption } from './zoom.ts';
 
@@ -60,6 +62,15 @@ const els = {
   searchCount: $('search-count'),
   searchPrev: $<HTMLButtonElement>('search-prev'),
   searchNext: $<HTMLButtonElement>('search-next'),
+  cropGroup: $('crop-group'),
+  cropBtn: $<HTMLButtonElement>('crop-btn'),
+  cropCount: $('crop-count'),
+  cropMenu: $('crop-menu'),
+  cropStatus: $('crop-status'),
+  cropList: $('crop-list'),
+  cropAll: $<HTMLButtonElement>('crop-all'),
+  cropNone: $<HTMLButtonElement>('crop-none'),
+  cropPadding: $<HTMLInputElement>('crop-padding'),
   stats: $('stats'),
   viewer: $('viewer'),
   empty: $('empty'),
@@ -71,6 +82,7 @@ const els = {
 
 let viewer: PdfViewer | null = null;
 let search: SearchController | null = null;
+let crop: CropMenu | null = null;
 let info: DocumentInfo | null = null;
 let currentPage = 1;
 let busy = 0;
@@ -160,6 +172,9 @@ function onViewerEvent(event: ViewerEvent): void {
       els.navGroup.hidden = false;
       els.zoomGroup.hidden = false;
       els.searchGroup.hidden = false;
+      els.cropGroup.hidden = false;
+      // The title rule is only usable on a document that declares a title.
+      if (viewer) ensureCropMenu(viewer).setDocument(event.info.title);
       els.pagecount.textContent = String(event.info.pageCount);
       els.pageno.value = '1';
       // A new document starts on page one, whatever page the last one was left
@@ -196,6 +211,10 @@ function onViewerEvent(event: ViewerEvent): void {
       // document and can pan the visual viewport over it, so anything left open
       // is gone from view but still live - see `dismissChrome`.
       if (event.zoomed) dismissChrome();
+      break;
+    case 'crop-change':
+      // Nothing to do but say so: the viewer has already re-laid-out the pages.
+      crop?.setProgress({ measured: event.measured, total: event.total, running: event.running });
       break;
     case 'render':
       // Only the cost: everything else about a render is a debugging detail.
@@ -314,36 +333,34 @@ function moveZoomMenu(delta: number): void {
   if (chosen) scrollIntoPanel(chosen, els.zoomMenu);
 }
 
+/* ------------------------------------------------------------------ crop */
+
+/**
+ * The crop dropdown: rules in, a selection out. Applying it is one call - the
+ * viewer measures the pages and re-lays them out as the boxes arrive - and the
+ * progress it reports back is what the panel's status line shows.
+ */
+function ensureCropMenu(v: PdfViewer): CropMenu {
+  if (crop) return crop;
+  crop = createCropMenu({
+    button: els.cropBtn,
+    menu: els.cropMenu,
+    list: els.cropList,
+    status: els.cropStatus,
+    count: els.cropCount,
+    allButton: els.cropAll,
+    noneButton: els.cropNone,
+    padding: els.cropPadding,
+    onChange: (rules, padding) => v.setCrop(rules, padding),
+  });
+  return crop;
+}
+
 /* ---------------------------------------------------------------- panels */
 
 /**
- * Bring an element into view *inside the panel that scrolls it*, and nowhere
- * else. The behaviour is `block: 'nearest'`, the only mode either caller wants.
- *
- * `Element.scrollIntoView` walks the entire ancestor chain and ends at the
- * document viewport, which is wrong twice over here: the outline is
- * `position: fixed` and the zoom list sits in the sticky bar, so as soon as the
- * browser is magnified and the visual viewport is panned over the page, both
- * count as off screen. Scrolling past a page then made the browser drag the
- * magnified view sideways to "reveal" a panel the reader could not even see -
- * the browser test measures a 657 px jump of the view the moment the current
- * page changes. The panel is scrolled by hand instead, and the document stays
- * exactly where the reader put it.
- */
-function scrollIntoPanel(el: HTMLElement, panel: HTMLElement): void {
-  const item = el.getBoundingClientRect();
-  const box = panel.getBoundingClientRect();
-  // A scrollport is the padding box, which is what `block: 'nearest'` measures
-  // against: `clientTop` is the border, `clientHeight` the padding box height.
-  const top = box.top + panel.clientTop;
-  const bottom = top + panel.clientHeight;
-  if (item.top < top) panel.scrollTop -= top - item.top;
-  else if (item.bottom > bottom) panel.scrollTop += item.bottom - bottom;
-}
-
-/**
  * Close everything that was opened over the pages - the outline, the zoom
- * dropdown - and take focus out of it.
+ * dropdown, the crop rules - and take focus out of it.
  *
  * Zoom is the reason this exists rather than an accident of the toggle: a pinch
  * is the browser's page scale, and chrome drawn next to the pages is magnified
@@ -357,9 +374,10 @@ function scrollIntoPanel(el: HTMLElement, panel: HTMLElement): void {
 function dismissChrome(): void {
   const active = document.activeElement;
   const focused = active instanceof HTMLElement && (topbar?.contains(active) === true || els.toc.contains(active));
-  if (els.toc.hidden && els.zoomMenu.hidden && !focused) return;
+  if (els.toc.hidden && els.zoomMenu.hidden && els.cropMenu.hidden && !focused) return;
   if (!els.toc.hidden) setOutline(false);
   if (!els.zoomMenu.hidden) closeZoomMenu();
+  if (!els.cropMenu.hidden) crop?.close();
   // Focus left in a control that the zoom has made invisible would swallow
   // keystrokes. The viewer's link hit areas are not chrome, and keep theirs.
   if (focused) active.blur();
@@ -567,12 +585,15 @@ els.zoomMenuBtn.addEventListener('click', () => {
 });
 // A click anywhere else, or a resize that would move the anchor, closes the list.
 document.addEventListener('pointerdown', (event) => {
-  if (!els.zoomMenu.hidden && !(event.target as Element | null)?.closest?.('.zoom-field')) closeZoomMenu();
+  const target = event.target as Element | null;
+  if (!els.zoomMenu.hidden && !target?.closest?.('.zoom-field')) closeZoomMenu();
+  if (!els.cropMenu.hidden && !target?.closest?.('.crop-field')) crop?.close();
 });
 // A resize moves the fit levels; if the current level is a factor, no zoom event
 // fires, so ask for the rebuild directly.
 window.addEventListener('resize', () => {
   closeZoomMenu();
+  crop?.close();
   refreshZoomMenu();
 });
 
@@ -596,6 +617,8 @@ els.search.addEventListener('keydown', (event) => {
 });
 els.searchNext.addEventListener('click', () => search?.step(1));
 els.searchPrev.addEventListener('click', () => search?.step(-1));
+
+els.cropBtn.addEventListener('click', () => crop?.toggle());
 
 els.tocToggle.addEventListener('click', () => setOutline(els.toc.hidden));
 els.tocClose.addEventListener('click', () => setOutline(false));
