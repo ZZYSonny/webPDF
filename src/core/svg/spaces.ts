@@ -34,6 +34,15 @@ export interface TextChar {
 }
 
 /**
+ * How far apart two points that are meant to be the same one may be.
+ *
+ * A twentieth of a point: far below any glyph, far above float noise. Both
+ * places that line the text device's characters up with the SVG's glyphs - the
+ * spaces and the ligatures - measure with it, and they have to agree.
+ */
+export const ANCHOR_EPSILON = 0.05;
+
+/**
  * A space, and where to write it: the origin of the character it precedes.
  *
  * That is the point a space ends at, so it is the position that keeps the

@@ -28,7 +28,7 @@
  */
 
 import type { GlyphPlacement, Attribute } from './glyphs.ts';
-import type { SpaceMark } from './spaces.ts';
+import { ANCHOR_EPSILON, type SpaceMark } from './spaces.ts';
 import { BIONIC_DIM, bionicSegments } from './bionic.ts';
 
 export interface GlyphEncoding {
@@ -135,6 +135,12 @@ interface Run {
   source: string;
 }
 
+/** A glyph that will be written as text: the font to use, and its character. */
+interface ReadyGlyph {
+  family: string;
+  code: number;
+}
+
 interface RunItem {
   x: number;
   y: number;
@@ -153,9 +159,6 @@ function hasStroke(attrs: readonly Attribute[]): boolean {
   return false;
 }
 
-/** A twentieth of a point: far below any glyph, far above float noise. */
-const ANCHOR_EPSILON = 0.05;
-
 /**
  * Which glyph each space goes in front of.
  *
@@ -165,13 +168,23 @@ const ANCHOR_EPSILON = 0.05;
  * because a page has thousands of them and a document has thousands of spaces,
  * and comparing every pair would be the only slow part of a page render.
  *
- * Two kinds of mark are dropped. A space the page draws itself - some fonts do
- * give one an outline - is already in the SVG as a glyph, and writing the
- * character a second time would double it. A space whose next character is not
- * in the SVG at all (it stayed an outline, or it is trailing whitespace with
- * nothing after it) has nothing to sit in front of.
+ * A space the page draws itself - some fonts do give one an outline - is already
+ * in the SVG as a glyph, and writing the character a second time would double
+ * it. That holds as long as the glyph becomes text: a drawn space that stays an
+ * outline has no character anywhere, so its mark is kept and written in front of
+ * the next glyph like any other. (This is not hypothetical: a figure set in Type
+ * 3 fonts draws its spaces with a glyph that has no outline to rebuild, and the
+ * words of its labels would otherwise arrive glued together.)
+ *
+ * A space whose next character is not in the SVG at all (it stayed an outline,
+ * or it is trailing whitespace with nothing after it) has nothing to sit in
+ * front of, and is dropped.
  */
-function anchorSpaces(placements: readonly GlyphPlacement[], marks: readonly SpaceMark[]): Map<number, SpaceMark[]> {
+function anchorSpaces(
+  placements: readonly GlyphPlacement[],
+  marks: readonly SpaceMark[],
+  ready: ReadonlyArray<ReadyGlyph | null>,
+): Map<number, SpaceMark[]> {
   const out = new Map<number, SpaceMark[]>();
   if (marks.length === 0) return out;
 
@@ -202,7 +215,10 @@ function anchorSpaces(placements: readonly GlyphPlacement[], marks: readonly Spa
   };
 
   for (const mark of marks) {
-    if (mark.kind === 'space' && at(mark.originX, mark.originY) >= 0) continue;
+    if (mark.kind === 'space') {
+      const drawn = at(mark.originX, mark.originY);
+      if (drawn >= 0 && ready[drawn] !== null) continue;
+    }
     const index = at(mark.x, mark.y);
     if (index < 0) continue;
     const bucket = out.get(index);
@@ -261,7 +277,20 @@ export function upgradeGlyphsToText(
   const simpleOnly = opts.simpleTextOnly ?? true;
   const precise = opts.preciseTextRendering ?? true;
   const bionic = opts.bionic ?? false;
-  const spaces = anchorSpaces(placements, opts.spaces ?? []);
+
+  // What each placement is going to become, decided before anything is written
+  // because the spaces depend on it: a space the page drew is already text only
+  // if the glyph it drew it with becomes text too.
+  const ready: Array<ReadyGlyph | null> = placements.map((p): ReadyGlyph | null => {
+    if (hasStroke(p.attrs)) return null;
+    const family = enc.familyFor(p.fontId);
+    if (!family) return null;
+    const code = enc.codeFor(p.fontId, p.gid);
+    if (code === null || code <= 0) return null;
+    if (simpleOnly && !isSimpleCode(code)) return null;
+    return { family, code };
+  });
+  const spaces = anchorSpaces(placements, opts.spaces ?? [], ready);
 
   const stats: UpgradeStats = { runs: 0, converted: 0, kept: 0, spaces: 0 };
   const pieces: string[] = [];
@@ -331,13 +360,11 @@ export function upgradeGlyphsToText(
   };
 
   for (const [index, p] of placements.entries()) {
-    const family = enc.familyFor(p.fontId);
-    const code = family && !hasStroke(p.attrs) ? enc.codeFor(p.fontId, p.gid) : null;
-    const ok = code !== null && code > 0 && (!simpleOnly || isSimpleCode(code));
+    const planned = ready[index];
     // The spaces whose next character became this glyph.
     const marks = spaces.get(index);
 
-    if (!ok) {
+    if (!planned) {
       // This glyph stays an outline, so there is no text to put its spaces in
       // front of; the run that just ended is the same point in the reading
       // order, and putting them there keeps the offset a space is anchored by.
@@ -350,14 +377,14 @@ export function upgradeGlyphsToText(
       continue;
     }
 
-    const cv = code as number;
-    if (!canExtend(p, family as string, cv)) {
+    const { family, code: cv } = planned;
+    if (!canExtend(p, family, cv)) {
       flush();
       pieces.push(svg.slice(cursor, p.start));
       cursor = p.start;
       run = {
         fontId: p.fontId,
-        family: family as string,
+        family,
         matrix: { a: p.matrix.a, b: p.matrix.b, c: p.matrix.c, d: p.matrix.d },
         attrs: serializeAttrs(p.attrs),
         items: [],

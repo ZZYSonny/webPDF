@@ -190,8 +190,25 @@ test('a space in front of a glyph that stays an outline joins the run before it'
   const placements = scanGlyphPlacements(two);
   // 'h', a space, the unreachable glyph, then 'w' - so the space points at the
   // glyph that stays an outline.
-  const spaces = spaceMarks(chars(['h', 0, 0, 0], [' ', 5, 0, 0], ['\u0009', 8, 0, 0], ['w', 13, 0, 0]));
+  const spaces = spaceMarks(chars(['h', 0, 0, 0], [' ', 5, 0, 0], ['x', 8, 0, 0], ['w', 13, 0, 0]));
   const result = upgradeGlyphsToText(two, placements, enc, { spaces });
+  assert.equal(textOf(result.svg), 'h w');
+  assert.equal(result.stats.spaces, 1);
+  assert.equal(result.stats.kept, 1);
+});
+
+test('a space the page drew with a glyph that stays an outline is still written', () => {
+  // A figure set in Type 3 fonts draws its spaces with a glyph that has no
+  // outline to rebuild, so the character is nowhere in the SVG: the mark has to
+  // be written, or the words of the figure come out joined.
+  const figure = page([
+    { gid: 1, code: 0x68, x: 0, y: 0 },
+    { gid: 40, code: 0x20, x: 8, y: 0 },
+    { gid: 5, code: 0x77, x: 13, y: 0 },
+  ]);
+  const placements = scanGlyphPlacements(figure);
+  const spaces = spaceMarks(chars(['h', 0, 0, 0], [' ', 8, 0, 0], ['w', 13, 0, 0]));
+  const result = upgradeGlyphsToText(figure, placements, enc, { spaces });
   assert.equal(textOf(result.svg), 'h w');
   assert.equal(result.stats.spaces, 1);
   assert.equal(result.stats.kept, 1);
@@ -310,25 +327,15 @@ function pageLines(doc: mupdf.Document, index: number): string[] {
   return lines;
 }
 
-const words = (text: string): string[] => text.normalize('NFKC').split(/\s+/).filter(Boolean);
-
 /**
- * A word from the SVG as a pattern for the word the text device read.
+ * The words of a piece of text, with the ligatures spelled out.
  *
- * A private-use character is how a font encodes a ligature: the glyph is one
- * glyph - "fi" - and MuPDF's cmap gives it a code of its own, which is why the
- * SVG can read "efficient" where the device read "efficient". The ligature
- * stands for the letters it was made from, so it is allowed to match one or two
- * of them; every other character has to match exactly.
+ * NFKC is what spells them: a font's one glyph for "fi" is the Unicode
+ * character for that ligature in the SVG (`svg/ligatures.ts`), and normalising
+ * puts the letters back - so the comparison here is exact, character for
+ * character, in both directions.
  */
-function wordPattern(word: string): RegExp {
-  let out = '^';
-  for (const char of word) {
-    const code = char.codePointAt(0) ?? 0;
-    out += code >= 0xe000 && code <= 0xf8ff ? '..?' : char.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  }
-  return new RegExp(out + '$');
-}
+const words = (text: string): string[] => text.normalize('NFKC').split(/\s+/).filter(Boolean);
 
 test('a real page: the SVG words are the page words', { skip: bytes ? false : 'no cached paper' }, async () => {
   assert.ok(bytes);
@@ -346,16 +353,13 @@ test('a real page: the SVG words are the page words', { skip: bytes ? false : 'n
     assert.ok(/\bthe\b/.test(text), 'the words are words');
     assert.ok(!/[a-z]{25}/.test(text), 'nothing is a 25-letter word');
 
-    // And they are the page's words - all of them, in order, allowing for the
-    // ligatures a font draws as a single glyph.
+    // And they are the page's words - all of them, in order. The glyphs the
+    // font drew for two letters at once come out as the ligature character,
+    // which NFKC spells back into the letters the page read.
     const doc = mupdf.Document.openDocument(bytes, 'application/pdf');
     const reference = words(pageLines(doc, index).join(' '));
     doc.destroy();
-    const got = words(text);
-    assert.equal(got.length, reference.length, 'word count');
-    for (let i = 0; i < reference.length; i++) {
-      assert.match(reference[i], wordPattern(got[i]), `word ${i}`);
-    }
+    assert.deepEqual(words(text), reference);
   } finally {
     engine.close();
   }

@@ -22,6 +22,11 @@ export interface Attribute {
   value: string;
 }
 
+/** A glyph's name across the modules: its font on the page, and its id in it. */
+export function glyphKey(fontId: number, gid: number): string {
+  return `${fontId}:${gid}`;
+}
+
 /** A `<path id="font_N_gid" d="...">` or `<g id="font_N_gid">` inside `<defs>`. */
 export interface GlyphOutline {
   fontId: number;
@@ -125,7 +130,7 @@ export function scanGlyphOutlines(svg: string): Map<string, GlyphOutline> {
   while ((m = RE_DEF_PATH.exec(svg))) {
     const fontId = Number(m[1]);
     const gid = Number(m[2]);
-    out.set(`${fontId}:${gid}`, {
+    out.set(glyphKey(fontId, gid), {
       fontId,
       gid,
       d: unescapeAttr(m[3]),
@@ -141,7 +146,7 @@ export function scanGlyphOutlines(svg: string): Map<string, GlyphOutline> {
   while ((m = RE_DEF_GROUP.exec(svg))) {
     const fontId = Number(m[1]);
     const gid = Number(m[2]);
-    const key = `${fontId}:${gid}`;
+    const key = glyphKey(fontId, gid);
     if (!out.has(key)) {
       out.set(key, { fontId, gid, d: null, raw: m[0], start: m.index, end: m.index + m[0].length });
     }

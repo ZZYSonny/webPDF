@@ -27,6 +27,7 @@ import {
   type CropSpan,
 } from './crop.ts';
 import { spaceMarks, type SpaceMark, type TextChar } from './svg/spaces.ts';
+import { glyphLetters } from './svg/ligatures.ts';
 
 export type PdfSource =
   | ArrayBuffer
@@ -280,16 +281,18 @@ function readSpans(page: mupdf.Page): CropSpan[] {
 }
 
 /**
- * Every space the text device read, and the character it sits in front of.
+ * Everything the text device has to say about a page, on one walk of it.
  *
- * The SVG the outline device produces has no spaces in it: a space has no
- * outline, so there is nothing to draw and nothing to reference. They are read
- * here, from the same page, and written back into the text (`svg/spaces.ts`) -
- * which is what turns "linearattention" back into two words, for a reader
- * copying it and for anything that has to find word boundaries. Text only: the
- * vectors and images a crop rule wants are asked for by `readSpans`.
+ * The SVG the outline device produces has no spaces in it - a space has no
+ * outline, so there is nothing to draw and nothing to reference - and it names a
+ * ligature by its first letter only. Both are read here, from the same page, and
+ * both are written back into the text: the spaces (`svg/spaces.ts`) turn
+ * "linearattention" into two words for a reader copying it and a word-level tool
+ * finding them, and the ligatures (`svg/ligatures.ts`) say what the one glyph a
+ * typesetter drew for two letters actually stands for. Text only: the vectors
+ * and images a crop rule wants are asked for by `readSpans`.
  */
-function readSpaces(page: mupdf.Page): SpaceMark[] {
+function readText(page: mupdf.Page): { chars: TextChar[]; spaces: SpaceMark[] } {
   const chars: TextChar[] = [];
   let line = 0;
   // No options: this walk wants the characters and their origins, and asking
@@ -306,7 +309,7 @@ function readSpaces(page: mupdf.Page): SpaceMark[] {
   } finally {
     stext.destroy();
   }
-  return spaceMarks(chars);
+  return { chars, spaces: spaceMarks(chars) };
 }
 
 /** The box a rectangle in one space occupies in another, corners and all. */
@@ -606,7 +609,10 @@ export class PdfEngine implements PdfEngineLike {
 
       if (placements.length > 0) {
         debug('renderPage: plan fonts', placements.length, 'placements', outlines.size, 'outlines');
-        const plan = await this.registry.planPage(outlines, placements);
+        const text = readText(page);
+        const plan = await this.registry.planPage(outlines, placements, {
+          letters: glyphLetters(text.chars, placements),
+        });
         debug('renderPage: planned', plan.fonts.size, 'fonts');
         stats.fontsBuilt = plan.built;
         stats.fontsReused = plan.reused;
@@ -617,7 +623,7 @@ export class PdfEngine implements PdfEngineLike {
             familyFor: (fontId) => plan.fonts.get(fontId)?.family ?? null,
             codeFor: (fontId, gid) => plan.fonts.get(fontId)?.codes.get(gid) ?? null,
           },
-          { spaces: readSpaces(page), bionic: opts.bionic },
+          { spaces: text.spaces, bionic: opts.bionic },
         );
         svg = upgraded.svg;
         debug('renderPage: upgraded', upgraded.stats);

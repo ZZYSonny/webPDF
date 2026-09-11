@@ -5,13 +5,17 @@
  * drawn, mint a cmap that maps those glyphs to the code points we are going to
  * write into the SVG, and compile a subset TrueType font. Where a glyph has a
  * real Unicode value (MuPDF records it as `data-text`) we use it, so text stays
- * selectable and searchable; otherwise we use a Private Use Area code point,
- * which keeps every glyph reachable without inventing a meaning.
+ * selectable and searchable; where it stands for several letters at once - a
+ * ligature - we use the Unicode character for that ligature, which the caller
+ * has read off the page (`svg/ligatures.ts`); otherwise we use a Private Use
+ * Area code point, which keeps every glyph reachable without inventing a
+ * meaning.
  */
 
 import { buildFontFromOutlines, PUA_BASE, PUA_LIMIT, type OutlineGlyph } from './build.ts';
 import { encodeWoff } from './woff.ts';
-import type { GlyphOutline, GlyphPlacement } from '../svg/glyphs.ts';
+import { glyphKey, type GlyphOutline, type GlyphPlacement } from '../svg/glyphs.ts';
+import { ligatureCode } from '../svg/ligatures.ts';
 import { debug } from '../debug.ts';
 
 export interface FontAsset {
@@ -103,10 +107,14 @@ export class FontRegistry {
    *
    * `outlines` is the full glyph definition table for the page; placements tell
    * us which glyphs are actually drawn and which character each one stands for.
+   * `letters` says which letters a glyph stands for when it stands for more
+   * than one - a ligature, whose code point is then the ligature's own Unicode
+   * character rather than a private-use stand-in (`svg/ligatures.ts`).
    */
   async planPage(
     outlines: ReadonlyMap<string, GlyphOutline>,
     placements: readonly GlyphPlacement[],
+    opts: { letters?: ReadonlyMap<string, string> } = {},
   ): Promise<PageFontPlan> {
     // fontId -> gid -> preferred code point
     const wanted = new Map<number, Map<number, number>>();
@@ -149,25 +157,59 @@ export class FontRegistry {
       const claimed = new Set<number>();
       const parts: string[] = [];
       const advanceByGid = advances.get(fontId);
-      // Glyphs without a usable Unicode value get a BMP Private Use code.
-      let nextPua = PUA_BASE;
 
-      for (const gid of [...byGid.keys()].sort((x, y) => x - y)) {
-        const outline = outlines.get(`${fontId}:${gid}`);
-        if (!outline || outline.d === null) continue; // Type3 / bitmap glyph
-        const preferred = byGid.get(gid) ?? -1;
-        let code: number;
-        if (preferred > 0 && !claimed.has(preferred)) {
-          code = preferred;
-        } else {
-          while (nextPua <= PUA_LIMIT && claimed.has(nextPua)) nextPua++;
-          // Out of private-use room: leave the glyph as an outline rather than
-          // invent a mapping that could collide with real text.
-          if (nextPua > PUA_LIMIT) continue;
-          code = nextPua++;
-        }
+      /** Every glyph of this font that has an outline to build from. */
+      const gids = [...byGid.keys()]
+        .sort((x, y) => x - y)
+        .filter((gid) => {
+          const outline = outlines.get(glyphKey(fontId, gid));
+          return Boolean(outline && outline.d !== null);
+        });
+      const lettersOf = (gid: number): string | undefined => opts.letters?.get(glyphKey(fontId, gid));
+      /** How many letters a glyph stands for, or -1 when nothing is known. */
+      const letterCount = (gid: number): number => {
+        const letters = lettersOf(gid);
+        return letters === undefined ? -1 : [...letters].length;
+      };
+      /** Take a code point for a glyph, if it is one worth taking and free. */
+      const claim = (gid: number, code: number | null | undefined): boolean => {
+        if (code === null || code === undefined || code <= 0 || claimed.has(code)) return false;
         claimed.add(code);
         codes.set(gid, code);
+        return true;
+      };
+
+      // What a glyph *means* decides which code point it writes, not the order
+      // the glyphs happen to be numbered in - a ligature is often numbered
+      // before the letters it is made of. First the glyphs with one letter:
+      // they own the letter MuPDF named. Then the ligatures, which get the
+      // Unicode presentation form for their letters. Everyone left over - a
+      // glyph the text device could not describe, or one whose letters are
+      // already spoken for - falls back to a BMP Private Use code, which keeps
+      // every glyph reachable without inventing a meaning for it.
+      for (const gid of gids) {
+        if (letterCount(gid) === 1) claim(gid, byGid.get(gid));
+      }
+      for (const gid of gids) {
+        const letters = lettersOf(gid);
+        if (letters !== undefined && letterCount(gid) > 1) claim(gid, ligatureCode(letters));
+      }
+
+      let nextPua = PUA_BASE;
+      for (const gid of gids) {
+        if (codes.has(gid)) continue;
+        if (claim(gid, byGid.get(gid))) continue;
+        while (nextPua <= PUA_LIMIT && claimed.has(nextPua)) nextPua++;
+        // Out of private-use room: leave the glyph as an outline rather than
+        // invent a mapping that could collide with real text.
+        if (nextPua > PUA_LIMIT) continue;
+        claim(gid, nextPua++);
+      }
+
+      for (const gid of gids) {
+        const outline = outlines.get(glyphKey(fontId, gid));
+        const code = codes.get(gid);
+        if (!outline || outline.d === null || code === undefined) continue;
         glyphs.push({ gid, d: outline.d, codes: [code], advanceEm: advanceByGid?.get(gid) });
         parts.push(`${gid}\u0001${code}\u0001${outline.d}`);
       }

@@ -23,6 +23,7 @@
  */
 
 import { textVide } from 'text-vide';
+import { LIGATURE_LETTERS } from './ligatures.ts';
 
 export interface BionicSegment {
   /** Whether this stretch of text is a word's fixation point. */
@@ -73,6 +74,43 @@ function charCount(text: string): number {
   return n;
 }
 
+/** Where one character of the input sits in it. */
+interface Bounds {
+  start: number;
+  end: number;
+}
+
+interface SpelledOut {
+  /** The text with every ligature spelled out, ready for `text-vide`. */
+  marked: string;
+  /** For every character of the input, where it starts and ends in the input. */
+  bounds: Bounds[];
+  /** For every character of `marked`, which character of the input it is. */
+  owner: number[];
+}
+
+/** The text with every ligature spelled out, and the input behind each character. */
+function spellOut(text: string): SpelledOut {
+  let marked = '';
+  const bounds: Bounds[] = [];
+  const owner: number[] = [];
+  for (let i = 0; i < text.length; ) {
+    const at = bounds.length;
+    ENTITY.lastIndex = i;
+    const entity = ENTITY.exec(text);
+    const code = entity ? 0 : (text.codePointAt(i) ?? 0);
+    const end = entity ? ENTITY.lastIndex : i + (code > 0xffff ? 2 : 1);
+    const letters = entity ? undefined : LIGATURE_LETTERS.get(code);
+    const written = letters ?? text.slice(i, end);
+    marked += written;
+    bounds.push({ start: i, end });
+    // A ligature writes two characters for the one it is, everything else one.
+    for (let k = 0; k < (letters ? letters.length : 1); k++) owner.push(at);
+    i = end;
+  }
+  return { marked, bounds, owner };
+}
+
 /**
  * The text as a run of stretches, each marked as a fixation point or not.
  *
@@ -80,25 +118,46 @@ function charCount(text: string): number {
  * of characters in it. The caller checks that sum against the glyphs it has, so
  * a future `text-vide` that marks characters differently degrades to plain text
  * rather than to fixation points in the wrong places.
+ *
+ * A ligature is spelled out before the words are looked for - the one glyph a
+ * typesetter drew for "fi" is two letters to a reader, and how many letters a
+ * word has is how `text-vide` decides how much of it to mark. The marks are then
+ * read back onto the characters that are really there, and a glyph the fixation
+ * reaches into is marked whole: it is one outline and cannot be drawn half dark.
  */
 export function bionicSegments(text: string): BionicSegment[] {
   if (!text) return [];
-  const marked = textVide(text);
-  const out: BionicSegment[] = [];
+  const { marked, bounds, owner } = spellOut(text);
+  const fixed: boolean[] = new Array<boolean>(bounds.length).fill(false);
+
+  // The marks arrive in the order of the characters they cover, so one cursor
+  // walks them: the stretch `text-vide` wrote is a run of characters of the
+  // spelled-out text, and `owner` says which character of the input each is.
   let at = 0;
+  const mark = (stretch: string, fixation: boolean): void => {
+    for (let i = 0; i < charCount(stretch) && at < owner.length; i++, at++) {
+      if (fixation) fixed[owner[at]] = true;
+    }
+  };
+
+  const markup = textVide(marked);
+  let cursor = 0;
   FIXATION.lastIndex = 0;
   let match: RegExpExecArray | null;
-  while ((match = FIXATION.exec(marked))) {
-    if (match.index > at) {
-      const plain = marked.slice(at, match.index);
-      out.push({ fixation: false, text: plain, chars: charCount(plain) });
-    }
-    out.push({ fixation: true, text: match[1], chars: charCount(match[1]) });
-    at = match.index + match[0].length;
+  while ((match = FIXATION.exec(markup))) {
+    mark(markup.slice(cursor, match.index), false);
+    mark(match[1], true);
+    cursor = match.index + match[0].length;
   }
-  if (at < marked.length) {
-    const rest = marked.slice(at);
-    out.push({ fixation: false, text: rest, chars: charCount(rest) });
+  mark(markup.slice(cursor), false);
+
+  const out: BionicSegment[] = [];
+  let i = 0;
+  while (i < fixed.length) {
+    let j = i;
+    while (j < fixed.length && fixed[j] === fixed[i]) j++;
+    out.push({ fixation: fixed[i], text: text.slice(bounds[i].start, bounds[j - 1].end), chars: j - i });
+    i = j;
   }
   return out;
 }

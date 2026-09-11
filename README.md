@@ -81,11 +81,22 @@ SVG with real text, plus outlines kept for whatever could not be converted
 ### Character mapping
 
 Each glyph is reachable under a real Unicode value where MuPDF recorded one
-(`data-text`), so copy, search and screen readers work. Glyphs that have no
-Unicode of their own — ligatures such as `fi`, which is one glyph standing for
-two characters — get a code point from the BMP Private Use Area instead
-(`U+E000…U+F8FF`). Both cases produce a `cmap` entry pointing at the right
-outline, so nothing renders blank.
+(`data-text`), so copy, search and screen readers work. A ligature is the case
+that needs help: the outline device names a glyph by the *first* of the letters
+it was shown with, so the one glyph a typesetter drew for `fi` arrives as `f` and
+looks like a second glyph claiming a code point that is already taken. The text
+device knows the whole word — it takes the ligature apart and reports one
+character per letter — so the letters are read from there
+(`core/svg/ligatures.ts`) and the glyph is given the Unicode character that *is*
+that ligature (`U+FB01` for `fi`, and the six others Unicode names). Copying
+`efficient` then gives a ligature character - not a box - which normalising
+spells back into `ffi`, and which a search that normalises (ICU-based find in
+the browsers, a normalising index) matches against the decomposed spelling.
+
+Only what is left over falls back to a code point from the BMP Private Use Area
+(`U+E000…U+F8FF`): a ligature Unicode never named, a glyph drawn two different
+ways on one page, or one the text device did not describe. Every case produces a
+`cmap` entry pointing at the right outline, so nothing renders blank.
 
 ### Falling back
 
@@ -97,6 +108,7 @@ Anything not provably safe stays an outline, glyph by glyph:
 | glyph with no outline in `<defs>` | `<use>` outline kept |
 | stroked text (`stroke` attribute) | `<use>` outline kept |
 | right-to-left or complex-shaping scripts | `<use>` outline kept (see limitations) |
+| ligature whose letters cannot be established | private-use code point (see limitations) |
 | more than 6400 unicode-less glyphs in one font | the excess stays outlines |
 | `textMode: 'paths'` | the whole page stays outlines |
 
@@ -112,11 +124,11 @@ their public URLs (`demo/papers.mjs`):
 
 | document | outline SVG | with real text | glyphs as text | fonts (WOFF) |
 | --- | --- | --- | --- | --- |
-| *Attention Is All You Need*, 1 page (6 Type 1/PFB fonts) | 373 KB | 65 KB (**17%**) | 2464 / 2464 | 6 (21 KB) |
-| *Deep Residual Learning*, 1 page (9 fonts, bitmap figures) | 572 KB | 103 KB (**18%**) | 3630 / 3630 | 9 (33 KB) |
-| *GPT-4 Technical Report*, 1 page (6 fonts) | 397 KB | 78 KB (**20%**) | 2917 / 2917 | 6 (19 KB) |
+| *Attention Is All You Need*, 1 page (6 Type 1/PFB fonts) | 373 KB | 74 KB (**20%**) | 2464 / 2464 | 6 (21 KB) |
+| *Deep Residual Learning*, 1 page (9 fonts, bitmap figures) | 579 KB | 117 KB (**20%**) | 3630 / 3630 | 9 (33 KB) |
+| *GPT-4 Technical Report*, 1 page (6 fonts) | 398 KB | 89 KB (**22%**) | 2917 / 2917 | 6 (19 KB) |
 
-The same paper over 3 pages: 1255 KB of outlines become 429 KB (34%) across 18
+The same paper over 3 pages: 1260 KB of outlines become 458 KB (36%) across 18
 distinct faces, 51 KB of WOFF.
 
 Those numbers are the default output, link hit areas included — that is what the
@@ -233,6 +245,13 @@ It is a text-level effect rather than a word-level one: anything `text-vide` fin
 no word in - a bare number, a formula, a run of symbols - is faded like a word's
 tail, so a page of prose reads as intended and a table reads as uniformly light.
 
+A word is counted in *letters*, not in glyphs. `fi` is one glyph in most text
+faces and two letters to a reader, and the letters are what the fixation point is
+made of, so a ligature is spelled out before the words are looked for and the
+marks are read back onto the glyphs afterwards. A glyph the fixation point
+reaches into is marked whole - it is a single outline and cannot be drawn half
+dark - which is why `find` marks `fin` and not the `n` alone.
+
 It changes how the text is **drawn** and nothing else. Every character carries its
 own x and y, and the fade is an attribute of the character's own `<tspan>`: the
 words do not reflow, the pages do not change size, and nothing has to be measured
@@ -266,7 +285,10 @@ looks like. Two details are what make it exact rather than approximate:
 
 A space the page *does* draw - some fonts give one an outline - is left to the
 glyph that already carries it, and trailing whitespace has nothing to sit in
-front of, so neither is written twice. This is on in every render, and costs
+front of, so neither is written twice. The exception is a drawn space whose glyph
+cannot become text: figures set in Type 3 fonts draw their spaces with a glyph
+that has no outline to rebuild, and the character is then nowhere in the SVG, so
+its space is written back like any other. This is on in every render, and costs
 about 4 ms a page.
 
 #### Who owns the zoom
@@ -551,6 +573,7 @@ src/
       glyphs.ts             scanner for MuPDF's SVG (outlines + <use>)
       text-upgrade.ts       <use> runs → <text> runs, with spaces and fading
       spaces.ts             where the spaces the outline device cannot draw go
+      ligatures.ts          the letters behind the one glyph a font draws for two
       bionic.ts             text-vide's fixation points, and how they are drawn
       package.ts            id namespacing, root rewriting, font embedding
     font/
@@ -670,12 +693,13 @@ is referenced relatively.
   a line break arrives as `trans-` and `formation` on either side of the space
   the break stands for - which is what a PDF's own copy gives you too.
 * **A ligature is one glyph, so it is one character.** Where a document draws
-  `fi` as a single glyph, the cmap entry for that glyph is what the text gets:
-  in a TeX-produced paper that is a private-use code point, so a copied
-  `efficient` can carry a character other programs show as a box. It renders
-  correctly, and the tests allow for it, but searching for the decomposed
-  spelling does not match it. Mapping the glyph names back to `U+FB01` and
-  friends is the fix, and it belongs in the font build, not here.
+  `fi` as a single glyph, the text carries the ligature's own Unicode character
+  (`U+FB01`) rather than the two letters, because one glyph can only be one
+  character. Everything that normalises text spells it back into `fi`, but a
+  plain substring search for `efficient` - in a program that neither normalises
+  nor compares the way the browsers' find-in-page does - will not match the
+  copied text. A ligature Unicode has no character for (`fj`, say) gets a
+  private-use code point instead, which renders correctly and reads as nothing.
 * **Bionic reading fades rather than emboldens.** A fixation point is the
   document's own ink at full strength and the rest of the word is half faded; a
   reader who expects the fixation points to be *bolder* (as the original Bionic
