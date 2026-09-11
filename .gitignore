@@ -5,3 +5,7 @@ dist/
 *.log
 .DS_Store
 tests/browser/out/
+
+# No PDF is ever part of this repository: the test corpus is a list of public
+# URLs, downloaded into .scratch/pdfs. A stray download here is a mistake.
+*.pdf

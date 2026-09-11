@@ -22,6 +22,7 @@
     "build:pages": "npm run build:lib && npm run build:demo && node scripts/no-jekyll.mjs dist/demo",
     "preview": "vite preview --config vite.demo.config.ts",
     "typecheck": "tsc --noEmit",
+    "pdfs": "node tests/pdf-cache.mjs",
     "test": "node --test tests/*.test.ts",
     "test:browser": "node tests/browser/all.mjs",
     "verify": "npm run typecheck && npm test && npm run test:browser"

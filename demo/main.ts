@@ -73,7 +73,7 @@ let toastTimer = 0;
 /* ---------------------------------------------------------------- sources */
 
 /**
- * Where this page lives, so a fixture URL or an upload can be resolved against
+ * Where this page lives, so a document URL or an upload can be resolved against
  * it rather than against a domain root: the built demo is published under a
  * path ([user].github.io/<repo>/) that it has no other way of knowing.
  */
@@ -98,7 +98,12 @@ function fillSamplePicker(): void {
   example = defaultExample() ?? list[0] ?? null;
   els.sample.replaceChildren(
     new Option('Example…', ''),
-    ...list.map((item) => new Option(`${item.label} · ${item.note}`, item.url)),
+    ...list.map((item) => {
+      const option = new Option(`${item.label} · ${item.note}`, item.url);
+      // What the document is like, for anyone deciding which one to open.
+      option.title = item.title;
+      return option;
+    }),
   );
   els.sample.value = '';
   els.emptySample.hidden = example === null;

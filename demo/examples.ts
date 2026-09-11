@@ -1,17 +1,20 @@
 /**
  * The documents the demo offers.
  *
- * Every one of them is fetched from the URL it actually lives at, so the
- * published page has no documents of its own to serve, version or keep in sync:
- * an example is a real, third-party paper downloaded over the network, like any
- * other file a reader would open.
+ * Every one of them is a public URL: the published page has no documents of its
+ * own to serve, version or keep in sync, so an example is a real, third-party
+ * paper downloaded over the network, like any other file a reader would open.
  *
- * The two PDFs under `tests/fixtures` are a different thing - they exist so the
- * browser tests can measure against a document that never changes, and so the
- * font pipeline gets exercised on pdfTeX's Type 1 (PFB) output. The dev and
- * preview servers mount that directory at the site root; a built site does not
- * have it at all, which is why these are only offered on a local origin.
+ * The tests render those same papers. On a local dev or preview server, the
+ * cache the test suite fills (`$WEBPDF_PDF_CACHE`, or `.scratch/pdfs`) is mounted
+ * at `/pdf/<name>`, and whatever is in it is listed first, marked as cached -
+ * which is how the tests, and anyone working offline, open the exact bytes that
+ * were verified rather than whatever the network returns today. A built site has
+ * no cache behind it, so there the list is the public URLs only.
  */
+
+import { cachedPapers, type Paper } from './papers-client.ts';
+import { PAPERS, pdfName } from './papers.mjs';
 
 export interface Example {
   /** What the picker says. */
@@ -20,56 +23,34 @@ export interface Example {
   url: string;
   /** Shown after the label: who is being downloaded from. */
   note: string;
+  /** What the document is like, as the option's tooltip. */
+  title: string;
 }
 
-/**
- * Documents fetched from a public URL. The arXiv URLs are versioned, which
- * makes them immutable - the same bytes come back as long as the paper is on
- * the site - and they are served with `access-control-allow-origin: *`, so the
- * browser fetches them directly with no proxy of ours in the middle.
- */
-export const EXAMPLES: readonly Example[] = [
-  {
-    label: 'Attention Is All You Need — pdfTeX, Type 1 fonts',
-    url: 'https://arxiv.org/pdf/1706.03762v7',
-    note: 'arxiv.org',
-  },
-  {
-    label: 'Deep Residual Learning — raster figures',
-    url: 'https://arxiv.org/pdf/1512.03385v1',
-    note: 'arxiv.org',
-  },
-];
-
-/** The test documents, which only a local dev or preview server can serve. */
-export const FIXTURES: readonly Example[] = [
-  {
-    label: 'LaTeX paper — Type 1 (PFB) fonts',
-    url: '/sample-latex.pdf',
-    note: 'test fixture',
-  },
-  {
-    label: 'TrueType embedded fonts',
-    url: '/sample-truetype.pdf',
-    note: 'test fixture',
-  },
-];
-
-/** True where a dev or preview server is expected to be serving the fixtures. */
-function local(): boolean {
-  const host = location.hostname;
-  return (
-    (host === 'localhost' || host === '127.0.0.1' || host === '[::1]') &&
-    (location.protocol === 'http:' || location.protocol === 'https:')
-  );
-}
-
-/** Every document this page can open, in the order the picker lists them. */
+/** The papers the demo can open, in the order the picker lists them. */
 export function exampleDocuments(): Example[] {
-  return local() ? [...FIXTURES, ...EXAMPLES] : [...EXAMPLES];
+  return [
+    ...cachedPapers().map(({ paper, url }) => toExample(paper, url, 'cached locally')),
+    ...PAPERS.map((paper) => toExample(paper, paper.url, paper.note)),
+  ];
 }
 
-/** The one document the empty state opens: the first public example. */
+/** The paper with this public URL, or null. */
+export function paperFor(url: string): Paper | null {
+  return PAPERS.find((paper) => paper.url === url) ?? null;
+}
+
+/** The document the empty state opens: the first paper, from its public URL. */
 export function defaultExample(): Example | null {
-  return EXAMPLES[0] ?? null;
+  const [first] = PAPERS;
+  return first ? toExample(first, first.url, first.note) : null;
+}
+
+function toExample(paper: Paper, url: string, note: string): Example {
+  return {
+    label: url === paper.url ? paper.label : `${paper.label} (cached)`,
+    url,
+    note,
+    title: paper.settings,
+  };
 }

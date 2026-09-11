@@ -107,17 +107,22 @@ older, larger, still-correct representation.
 
 ## Results
 
-Measured on the test fixtures, page 1:
+Measured on page 1 of the papers in the test corpus, all of them downloaded from
+their public URLs (`demo/papers.mjs`):
 
 | document | outline SVG | with real text | glyphs as text | fonts (WOFF) |
 | --- | --- | --- | --- | --- |
-| LaTeX paper, 1 page (6 Type 1/PFB fonts) | 373 KB | 65 KB (**17%**) | 2464 / 2464 | 21 KB |
-| LaTeX paper, 3 pages | 1255 KB | 424 KB (**34%**) | 7626 / 7626 | 51 KB |
-| Manual, 3 pages, non-embedded base-14 | 454 KB | 68 KB (**15%**) | 3045 / 3045 | 27 KB |
+| *Attention Is All You Need*, 1 page (6 Type 1/PFB fonts) | 373 KB | 65 KB (**17%**) | 2464 / 2464 | 6 (21 KB) |
+| *Deep Residual Learning*, 1 page (9 fonts, bitmap figures) | 572 KB | 96 KB (**17%**) | 3630 / 3630 | 9 (33 KB) |
+| *GPT-4 Technical Report*, 1 page (6 fonts) | 397 KB | 76 KB (**19%**) | 2917 / 2917 | 6 (19 KB) |
+
+The same paper over 3 pages: 1255 KB of outlines become 424 KB (34%) across 18
+distinct faces, 51 KB of WOFF.
 
 Ink coverage of the text render against MuPDF's own outline render: **100.000%**
-(page 1 of the LaTeX fixture), 99.5–99.9% across the other pages tested. The
-residue is antialiasing and stem darkening, not missing or misplaced glyphs.
+(page 1 of *Attention Is All You Need*), 99.5–99.9% across the other pages
+tested. The residue is antialiasing and stem darkening, not missing or misplaced
+glyphs.
 
 ---
 
@@ -205,9 +210,10 @@ viewer:
   whose Type 1 fonts are exactly the case this library exists for. A published page
   therefore carries no PDFs at all: the browser downloads the example from whoever
   hosts it (arXiv serves it with `access-control-allow-origin: *`, so no proxy of
-  ours sits in the middle) and opens it like any other file. The two PDFs under
-  `tests/fixtures` are only *offered* on a local origin, where the dev and preview
-  servers serve them for the test suite; no build contains them.
+  ours sits in the middle) and opens it like any other file. On a local dev or
+  preview server, the papers the tests have cached are *also* offered, from
+  `/pdf/<name>`; a build has no cache behind it, so the published site lists the
+  public URLs and nothing else.
 * **One bar, no status bar.** Messages float in a toast instead, so the pages own
   every pixel below the bar and there is no chrome pretending to stay put while
   the browser magnifies the document.
@@ -325,10 +331,12 @@ src/
     layout.ts               page geometry + visible-range maths
     viewer.ts               virtualised scrolling viewer (browser-owned pinch)
 demo/                       the demo application
-  examples.ts               the public URLs the demo offers, and the fixtures
+  papers.mjs                the corpus: public URLs, and where they are cached
+  papers-client.ts          which of them this page has a local copy of
+  examples.ts               the picker's entries, cached copies first
 tests/
   *.test.ts                 Node tests (real PDFs through the real wasm)
-  fixtures/                 the PDFs the tests render; served only in dev
+  pdf-cache.mjs             fetches the corpus, lists it, clears it
   browser/                  headless-Chromium verification over CDP
 scripts/
   no-jekyll.mjs             marks the Pages artifact as pre-built
@@ -342,18 +350,41 @@ inside the worker, and under Node in the tests.
 ```sh
 npm install
 npm run dev          # demo on http://127.0.0.1:5173
-npm test             # Node tests: font pipeline over real PDFs
+npm run pdfs         # fetch the test corpus into the cache (also happens on demand)
+npm test             # Node tests: font pipeline over the real papers
 npm run test:browser # builds the demo, serves it, verifies in headless Chromium
 npm run verify       # typecheck + both test suites
 npm run build:pages  # the published site, in dist/demo
 ```
 
+### The test corpus
+
+No PDF is stored in this repository, and none is generated: `demo/papers.mjs`
+lists the corpus - four papers, at the time of writing - by public URL, and
+everything refers to that one list: the Node tests, the browser tests, and the
+demo's picker on a local origin. Nothing needs a document to be checked in,
+reviewed as a binary, or replaced when it goes stale; `git ls-files '*.pdf'` is
+empty, and the tests cannot drift from what a reader would actually download.
+
+The URLs are versioned arXiv papers (plus ISO 32000-1 from Adobe), chosen because
+they are immutable and served with `access-control-allow-origin: *`. Both matter
+here: the browser tests fetch them the way the published demo does, with no proxy.
+
+Downloads land in a cache, `.scratch/pdfs` by default, which is gitignored. Point
+it somewhere else - a shared or pre-warmed directory, a CI volume - with
+`$WEBPDF_PDF_CACHE`; a relative path is read from the repository root. The tests
+fetch whatever is missing on their own, so a cold cache costs one download and
+every run after that is offline. `npm run pdfs -- --list` shows what is cached,
+`-- --clear` empties it, and the cache directory is never written to by a build.
+
 The browser suite is the interesting one. It renders each page twice — once as
 MuPDF outlines, once through the text upgrade — rasterises both, and reports how
 much of the reference ink the text render covers. It needs a Chromium binary;
 set `$CHROMIUM` if it is not at `/usr/bin/chromium`. It also needs the network:
-the last thing it does is open the public example, because that is what a reader
-of the published page does.
+the last thing it does is open a paper at its public URL, because that is what a
+reader of the published page does. The document-specific search checks run
+against the cached copy of the paper, so their counts do not depend on what the
+network returns today.
 
 `tests/browser/diff.mjs` produces a red/green difference map for human eyes:
 overlapping ink is yellow, so any systematic offset or missing glyph is obvious.
@@ -364,7 +395,8 @@ overlapping ink is yellow, so any systematic offset or missing glyph is obvious.
 `actions/deploy-pages` on every push to `main` (and on demand from the Actions
 tab). It deliberately does **not** run the test suites: rendering a paper and
 rasterising pages is a fine thing to do on a developer's machine and a poor gate
-between a commit and the published site.
+between a commit and the published site. It does not fetch the corpus either -
+the published build has no use for it.
 
 Pages has to be set to **Source: GitHub Actions** in the repository settings —
 there is no `gh-pages` branch and nothing to commit back to the repository. The

@@ -137,11 +137,13 @@ try {
 
   await page.goto(url);
   await page.waitFor(() => typeof window.webpdf === 'object', { label: 'demo bootstrap', timeout: 90000 });
-  // The fixture the tests are written against, wherever this page can get it.
+  // The paper the other tests are written against, wherever this page can get
+  // it: the local copy when the cache behind `/pdf` has one, else its public URL.
   const document_ = await page.evaluate(() => {
     const sel = document.getElementById('sample');
-    const fixture = [...sel.options].find((o) => o.value === '/sample-latex.pdf');
-    const chosen = fixture?.value ?? [...sel.options].find((o) => o.value.startsWith('http'))?.value;
+    const options = [...sel.options].map((o) => o.value).filter(Boolean);
+    const chosen = options.find((value) => value.startsWith('/pdf/')) ?? options.find((value) => value.startsWith('https://arxiv.org/'));
+    if (!chosen) throw new Error('the picker offers no document to open: ' + JSON.stringify(options));
     sel.value = chosen;
     sel.dispatchEvent(new Event('change'));
     return chosen;

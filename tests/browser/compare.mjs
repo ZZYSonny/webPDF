@@ -1,6 +1,6 @@
 /**
- * Generate a browser fixture that proves the text output draws the same pixels
- * as MuPDF's outlines.
+ * Generate the comparison page that proves the text output draws the same
+ * pixels as MuPDF's outlines.
  *
  * For each page we rasterise two standalone SVGs into canvases:
  *   A: MuPDF's outline rendering (the reference)
@@ -9,7 +9,7 @@
  * A page banner at the top shows the two renders stacked so a mismatch is also
  * visible to a human looking at a screenshot.
  *
- *   node tests/browser/fixture.mjs <pdf> <pageIndex> [outDir]
+ *   node tests/browser/compare.mjs <pdf> <pageIndex> [outDir]
  */
 
 import fs from 'node:fs';
@@ -24,7 +24,7 @@ const pageIndex = Number(process.argv[3] ?? 0);
 const outDir = process.argv[4] ?? path.join(here, 'out');
 
 if (!pdf) {
-  console.error('usage: fixture.mjs <pdf> <pageIndex> [outDir]');
+  console.error('usage: compare.mjs <pdf> <pageIndex> [outDir]');
   process.exit(2);
 }
 

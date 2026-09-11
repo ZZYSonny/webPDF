@@ -1,52 +1,68 @@
 /**
  * End-to-end check of the outline -> web font -> text upgrade pipeline.
  *
- * Runs the real MuPDF wasm build over real PDFs, without a browser.
+ * Runs the real MuPDF wasm build over real PDFs, without a browser. Every
+ * document is a public URL (see `demo/papers.mjs`); the bytes are cached under
+ * `$WEBPDF_PDF_CACHE`, or `.scratch/pdfs`, and fetched once when missing.
  *
- *   node tests/font-pipeline.test.ts [pdf ...]
+ *   node tests/font-pipeline.test.ts [pdf-or-url ...] [--all]
+ *
+ * Local files and URLs both work as arguments. With none, the first three
+ * papers of the corpus run - the full set is one `--all` away.
  */
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
 
 import * as mupdf from 'mupdf';
 import { scanGlyphOutlines, scanGlyphPlacements } from '../src/core/svg/glyphs.ts';
 import { upgradeGlyphsToText } from '../src/core/svg/text-upgrade.ts';
 import { FontRegistry } from '../src/core/font/registry.ts';
+import { PAPERS, paperFor, pdfName } from '../demo/papers.mjs';
+import { download, ensurePapers } from './pdf-cache.mjs';
 
-const here = path.dirname(fileURLToPath(import.meta.url));
-/** Extra corpora can be dropped in `.scratch/pdfs`; the bundled samples always run. */
-const pdfDirs = [path.join(here, '..', '.scratch', 'pdfs'), path.join(here, '..', 'demo', 'public')];
+const args = process.argv.slice(2);
+const explicit = args.filter((arg) => !arg.startsWith('-'));
+const all = args.includes('--all');
+const urls = PAPERS.slice(0, all ? PAPERS.length : 3).map((paper) => paper.url);
 
-function renderPathSvg(doc: mupdf.Document, pageIndex: number): string {
-  const page = doc.loadPage(pageIndex);
-  const buf = new mupdf.Buffer();
-  const writer = new mupdf.DocumentWriter(buf, 'svg', { text: 'path' });
-  const dev = writer.beginPage(page.getBounds());
-  page.run(dev, mupdf.Matrix.identity);
-  writer.endPage();
-  writer.close();
-  return buf.asString();
-}
-
-function pdfFiles(): string[] {
-  const explicit = process.argv.slice(2).filter((a) => a.endsWith('.pdf'));
-  if (explicit.length) return explicit;
-  const found: string[] = [];
-  for (const dir of pdfDirs) {
-    if (!fs.existsSync(dir)) continue;
-    for (const f of fs.readdirSync(dir)) {
-      if (f.endsWith('.pdf')) found.push(path.join(dir, f));
+/**
+ * The document behind each argument, fetched to the cache when it is a URL.
+ * A paper that cannot be fetched is reported once and skipped, so one host
+ * being unreachable does not hide the verdict on every other document.
+ */
+const documents: Array<{ name: string; file: string }> = [];
+if (explicit.length) {
+  for (const arg of explicit) {
+    if (/^https?:/.test(arg)) {
+      const file = await download(arg, { log: (line) => console.log('  ' + line) }).catch((error) => error);
+      if (file instanceof Error) console.error(`skip ${arg}: ${file.message}`);
+      else documents.push({ name: `${paperFor(arg)?.label ?? arg} (${pdfName(arg)})`, file });
+    } else {
+      documents.push({ name: path.basename(arg), file: arg });
     }
   }
-  return found;
+} else {
+  const files = await ensurePapers(urls);
+  for (const url of urls) {
+    const file = files.get(url);
+    if (file instanceof Error) console.error(`skip ${url}: ${file.message}`);
+    else if (file) documents.push({ name: `${paperFor(url)?.label ?? url} (${pdfName(url)})`, file });
+  }
 }
 
-for (const file of pdfFiles()) {
-  test(`font pipeline: ${path.basename(file)}`, async () => {
+// A silent pass is the one outcome that would make this file worthless: no
+// document, no evidence.
+if (!documents.length) {
+  test('font pipeline', () => {
+    assert.fail(`no document could be fetched, so the pipeline went unmeasured (tried ${urls.join(', ')})`);
+  });
+}
+
+for (const { name, file } of documents) {
+  test(`font pipeline: ${name}`, async () => {
     const doc = mupdf.Document.openDocument(fs.readFileSync(file), 'application/pdf');
     const registry = new FontRegistry({ disableCompression: false });
     const pages = Math.min(doc.countPages(), 5);
@@ -92,12 +108,23 @@ for (const file of pdfFiles()) {
     const assets = registry.assets();
     const bytes = assets.reduce((a, f) => a + f.bytes, 0);
     console.log(
-      `  ${path.basename(file)}: pages=${pages} fonts=${assets.length} ` +
+      `  ${name}: pages=${pages} fonts=${assets.length} ` +
         `glyphs->text=${convertedTotal} fontBytes=${(bytes / 1024).toFixed(1)}KiB ` +
         `formats=${[...new Set(assets.map((a) => a.format))].join(',')}`,
     );
     assert.ok(assets.length >= 0);
   });
+}
+
+function renderPathSvg(doc: mupdf.Document, pageIndex: number): string {
+  const page = doc.loadPage(pageIndex);
+  const buf = new mupdf.Buffer();
+  const writer = new mupdf.DocumentWriter(buf, 'svg', { text: 'path' });
+  const dev = writer.beginPage(page.getBounds());
+  page.run(dev, mupdf.Matrix.identity);
+  writer.endPage();
+  writer.close();
+  return buf.asString();
 }
 
 function count(s: string, needle: string): number {

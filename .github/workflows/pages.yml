@@ -11,8 +11,9 @@
 # does not compile as written.
 #
 # The published site is the demo app plus the library it is built from, and it
-# carries no documents of its own: the example papers are fetched from their
-# public URLs, and the fixtures under tests/fixtures stay in the repository.
+# carries no documents of its own: every paper it offers is fetched from its
+# public URL. Nothing in this repository is a PDF, so there is no corpus for the
+# build to ship, and the PDF cache the tests use is not consulted here at all.
 
 name: Pages
 

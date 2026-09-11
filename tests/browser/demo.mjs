@@ -19,14 +19,14 @@ fs.mkdirSync(path.dirname(out), { recursive: true });
 
 /**
  * The published demo ships no documents: every entry in its picker is a public
- * URL. The evaluation copy additionally offers the test fixtures, and this test
- * uses one of those so the numbers below are about this renderer rather than
- * about whichever bytes arXiv is serving today. Where the fixtures are not
- * being served, the public example is used instead and the fixture-only checks
- * are skipped.
+ * URL. A local dev or preview server additionally mounts the test cache at
+ * `/pdf`, and this test prefers such a copy so the numbers below are about this
+ * renderer rather than about whichever bytes arXiv is serving today. Where the
+ * cache is empty the public URL is used instead, and the document-specific
+ * checks are skipped.
  */
-const FIXTURE = '/sample-latex.pdf';
 const PUBLIC_EXAMPLE = 'https://arxiv.org/pdf/1706.03762v7';
+const CACHED_PREFIX = '/pdf/';
 
 const fail = (msg) => {
   console.error('FAIL: ' + msg);
@@ -94,9 +94,10 @@ try {
   if (!beforeLoad.options.includes(PUBLIC_EXAMPLE)) {
     fail(`the picker should offer the public example ${PUBLIC_EXAMPLE}, got ${JSON.stringify(beforeLoad.options)}`);
   }
-  const fixturesServed = beforeLoad.options.includes(FIXTURE);
-  const document_ = fixturesServed ? FIXTURE : PUBLIC_EXAMPLE;
-  if (!fixturesServed) console.log('  (no test fixtures served here - using the public example)');
+  // The local copy of a cached paper, when the cache behind `/pdf` has one.
+  const cachedDoc = beforeLoad.options.find((value) => value.startsWith(CACHED_PREFIX)) ?? null;
+  const document_ = cachedDoc ?? PUBLIC_EXAMPLE;
+  if (!cachedDoc) console.log('  (cache empty - using the public URL, document-specific checks skipped)');
   await open(document_);
 
   await page.waitFor(
@@ -312,11 +313,11 @@ try {
   if (after.slots > 4) fail(`virtualisation is keeping too many slots: ${after.slots}`);
 
   // ---------------------------------------------------------------- search
-  // The checks below count matches in the fixture, which never changes. (The
-  // same search runs against the public example further down, where the exact
+  // The checks below count matches in the cached paper, which never changes.
+  // (The same search runs against a public URL further down, where the exact
   // numbers are the document's business, not ours.)
-  if (!fixturesServed) {
-    console.log('— skipping the search checks: they are written against the fixture —');
+  if (!cachedDoc) {
+    console.log('— skipping the search checks: they are written against the cached paper —');
   } else {
     // "encoder" appears on all three pages of the sample (2/3/7). Typing is
     // enough: like a browser's find bar the first match is boxed and jumped to
@@ -413,7 +414,7 @@ try {
   if (remote.textElements < 20) fail(`the example rendered almost no text (${remote.textElements} elements)`);
   if (!remote.prose) fail('the rendered page 1 of the example has no recognisable prose');
   if (remote.outline < 5) fail(`the example's outline did not populate (${remote.outline} entries)`);
-  // A document that is not the fixture must still be a document we can open.
+  // A document fetched over the network must still be a document we can open.
   if (remote.rendersInWorker !== true) fail('the example did not render in the worker');
   if (!remote.title) fail('the example did not set a document title');
 

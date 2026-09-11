@@ -3,17 +3,19 @@
  *
  *   node tests/browser/all.mjs
  *
- * Builds the demo, serves it (with `tests/fixtures` mounted by the Vite config,
- * so the demo offers them as documents it can open locally), checks that the
- * text render reproduces MuPDF's outlines pixel-for-pixel, then drives the demo
- * UI - including a download of the public example, because that is what a
+ * Makes sure the test corpus is in the cache (the papers are public URLs, so a
+ * cold cache is a download), builds the demo, serves it - the Vite config mounts
+ * that cache at `/pdf`, which is how the picker offers a local copy of a paper -
+ * checks that the text render reproduces MuPDF's outlines, then drives the demo
+ * UI, including a paper fetched from its public URL, because that is what a
  * published page loads.
  */
 
 import { spawn } from 'node:child_process';
-import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+
+import { PAPERS, cachedFile, ensurePapers } from '../pdf-cache.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const root = path.join(here, '..', '..');
@@ -27,6 +29,12 @@ const run = (args, opts = {}) =>
   });
 
 const vite = path.join(root, 'node_modules', '.bin', 'vite');
+
+console.log('› fetching the test corpus (cached: only missing files are downloaded)');
+await ensurePapers(
+  PAPERS.map((paper) => paper.url),
+  { log: (line) => console.log('  ' + line) },
+);
 
 console.log('› building demo');
 await run([vite, 'build', '--config', 'vite.demo.config.ts']);
@@ -54,18 +62,20 @@ let failed = false;
 try {
   if (!(await ready())) throw new Error('preview server never came up');
 
-  const samples = fs
-    .readdirSync(path.join(root, 'tests', 'fixtures'))
-    .filter((f) => f.endsWith('.pdf'))
-    .map((f) => path.join(root, 'tests', 'fixtures', f));
+  // Fidelity is measured on the two papers the rest of the suite is written
+  // against; a document that never made it into the cache is skipped rather
+  // than failing the suite on the network.
+  const samples = PAPERS.slice(0, 2).filter((paper) => cachedFile(paper.url));
 
-  for (const sample of samples) {
-    console.log(`\n› outline-vs-text fidelity: ${path.basename(sample)}`);
-    await run([path.join(here, 'run.mjs'), sample, '0'], { stdio: 'inherit' }).catch((err) => {
+  for (const paper of samples) {
+    const file = cachedFile(paper.url);
+    console.log(`\n› outline-vs-text fidelity: ${paper.label}`);
+    await run([path.join(here, 'run.mjs'), file, '0'], { stdio: 'inherit' }).catch((err) => {
       failed = true;
       console.error(String(err.message));
     });
   }
+  if (!samples.length) console.log('\n(no paper in the cache - fidelity skipped)');
 
   console.log('\n› demo application');
   await run([path.join(here, 'demo.mjs'), url], { stdio: 'inherit' });

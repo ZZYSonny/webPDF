@@ -1,5 +1,5 @@
 /**
- * Render a fixture with headless Chromium and report the verdict.
+ * Render one page of a PDF with headless Chromium and report the verdict.
  *
  *   node tests/browser/run.mjs <pdf> <page...> [outDir]
  *
@@ -48,13 +48,13 @@ let failures = 0;
 const summary = [];
 
 for (const p of pages) {
-  const fixture = execFileSync(process.execPath, [path.join(here, 'fixture.mjs'), pdf, p, outDir], {
+  const compare = execFileSync(process.execPath, [path.join(here, 'compare.mjs'), pdf, p, outDir], {
     encoding: 'utf8',
   })
     .trim()
     .split('\n');
-  const html = fixture[0];
-  console.log(fixture[1]);
+  const html = compare[0];
+  console.log(compare[1]);
 
   const dom = execFileSync(chromium, [...baseFlags, '--dump-dom', `file://${html}`], {
     encoding: 'utf8',
