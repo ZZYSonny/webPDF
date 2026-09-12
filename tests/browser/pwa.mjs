@@ -27,12 +27,24 @@
  *     copy of the document. That is the whole offline claim, and there is no way
  *     to check it other than by taking the network away.
  *
+ *  3. *A redeploy, and what the page does about it.* A worker that never takes
+ *     over on its own is a site that never updates for a reader who keeps the
+ *     page open, so the page has to look for a new build and say what it found.
+ *     The same throwaway server serves a copy of the build that is rewritten
+ *     between visits - a different entry module under a different hash, which is
+ *     what a build does - and the page is checked at each step: a plain reload is
+ *     told a build is waiting and stays on the one it is reading; taking the
+ *     offer lands on the new build; the build before it is still there to answer
+ *     for the files it was made of; the one before *that* is dropped; and the
+ *     whole thing still comes up offline afterwards.
+ *
  * The fallback in (2) is also the proof that a CDN which is unreachable does not
  * take the viewer with it: the engine there can only have come from this site.
  */
 
 import fs from 'node:fs';
 import http from 'node:http';
+import os from 'node:os';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
@@ -113,18 +125,26 @@ const TYPES = {
 };
 
 /**
- * The site, served the way the preview server serves it: the built demo at the
+ * The site, served the way GitHub Pages serves it: the build under test at the
  * root, and the test corpus at `/pdf/<name>` - which is what the demo's own
  * picker calls those documents, and what the page will therefore keep offline.
  *
- * A server of the test's own rather than the suite's, because the offline half of
- * the test has to be able to kill it.
+ * A server of the test's own rather than the suite's, because the offline half
+ * of the test has to be able to kill it, and because the redeploy half has to be
+ * able to replace what it is serving.
+ *
+ * Every file gets GitHub Pages' own ten minutes, the page and the worker
+ * included. That is not incidental: a build's shell has to be assembled from the
+ * deploy that wrote the worker rather than from whatever the HTTP cache is still
+ * holding, and a worker is the one file whose being stale hides every other
+ * staleness behind it. A test server kinder than the real one would test
+ * neither.
  */
-function serve() {
+function serve(root) {
   const server = http.createServer((req, res) => {
     const at = decodeURIComponent(new URL(req.url ?? '/', 'http://x').pathname).replace(/^\/+/, '');
-    const local = at.startsWith('pdf/') ? path.join(path.dirname(file), path.basename(at)) : path.join(dist, at || 'index.html');
-    if (!local.startsWith(at.startsWith('pdf/') ? path.dirname(file) : dist) || !fs.existsSync(local) || !fs.statSync(local).isFile()) {
+    const local = at.startsWith('pdf/') ? path.join(path.dirname(file), path.basename(at)) : path.join(root, at || 'index.html');
+    if (!local.startsWith(at.startsWith('pdf/') ? path.dirname(file) : root) || !fs.existsSync(local) || !fs.statSync(local).isFile()) {
       res.writeHead(404, { 'Content-Type': 'text/plain' });
       res.end('not found');
       return;
@@ -132,14 +152,54 @@ function serve() {
     res.writeHead(200, {
       'Content-Type': TYPES[path.extname(local)] ?? 'application/octet-stream',
       'Content-Length': String(fs.statSync(local).size),
-      // The page is read fresh; everything else it loads carries a content hash
-      // and may be kept.
-      'Cache-Control': path.extname(local) === '.html' ? 'no-cache' : 'public, max-age=600',
+      'Cache-Control': 'public, max-age=600',
     });
     fs.createReadStream(local).pipe(res);
   });
   return server;
 }
+
+/**
+ * The next deploy, in the only terms a test can see one: the entry module is
+ * renamed to the hash a new build would give it, the page points at the new
+ * name, the shell lists it instead of the old one, and the worker's build digest
+ * changes so a browser sees a worker it does not have.
+ *
+ * The *page* is marked as well, because that is the question the rest of this
+ * checks ask: which build is the reader looking at.
+ */
+function redeploy(dir, marker) {
+  const index = path.join(dir, 'index.html');
+  let html = fs.readFileSync(index, 'utf8');
+  const entry = /src="\.\/(assets\/[^"]+\.js)"/.exec(html);
+  if (!entry) throw new Error('no entry module in the built page');
+  const was = entry[1];
+  const now = `assets/index-${createHash('sha256').update(marker).digest('base64url').slice(0, 8)}.js`;
+  if (now === was) throw new Error(`the entry name did not change: ${was}`);
+  fs.renameSync(path.join(dir, was), path.join(dir, now));
+  html = html
+    .replace(was, now)
+    .replace(/\s*<meta name="build"[^>]*>/, '')
+    .replace('<head>', `<head>\n    <meta name="build" content="${marker}" />`);
+  fs.writeFileSync(index, html);
+
+  const worker = path.join(dir, 'sw.js');
+  fs.writeFileSync(
+    worker,
+    fs
+      .readFileSync(worker, 'utf8')
+      .replace(was, now)
+      .replace(/const BUILD = "[0-9a-f]+"/, `const BUILD = "${createHash('sha256').update(html).digest('hex').slice(0, 16)}"`),
+  );
+  return { was, now };
+}
+
+/** Which build the page on screen is, or null for the one that was there first. */
+const buildOf = (page) => page.evaluate(`document.querySelector('meta[name="build"]')?.content ?? null`);
+
+/** The shells that are kept, in order: the browser's own answer to "which builds". */
+const shellsOf = (page) =>
+  page.evaluate(`caches.keys().then((names) => names.filter((name) => name.startsWith('webpdf-shell-')).sort())`);
 
 /** Start a server on a port of the system's choosing, and how to stop it. */
 async function listening(server) {
@@ -279,7 +339,7 @@ console.log('\n› the same viewer with no network at all');
   await page.setViewport(1280, 900);
   await page.send('Page.addScriptToEvaluateOnNewDocument', { source: PROBE });
 
-  const server = await listening(serve());
+  const server = await listening(serve(dist));
   await boot(page, server.origin);
   await page.evaluate(
     `(async () => { await navigator.serviceWorker.ready; })()`,
@@ -316,6 +376,162 @@ console.log('\n› the same viewer with no network at all');
   );
 
   await browser.close();
+}
+
+/* --------------------------------------------------- a new build, waiting */
+
+console.log('\n› a redeploy, and what the page does about it');
+{
+  const browser = await launch();
+  const page = await browser.newPage();
+  await page.setViewport(1280, 900);
+  await page.send('Page.addScriptToEvaluateOnNewDocument', { source: PROBE });
+
+  // A copy of the build this test is free to rewrite: a redeploy is nothing but
+  // a different set of files at the same URLs, as far as a browser can tell.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'webpdf-redeploy-'));
+  fs.cpSync(dist, dir, { recursive: true });
+  const server = await listening(serve(dir));
+
+  /**
+   * Reload onto the build that is being served, and wait to be told a new one is
+   * waiting. What the reader is on while the offer is up is the answer that
+   * matters, so it is read before either button is pressed.
+   */
+  const toldAbout = async () => {
+    await boot(page, server.origin);
+    const said = await page.waitFor(
+      () => {
+        const toast = document.getElementById('toast');
+        if (!toast || toast.hidden) return false;
+        const text = document.getElementById('toast-text')?.textContent ?? '';
+        // Anything else on this page - "Ready", an error - is a message that
+        // leaves on its own; the one that stays is the one being waited for.
+        return /newer version/i.test(text) ? text : false;
+      },
+      { label: 'the page to say a new build is waiting', timeout: 30000 },
+    );
+    const kept = await buildOf(page);
+    const label = await page.evaluate(
+      `document.getElementById('toast-action')?.hidden === false ? document.getElementById('toast-action').textContent : null`,
+    );
+    return { said, kept, label };
+  };
+
+  /** Press the offer's own button, and wait for the page to be the new build. */
+  const takeTheOffer = async (marker) => {
+    await page.evaluate(`document.getElementById('toast-action').click()`);
+    return await untilBuild(marker);
+  };
+
+  /**
+   * Wait for the page to *be* the named build.
+   *
+   * A wait for "some build" would be answered by the build already on screen -
+   * the reload that follows the button is exactly what is being waited for, and
+   * the page is one build until it happens. The navigation also throws away the
+   * context an evaluation runs in, halfway through it.
+   */
+  const untilBuild = async (marker, timeout = 30000) => {
+    const deadline = Date.now() + timeout;
+    let last = null;
+    while (Date.now() < deadline) {
+      try {
+        last = await buildOf(page);
+      } catch {
+        last = 'navigating';
+      }
+      if (last === marker) return last;
+      await new Promise((r) => setTimeout(r, 150));
+    }
+    throw new Error(`the page came back as ${JSON.stringify(last)}, not ${JSON.stringify(marker)}`);
+  };
+
+  /** Whether a file the page is made of is still answered for, from the page. */
+  const stillServed = (file) =>
+    page.evaluate(`fetch(${JSON.stringify('./' + file)}).then((response) => response.ok).catch(() => false)`);
+
+  try {
+    await boot(page, server.origin);
+    await page.waitFor(() => navigator.serviceWorker.controller !== null, { label: 'the first worker to take the site over' });
+    await page.waitFor(async () => (await window.__kept()).shell.length > 0, { label: 'the first shell to be precached' });
+    const first = await shellsOf(page);
+    const firstToast = await page.evaluate(`document.getElementById('toast-text')?.textContent ?? ''`);
+    check(
+      'a first visit installs one shell, and is not an update',
+      first.length === 1 && (await buildOf(page)) === null && !/newer version/i.test(firstToast),
+      `${first[0] ?? 'no shell'} is the only one, and nothing was offered`,
+    );
+
+    // The deploy. From here the server is a different build and the browser is
+    // still running the one before it.
+    const second = redeploy(dir, 'second');
+    const gone = await fetch(`${server.origin}/${second.was}`);
+    check(
+      'the deploy replaces the entry module the old shell was made of',
+      !fs.existsSync(path.join(dir, second.was)) && gone.status === 404,
+      `${second.was} is gone from the server (HTTP ${gone.status}), ${second.now} is there`,
+    );
+
+    // A plain reload is all a reader does, and all it takes to be told.
+    const offered = await toldAbout();
+    check('a reload says a newer build is ready', /newer version/i.test(offered.said), JSON.stringify(offered.said));
+    check(
+      'and the reader stays on the build they were reading, with a way to take it',
+      offered.kept === null && offered.label === 'Reload',
+      `the page is ${offered.kept} and the offer is ${JSON.stringify(offered.label)}`,
+    );
+
+    // "Not now" is an answer too: the notice goes, the build stays, and the
+    // next visit is told about it again rather than left to wonder.
+    await page.evaluate(`document.getElementById('toast-dismiss').click()`);
+    check(
+      'putting the notice down does not put the update on',
+      (await page.evaluate(`document.getElementById('toast').hidden`)) && (await buildOf(page)) === null,
+      'the notice is gone and the page is still the old build',
+    );
+    const again = await toldAbout();
+    check('and the visit after that is told again', /newer version/i.test(again.said), JSON.stringify(again.said));
+
+    check('taking it lands on the new build', (await takeTheOffer('second')) === 'second', 'the page is second');
+
+    const after = await shellsOf(page);
+    check(
+      'the build before it is kept, so the files it was made of still answer',
+      after.length === 2 && after.includes(first[0]) && (await stillServed(second.was)),
+      `${after.length} shells kept, and ${second.was} - which the server no longer has - is still served`,
+    );
+
+    // The one after that: the same again, and the shell before last dropped.
+    redeploy(dir, 'third');
+    const offeredAgain = await toldAbout();
+    check(
+      'a second deploy is offered the same way, to the reader who took the first',
+      offeredAgain.kept === 'second' && (await takeTheOffer('third')) === 'third',
+      `offered while on ${offeredAgain.kept}, landed on third`,
+    );
+
+    const now = await shellsOf(page);
+    check(
+      'the shell before last is dropped: two builds back is nobody to answer for',
+      now.length === 2 && !now.includes(first[0]) && (await stillServed(second.now)),
+      `${now.length} shells, the first build ${now.includes(first[0]) ? 'still kept' : 'gone'}, ${second.now} still served`,
+    );
+
+    // And none of it costs the offline claim: the last build is a build like any
+    // other, and the storage behind it is the same storage.
+    await server.stop();
+    await boot(page, server.origin);
+    check(
+      'after two updates the page still comes up with nothing to fetch it from',
+      (await page.evaluate(`!!window.webpdf?.open && !!navigator.serviceWorker.controller`)) && (await buildOf(page)) === 'third',
+      `${server.origin} is not answering any more`,
+    );
+  } finally {
+    await server.stop().catch(() => undefined);
+    fs.rmSync(dir, { recursive: true, force: true });
+    await browser.close();
+  }
 }
 
 console.log(failures ? `\nPWA CHECK FAILED (${failures})` : '\nPWA CHECK PASSED');

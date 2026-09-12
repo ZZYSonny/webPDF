@@ -776,15 +776,16 @@ the page comes up, and so does the document they were reading.
 Three things are cached, and they are cached differently on purpose:
 
 * **The shell** — the page, its scripts, its styles, the manifest — is precached
-  when the worker installs, into a cache named after a digest of those files. A
-  redeploy is a new name, so the old copy is dropped whole on activation and
-  nothing from two builds is ever served together. There is deliberately no
-  `skipWaiting`: a new build takes over when the pages of the old one are closed.
-  This page fetches parts of itself lazily — the engine's own chunk, when the
-  first document is opened — and a worker that swapped the shell out from under a
-  page mid-session would be answering those fetches with a build that no longer
-  has them. So an update waits for the next visit, and a reader reading is never
-  interrupted by one.
+  when the worker installs, into a cache named after a digest of those files, and
+  assembled with `cache: 'reload'` rather than out of whatever the HTTP cache is
+  still holding. A redeploy is a new name, so nothing from two builds is ever
+  served to the same request — a navigation is answered from the current build's
+  shell and from nowhere else — and the build *before* the current one is kept
+  whole, for exactly one generation. That one is not nostalgia: the moment a new
+  build takes over is a moment in which some page is still the old one, and this
+  page fetches parts of itself lazily (the engine's own chunk, when the first
+  document is opened). Anything older is dropped when the build after it
+  activates, so two builds is all that is ever kept.
 * **The engine** — MuPDF's 10 MB wasm — is *not* precached. Ten megabytes
   downloaded on install, for a reader who may never open a document, is not a
   promise a site should make. It is kept the first time it is actually fetched —
@@ -795,6 +796,22 @@ Three things are cached, and they are cached differently on purpose:
   worker only looks there before going to the network. A PDF at a URL is
   immutable, so a cached one is never revalidated; something that was not kept,
   opened while offline, says so rather than failing with "Failed to fetch".
+
+A redeploy arrives the way a deploy should: told, not sprung. There is
+deliberately no `skipWaiting`, because a worker that took over the moment it was
+installed would be answering those lazy fetches with a build that no longer has
+those files — but a worker that waits waits for as long as any page of the old
+build is open, which for a reader who keeps this page open, or for an installed
+app that is never navigated anywhere, is forever. That is the whole reason a site
+like this appears never to update. So the page looks for a new build — when it
+starts, and when it comes back to the front, with `updateViaCache: 'none'` so that
+GitHub Pages' ten-minute lifetime on every file cannot hide the one file that
+says whether the page is current — and when one is waiting it says so: a notice
+with *Reload* on it, which asks the worker to take over and reloads the page into
+it. The reader is never swapped onto a new build mid-sentence; they are told, and
+they answer. A reload alone does not do it — that is the browser's rule for a
+waiting worker, not this site's — which is exactly the complaint the notice
+exists to answer.
 
 The published engine is asked for from `https://cdn.jsdelivr.net/npm/mupdf@<version>/…`
 first and from the site's own copy of the same bytes second. The reason is not
@@ -1222,7 +1239,8 @@ demo/                       (continued)
   host.ts                   the host bridge: hand over a document, hear what opened
   host-mode.js              the one thing that must happen before the first paint
   offline.ts                the page's half of offline: the worker's registration,
-                            and the documents kept for the next visit
+                            the look for a newer build, and the documents kept
+                            for the next visit
   sw.js                     the service worker: the shell, the engine, the reader's
                             documents - the two lists it needs are filled in by
                             `pwa()` in `vite.demo.config.ts`
@@ -1280,7 +1298,8 @@ tests/
     ligature.mjs            the letters and the ligature glyph are the same pixels
     pinch.mjs               the pinch/zoom contract
     bridge.mjs              the host protocol: a new page, an old host
-    pwa.mjs                 the service worker, and a server killed mid-test
+    pwa.mjs                 the service worker, a redeploy the page is told about,
+                            and a server killed mid-test
     extension.mjs           the extension itself, loaded into Chrome
     compare.mjs, diff.mjs   text-vs-outlines fidelity, with a difference map
 scripts/

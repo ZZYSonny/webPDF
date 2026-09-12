@@ -8,8 +8,11 @@
  *   - the *shell* - this page and the files it is made of - is the service
  *     worker's (`demo/sw.js`), because it is the same for everyone and belongs to
  *     the build rather than to the reader. This module's job there is to register
- *     it, and to tell it once, after the engine has actually been used, which
- *     URLs the engine came from so it can keep a copy of the same bytes;
+ *     it, to notice when a *newer* build has installed and is waiting for a page
+ *     willing to reload into it, and to tell it once, after the engine has
+ *     actually been used, which URLs the engine came from so it can keep a copy
+ *     of the same bytes. A worker that is never asked never takes over - which is
+ *     deliberate, and which is why the noticing is here rather than there;
  *   - the *documents* are this module's, because which documents matter is a
  *     reader's business and nobody else's. The page writes them into a cache of
  *     its own as they are opened, and the worker serves them from there (see
@@ -59,6 +62,12 @@ export interface OfflineOptions {
   hosted: boolean;
   /** Where a failure that the reader should not be interrupted by is reported. */
   onWarn?: (message: string) => void;
+  /**
+   * A newer build has installed and is waiting to take over. `apply` asks it to,
+   * and reloads the page into it; what to do about the offer - say it, and let
+   * the reader decide - is the page's business.
+   */
+  onUpdate?: (apply: () => void) => void;
 }
 
 export interface Offline {
@@ -79,8 +88,8 @@ export interface Offline {
  * Register the worker, and hand back the two things the page does about being
  * offline. Safe to call in a browser that can do none of it.
  */
-export function createOffline({ sources, hosted, onWarn }: OfflineOptions): Offline {
-  const worker = register(hosted, onWarn);
+export function createOffline({ sources, hosted, onWarn, onUpdate }: OfflineOptions): Offline {
+  const worker = register(hosted, onWarn, onUpdate);
   let warmed = false;
 
   return {
@@ -113,15 +122,123 @@ function keyOf(url: string): string | null {
  * every edit into a mystery, and a reload that does not reload is worse than no
  * offline at all.
  */
-function register(hosted: boolean, onWarn?: (message: string) => void): ServiceWorkerContainer | null {
+function register(
+  hosted: boolean,
+  onWarn?: (message: string) => void,
+  onUpdate?: (apply: () => void) => void,
+): ServiceWorkerContainer | null {
   if (!import.meta.env.PROD || hosted) return null;
   if (typeof navigator === 'undefined' || !('serviceWorker' in navigator)) return null;
+  const worker = navigator.serviceWorker;
   // Relative to this page, so the site's path on GitHub Pages never has to be
   // known here; the scope is the worker's own directory, which is the whole site.
-  void navigator.serviceWorker.register('./sw.js').catch((error: unknown) => {
-    onWarn?.(`no offline copy of the viewer: ${String((error as Error)?.message ?? error)}`);
+  //
+  // `updateViaCache` is not a detail. The worker is a file like every other file
+  // on the site, and GitHub Pages hands each of them a ten-minute lifetime; what
+  // this one *is* - the only thing that can say whether the page is current - has
+  // to come from the network, or a deploy is invisible to a browser that asked
+  // within ten minutes of the one before it.
+  void worker
+    .register('./sw.js', { updateViaCache: 'none' })
+    .then((registration) => watch(registration, worker, onUpdate))
+    .catch((error: unknown) => {
+      onWarn?.(`no offline copy of the viewer: ${String((error as Error)?.message ?? error)}`);
+    });
+  return worker;
+}
+
+/** The shortest a second look for a new build can follow the first: see `watch`. */
+const CHECK_MS = 60_000;
+
+/**
+ * Watch for a newer build, and hand the page the way to take it.
+ *
+ * The worker never takes over on its own - a build that did would be answering
+ * the lazy fetches of a page built for the shell before it - so a new one
+ * installs and then *waits*, and it waits for as long as any page of the old
+ * build is open. For a reader who keeps this page open, and for an installed app
+ * that is never navigated anywhere, that is forever: it is the whole reason a
+ * site like this appears never to update. So the page looks, and says what it
+ * found.
+ *
+ * It looks at the two moments a reader arrives: when the page starts, and when
+ * it comes back to the front. A resumed app is not navigated, so nothing else
+ * would ask.
+ */
+function watch(
+  registration: ServiceWorkerRegistration,
+  worker: ServiceWorkerContainer,
+  onUpdate?: (apply: () => void) => void,
+): void {
+  let offered = false;
+  let applying = false;
+  let checkedAt = 0;
+  /** The build the reader was told about, so an answer can be given to it. */
+  let waiting: ServiceWorker | null = null;
+
+  /** Take the waiting build: ask it to take over, and reload into it. */
+  const apply = (): void => {
+    applying = true;
+    // The registration's own answer first, and the build that was announced as
+    // the fallback: a worker can report itself `installed` in the same turn that
+    // it becomes the waiting one, in which case only the second is set.
+    const next = registration.waiting ?? waiting;
+    // Already active - the browser promoted it with nobody watching - so there
+    // is nothing to ask for and only a page to fetch again.
+    if (!next) {
+      location.reload();
+      return;
+    }
+    next.postMessage({ wpdf: 'apply-update' });
+    // A worker that cannot take over must not leave the reader looking at a
+    // button that says it is reloading. The reload lands on the same build and
+    // the same offer, which is honest, and one more click away from it.
+    setTimeout(() => applying && location.reload(), 4000);
+  };
+
+  // The worker claims the page it replaced, which is the moment the page can ask
+  // for itself again - and the only moment it may reload unasked.
+  worker.addEventListener('controllerchange', () => {
+    if (applying) location.reload();
   });
-  return navigator.serviceWorker;
+
+  const offer = (build: ServiceWorker | null): void => {
+    if (offered) return;
+    offered = true;
+    waiting = build;
+    onUpdate?.(apply);
+  };
+
+  // A build that finished installing while this page was open - or while another
+  // tab of the old one was - is already waiting for whoever asks.
+  if (registration.waiting && worker.controller) offer(registration.waiting);
+
+  registration.addEventListener('updatefound', () => {
+    const installing = registration.installing;
+    installing?.addEventListener('statechange', () => {
+      // `installed` is a build that cannot take over while this page is
+      // controlled. The first install goes straight on to `activated`, and a
+      // page with no controller has nothing to be updated to.
+      if (installing.state === 'installed' && worker.controller) offer(installing);
+    });
+  });
+
+  const check = (): void => {
+    const now = Date.now();
+    if (now - checkedAt < CHECK_MS) return;
+    checkedAt = now;
+    // A page that cannot be reached is not a failure worth a word to the reader:
+    // offline is the state this worker exists for, and a check that cannot
+    // happen is that state, not an error.
+    void registration.update().catch(() => undefined);
+  };
+
+  if (typeof document !== 'undefined') {
+    document.addEventListener('visibilitychange', () => {
+      if (!document.hidden) check();
+    });
+  }
+  check();
 }
 
 /** Tell the worker to keep the engine, once a document has needed it. */

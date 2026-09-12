@@ -294,8 +294,15 @@
     <!--
       The old status bar is gone: transient messages (opening a file, an error)
       float in a toast instead, so nothing permanent is competing with the pages.
+      The one thing that stays until it is answered is a newer build waiting to
+      take over (`offline.ts` looks for one, `announceUpdate` says so) - a notice
+      with a way to take it and a way to put it down.
     -->
-    <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+    <div id="toast" class="toast" role="status" aria-live="polite" hidden>
+      <span id="toast-text"></span>
+      <button id="toast-action" class="btn tiny" type="button" hidden></button>
+      <button id="toast-dismiss" class="toast-dismiss" type="button" aria-label="Dismiss" hidden>×</button>
+    </div>
 
     <script type="module" src="./main.ts"></script>
   </body>

@@ -1,5 +1,6 @@
 /**
- * The service worker: the viewer with no network.
+ * The service worker: the viewer with no network, and the way a new build of it
+ * gets in.
  *
  * The published site is a page and a handful of assets, and every one of them is
  * listed below by the build that made it. That list is the shell, and the shell
@@ -10,8 +11,10 @@
  *
  *   - the *shell* (the page, its scripts, its styles, its manifest and icons) is
  *     precached on install, in a cache named after a digest of the files
- *     themselves. A new build is a new name, so the old one is dropped whole on
- *     activation and nothing from two builds is ever served together;
+ *     themselves. A new build is a new name, so the build before it is kept
+ *     whole - for exactly one generation, see `install` and `activate` - and
+ *     nothing from two builds is ever served to the same request: a navigation
+ *     is answered from this build's shell and from nowhere else;
  *   - the *engine* (MuPDF's 10 MB wasm) is not precached - downloading ten
  *     megabytes on install, for a reader who may never open a document, is not a
  *     promise a site should make. It is kept the first time it is actually
@@ -23,14 +26,15 @@
  *     does is look in it before going to the network. A PDF is immutable at its
  *     URL: a cached one is never stale, so it is never revalidated.
  *
- * There is no `skipWaiting`, and that is the interesting decision. A new worker
- * takes over when the pages of the old one are gone, not in the middle of a
- * reader's session: this page fetches parts of itself lazily (the engine's own
- * chunk is fetched when the first document is opened), and a worker that swapped
- * the shell out from under a page that was still loading it would be answering
- * those fetches with a build that no longer has those files. So an update waits
- * for the next visit, which for a document viewer is a reload away - and a reader
- * reading is never interrupted by one.
+ * There is still no `skipWaiting` on install, and that is the interesting
+ * decision. A worker that took over the moment it was installed would be
+ * answering the lazy fetches of a page that was built for the shell before it -
+ * this page fetches parts of itself when the first document is opened - and a
+ * reader reading is never interrupted by a deploy. What there is instead is a
+ * way for the *page* to ask: `apply-update` below, sent by a page that has been
+ * told a new build is waiting and has a reader willing to reload for it. The
+ * shell before this one is kept for exactly that reason: the moment of the swap
+ * is a moment in which some page is still the build before it.
  *
  * What is *not* here matters as much: no push, no sync, no background anything.
  * This worker exists to serve bytes that are already on the disk.
@@ -46,6 +50,21 @@ const PRECACHE = __PRECACHE__;
 
 /** The shell's cache, named after the build so a new one cannot mix with it. */
 const SHELL = `webpdf-shell-${BUILD}`;
+
+/** Every shell is named with this; the order below deliberately is not. */
+const SHELL_PREFIX = 'webpdf-shell-';
+
+/**
+ * Which shells are kept, newest first, in a cache of its own.
+ *
+ * Nothing about a cache name says when it was made, and a worker can be
+ * terminated between its install and its activation, so "the build before this
+ * one" has to be written down rather than worked out. One entry, one list, and
+ * the two names at the front of it are what survives; the cache itself is not a
+ * shell and is never trimmed.
+ */
+const ORDER = 'webpdf-shells';
+const ORDER_KEY = new URL('./shells.json', self.location.href).href;
 
 /** The engine's cache, and the page's document cache, which is not ours to trim. */
 const ENGINE = 'webpdf-engine';
@@ -64,17 +83,57 @@ const INDEX = new URL('./index.html', self.location.href).href;
  */
 const ENTRY = new URL('./', self.location.href).href;
 
+/**
+ * The shell this build replaced, once one is known to be kept.
+ *
+ * Read from the order below, and remembered here because it is asked for on
+ * every request that is not a navigation. A worker that was terminated reads it
+ * again on the first such request; that is what `read` is for.
+ */
+let older = null;
+let read = false;
+
+/** The shells that are kept, newest first. */
+async function order() {
+  const cache = await caches.open(ORDER);
+  const kept = await cache.match(ORDER_KEY);
+  if (!kept) return [];
+  try {
+    const names = JSON.parse(await kept.text());
+    return Array.isArray(names) ? names.filter((name) => typeof name === 'string') : [];
+  } catch {
+    return [];
+  }
+}
+
+/** Put a shell at the front of the order, where it stays until it is dropped. */
+async function remember(name) {
+  const cache = await caches.open(ORDER);
+  const names = [name, ...(await order()).filter((other) => other !== name)];
+  await cache.put(ORDER_KEY, new Response(JSON.stringify(names)));
+}
+
 self.addEventListener('install', (event) => {
   event.waitUntil(
     (async () => {
       const cache = await caches.open(SHELL);
       // All or nothing: a shell missing one of its files is not a shell, and
       // an install that fails is retried on the next visit.
-      await cache.addAll(PRECACHE);
+      //
+      // Fetched with `cache: 'reload'`, because what a shell is made of is
+      // decided by the deploy that wrote this worker and not by whatever the
+      // HTTP cache is still holding. GitHub Pages hands every file a ten-minute
+      // lifetime, and a shell assembled from that would be a page pointing at
+      // files the deploy has already replaced - which is a broken build, cached
+      // until the *next* one.
+      await cache.addAll(PRECACHE.map((file) => new Request(file, { cache: 'reload' })));
       // The entry alone is allowed to fail - `index.html` is already in the list
       // and is matched in its place - so a server that answers it with a
       // redirect, or not at all, cannot take the whole install down with it.
-      await cache.add(ENTRY).catch(() => undefined);
+      await cache.add(new Request(ENTRY, { cache: 'reload' })).catch(() => undefined);
+      // Only once the shell is really there: a name at the front of the order is
+      // a promise that the cache behind it is whole.
+      await remember(SHELL);
     })(),
   );
 });
@@ -82,11 +141,19 @@ self.addEventListener('install', (event) => {
 self.addEventListener('activate', (event) => {
   event.waitUntil(
     (async () => {
+      // This build's shell, and the one before it. The second is not nostalgia:
+      // between a reader asking for the update and the page they asked from
+      // reloading into it, that page is still the old one, and so is any other
+      // tab left open on it - and both fetch parts of themselves lazily. A
+      // build older than that has nobody to answer for, so it goes.
+      const keep = [SHELL, ...(await order()).filter((name) => name !== SHELL)].slice(0, 2);
       for (const name of await caches.keys()) {
-        // Only the shells: the engine and the reader's documents outlive a
-        // deploy, and the engine cache is trimmed by URL in `warmEngine`.
-        if (name.startsWith('webpdf-shell-') && name !== SHELL) await caches.delete(name);
+        if (name.startsWith(SHELL_PREFIX) && !keep.includes(name)) await caches.delete(name);
       }
+      older = keep[1] ?? null;
+      read = true;
+      const cache = await caches.open(ORDER);
+      await cache.put(ORDER_KEY, new Response(JSON.stringify(keep)));
       // A first visit installed this worker *after* the page it belongs to was
       // already loading; claiming it is what makes that page's later fetches -
       // the engine, a document - go through here.
@@ -94,6 +161,15 @@ self.addEventListener('activate', (event) => {
     })(),
   );
 });
+
+/** The shell this build replaced, if it is still kept. */
+async function previous() {
+  if (!read) {
+    read = true;
+    older = (await order()).find((name) => name !== SHELL) ?? null;
+  }
+  return older;
+}
 
 /** The page itself: the cached shell, by URL or as the site's one page. */
 async function shell(request) {
@@ -103,6 +179,25 @@ async function shell(request) {
     (await cache.match(INDEX)) ??
     (await fetch(request))
   );
+}
+
+/**
+ * What is already kept of a file the page is made of: this build's shell first,
+ * then the one before it.
+ *
+ * The second lookup is what keeps a deploy invisible to a page that is still
+ * loading. A file whose name carries a content hash is not in the new shell at
+ * all, so without it the fetch would go to the network and find a 404 where the
+ * deploy used to be - a viewer that cannot load its own engine until someone
+ * reloads it.
+ */
+async function shelled(request) {
+  for (const name of [SHELL, await previous()]) {
+    if (!name || !(await caches.has(name))) continue;
+    const hit = await (await caches.open(name)).match(request, { ignoreSearch: true });
+    if (hit) return hit;
+  }
+  return null;
 }
 
 /**
@@ -122,12 +217,11 @@ async function engine(request) {
   return kept ?? (await fetch(request));
 }
 
-/** A document the page kept, or the network. */
+/** A document the page kept, a file the shell kept, or the network. */
 async function kept(request) {
   const cached = await caches.match(request, { cacheName: DOCS, ignoreVary: true });
   if (cached) return cached;
-  const shelled = await caches.match(request, { cacheName: SHELL, ignoreSearch: true });
-  return shelled ?? (await fetch(request));
+  return (await shelled(request)) ?? (await fetch(request));
 }
 
 self.addEventListener('fetch', (event) => {
@@ -189,6 +283,15 @@ async function warmEngine(sources) {
 
 self.addEventListener('message', (event) => {
   const message = event.data;
-  if (!message || message.wpdf !== 'warm-engine') return;
-  event.waitUntil(warmEngine(message.sources));
+  if (!message) return;
+  if (message.wpdf === 'warm-engine') {
+    event.waitUntil(warmEngine(message.sources));
+    return;
+  }
+  // A page has found this build waiting and a reader has said yes: take over
+  // now, rather than when every tab of the build before it happens to close.
+  // The page reloads itself on `controllerchange`, so the shell is not swapped
+  // out from under a page that is staying - and the shell it came from is still
+  // kept until the next build, for whatever it had already started to fetch.
+  if (message.wpdf === 'apply-update') event.waitUntil(self.skipWaiting());
 });

@@ -92,6 +92,9 @@ const els = {
   emptyOpen: $<HTMLButtonElement>('empty-open'),
   progress: $('progress'),
   toast: $('toast'),
+  toastText: $('toast-text'),
+  toastAction: $<HTMLButtonElement>('toast-action'),
+  toastDismiss: $<HTMLButtonElement>('toast-dismiss'),
   password: $('password'),
   passwordForm: $<HTMLFormElement>('password-form'),
   passwordText: $('password-text'),
@@ -185,6 +188,10 @@ const offline = createOffline({
   sources: engineSources,
   hosted: isHosted() && window.parent !== window,
   onWarn: (message) => notify(message),
+  // A newer build of the viewer, waiting for a page willing to reload into it.
+  // The page says so and lets the reader decide; the alternative is a build that
+  // installs and then sits there until every tab of the old one is closed.
+  onUpdate: (apply) => announceUpdate(apply),
 });
 
 /**
@@ -563,15 +570,57 @@ function onViewerEvent(event: ViewerEvent): void {
 
 /* ------------------------------------------------------------------ toast */
 
+/**
+ * The one message that does not leave on its own: a newer build is installed
+ * and waiting to take over (`offline.ts` finds it). It stays until the reader
+ * answers it - the button, or the × - because a deploy that nobody is told
+ * about is a deploy that never arrives; anything else the page has to say is a
+ * sentence that floats and goes.
+ */
+let applyUpdate: (() => void) | null = null;
+
 function notify(text: string, kind: 'info' | 'error' = 'info'): void {
-  els.toast.textContent = text;
-  els.toast.classList.toggle('error', kind === 'error');
-  els.toast.hidden = false;
   clearTimeout(toastTimer);
+  applyUpdate = null;
+  els.toastText.textContent = text;
+  els.toast.classList.toggle('error', kind === 'error');
+  els.toastAction.hidden = true;
+  els.toastDismiss.hidden = true;
+  els.toast.hidden = false;
   toastTimer = window.setTimeout(() => {
     els.toast.hidden = true;
   }, kind === 'error' ? 8000 : 3500);
 }
+
+/** Say that a newer build is waiting, and take the reader's answer to it. */
+function announceUpdate(apply: () => void): void {
+  clearTimeout(toastTimer);
+  applyUpdate = apply;
+  els.toastText.textContent = 'A newer version of the viewer is ready.';
+  els.toast.classList.remove('error');
+  els.toastAction.textContent = 'Reload';
+  els.toastAction.disabled = false;
+  els.toastAction.hidden = false;
+  els.toastDismiss.hidden = false;
+  els.toast.hidden = false;
+}
+
+els.toastAction.addEventListener('click', () => {
+  const apply = applyUpdate;
+  if (!apply) return;
+  applyUpdate = null;
+  // The page is about to be replaced; saying so is the last thing this one does.
+  els.toastAction.disabled = true;
+  els.toastAction.textContent = 'Reloading…';
+  apply();
+});
+
+els.toastDismiss.addEventListener('click', () => {
+  // Not now is an answer: the build stays waiting, and the next visit is told
+  // about it again.
+  applyUpdate = null;
+  els.toast.hidden = true;
+});
 
 /* ------------------------------------------------------------------- zoom */
 

@@ -947,6 +947,9 @@ html.wpdf-host .empty {
 /**
  * Stands in for the status bar that used to sit under the pages: a message is
  * transient, so it floats and leaves on its own.
+ *
+ * A message with an action in it is not transient: a newer build, waiting for
+ * the reader to say yes, leaves when the reader has answered it - either way.
  */
 .toast {
   position: fixed;
@@ -961,6 +964,30 @@ html.wpdf-host .empty {
   border-radius: var(--radius);
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
   font-size: 12.5px;
+  color: var(--text);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.toast-action {
+  white-space: nowrap;
+}
+
+.toast-dismiss {
+  appearance: none;
+  border: 0;
+  background: none;
+  padding: 0 2px;
+  margin-left: -2px;
+  font: inherit;
+  font-size: 15px;
+  line-height: 1;
+  color: var(--text-muted);
+  cursor: pointer;
+}
+
+.toast-dismiss:hover {
   color: var(--text);
 }
 
