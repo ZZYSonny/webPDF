@@ -12,19 +12,31 @@
  * A font built from the program is not limited that way: it can hold every glyph
  * the font has (see `program.ts`), so one face serves the whole document. What a
  * program cannot say is which *character* each glyph is written as, because that
- * is the PDF's encoding rather than the font's, so the plan also walks the
- * document once - text only, drawing nothing - and collects, per program, the
- * glyph ids, the codes they were drawn for, and the letters behind any ligature.
+ * is the PDF's encoding rather than the font's, so the plan walks the document
+ * once - the display list only, drawing nothing - and collects the glyph ids and
+ * the codes they were drawn for. The *letters* behind a ligature come from the
+ * font dictionaries instead (`encoding.ts`): `/Differences` names the glyph `fi`
+ * and a `/ToUnicode` entry longer than one character spells it out, which is
+ * both cheaper and more faithful than laying the page's characters over its
+ * glyphs to work out which ones a glyph swallowed. Measured on the 756-page
+ * specification, that inference was 4.5 s of the plan's 8.1 s walk and it is now
+ * gone.
  *
- * The walk is cheap (measured: 4.3 ms a page on a 756-page specification, 12-19
- * on the papers) but the build is not - drawing every glyph a font program has
- * and compiling it is tens to hundreds of milliseconds a face - so a plan is not
- * something to make a reader wait for. It runs in the *background*, from the
- * moment the document is open, a slice at a time: `start()` walks and builds
- * while the host draws its pages the other way (a face per page, in a frame of
- * its own), and hands the thread back between slices so that a page the reader
- * asks for is never queued behind it. When the last face is built the plan is
- * `planned`, and the host can switch to it.
+ * Walking the display list is not the expensive part - measured: 4.7 ms a page
+ * on the specification, 12-19 on the papers - and it is not optional, because
+ * three of the four corpus documents draw a *substituted* face (no program at
+ * all) on nearly every page: only a page handle can draw those glyphs, and only
+ * the display list says which ones a page used. What a program could not be
+ * asked for is its characters, and those come from the dictionaries.
+ *
+ * The build is the part that cannot be made smaller - drawing every glyph a
+ * program has and compiling it is tens to hundreds of milliseconds a face - so
+ * a plan is not something to make a reader wait for. It runs in the
+ * *background*, from the moment the document is open, a slice at a time:
+ * `start()` walks and builds while the host draws its pages the other way (a
+ * face per page, in a frame of its own), and hands the thread back between
+ * slices so that a page the reader asks for is never queued behind it. When the
+ * last face is built the plan is `planned`, and the host can switch to it.
  *
  * Planning the whole document is worth it in *work* even when it is not worth
  * waiting for in time: a face that grows is a face rebuilt, so a plan that keeps
@@ -36,9 +48,9 @@
 import * as mupdf from 'mupdf';
 
 import { glyphsFromFont, glyphsFromProgram, pageGlyphs, programId, programsOnPage, type FontProgram } from './program.ts';
-import { glyphLetters, ligatureCode } from '../svg/ligatures.ts';
+import { drawLetters, pageEncodings, type FontEncoding } from './encoding.ts';
+import { ligatureCode } from '../svg/ligatures.ts';
 import { glyphKey, type GlyphOutline, type GlyphPlacement } from '../svg/glyphs.ts';
-import { type TextChar } from '../svg/spaces.ts';
 import { PUA_BASE, PUA_LIMIT, type LigatureSubstitution, type OutlineGlyph } from './build.ts';
 import { FontRegistry, type FontAsset, type PageFontPlan } from './registry.ts';
 import { debug } from '../debug.ts';
@@ -87,30 +99,6 @@ function hash(parts: readonly string[]): string {
     a = Math.imul(a ^ 0x1f, 0x01000193);
   }
   return (a >>> 0).toString(36) + (b >>> 0).toString(36);
-}
-
-/**
- * The characters on a page, with the origins that tie them to the glyphs.
- *
- * The text pass is what knows a ligature is two letters: the display list
- * reports one glyph for `fi`, and only the text device says that two characters
- * were standing at that point.
- */
-function readChars(page: mupdf.Page): TextChar[] {
-  const chars: TextChar[] = [];
-  let line = 0;
-  const stext = page.toStructuredText('');
-  try {
-    stext.walk({
-      beginLine() {
-        line++;
-      },
-      onChar: (c: string, origin: number[]) => chars.push({ text: c, x: origin[0], y: origin[1], line }),
-    });
-  } finally {
-    stext.destroy();
-  }
-  return chars;
 }
 
 /* ------------------------------------------------------------------ */
@@ -166,6 +154,14 @@ export class DocumentFontPlan {
    * hashing fonts that had not changed.
    */
   private readonly dirty = new Set<Entry>();
+  /**
+   * Font dictionaries already read, keyed by the resource's indirect object.
+   *
+   * A document draws one font on a thousand pages and every page names the same
+   * dictionary; parsing a `/ToUnicode` once per page would be the whole cost of
+   * the pass.
+   */
+  private readonly encodings = new Map<string, FontEncoding>();
   private readonly opts: DocumentFontPlanOptions;
   private registry: FontRegistry | null = null;
   private task: Promise<void> | null = null;
@@ -325,28 +321,20 @@ export class DocumentFontPlan {
         if (grew) this.dirty.add(entry);
       }
 
-      // Which letters a glyph stands for, matched by the origin the display list
-      // gave it - the same comparison the per-page pipeline makes, on the same
-      // two coordinates, but from the walk rather than from a rendered page.
-      const chars = readChars(page);
-      if (chars.length && draws.length) {
-        const placements: GlyphPlacement[] = draws.map((d) => ({
-          fontId: d.fontId,
-          gid: d.gid,
-          code: d.code,
-          matrix: d.matrix,
-          attrs: [],
-          start: 0,
-          end: 0,
-        }));
-        for (const [key, letters] of glyphLetters(chars, placements)) {
-          if ([...letters].length < 2) continue;
-          const gid = Number(key.split(':')[1]);
-          const entry = this.entryFor(fonts[Number(key.split(':')[0])]);
-          if (!entry.letters.has(gid)) {
-            entry.letters.set(gid, letters);
-            this.dirty.add(entry);
-          }
+      // Which letters a glyph stands for is a property of the *document*, not
+      // of a rendered page: `/Differences` names the glyph `fi`, a `/ToUnicode`
+      // entry longer than one character spells it out, and a code that is the
+      // ligature's own character carries its letters with it. Reading those is
+      // what replaced the text pass this used to make - laying the page's
+      // characters over its glyphs and inferring which ones a glyph swallowed -
+      // which was the most expensive thing the plan did and the least certain.
+      const letters = drawLetters(fonts, draws, pageEncodings(page, programs, this.encodings));
+      for (const [fontId, byGid] of letters) {
+        const entry = this.entryFor(fonts[fontId]);
+        for (const [gid, text] of byGid) {
+          if (entry.letters.has(gid)) continue;
+          entry.letters.set(gid, text);
+          this.dirty.add(entry);
         }
       }
     } finally {

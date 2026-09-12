@@ -1,28 +1,30 @@
 /**
  * What a document-wide face costs when no page is read.
  *
- * The plan in `src/core/font/plan.ts` reads every page's content three times -
- * the display list, the structured text, and the letters between them - to
- * learn which glyphs the document draws and which characters they stand for.
- * Every one of those things is also a property of the *font program*: the
- * glyphs it has, and, through FreeType's charmaps, the characters its own
- * encoding gives them. This measures both ways to the same faces, on the same
- * documents, in one run:
+ * The plan in `src/core/font/plan.ts` walks every page's display list to learn
+ * which glyphs the document draws and which characters they were shown with,
+ * and reads the page tree's font dictionaries for the *letters* behind a
+ * ligature (`font/encoding.ts`). Every one of those things is also a property of
+ * the font program - the glyphs it has, and, through FreeType's charmaps, the
+ * characters its own encoding gives them - so this measures the shortcut the
+ * programs offer against what the plan actually does:
  *
- *   - the walk, then one face per font built from the glyphs the walk saw
- *     (what the plan does today);
+ *   - the plan's walk: the display list, page by page, plus the dictionaries
+ *     (`pageGlyphs` and `pageEncodings` - metadata, and no page is drawn);
  *   - no walk at all: the page tree's font dictionaries for the programs
- *     (`programsOnPage` - metadata only, no content stream is run), a sweep of
+ *     (metadata only, no content stream is run), a sweep of
  *     `mupdf.Font.encodeCharacter` for the characters each program gives itself,
  *     and one face per font built from every glyph the program has.
  *
- * The second is the shortcut the plan could take, and the numbers say two
- * things at once: it is much cheaper (the walk is most of what opening a large
- * document costs), and its characters are the *program's*, which are not always
- * the document's - a subset's own encoding disagrees with the PDF encoding for
- * a handful of glyphs, and a program with no cmap at all (a Symbol subset) names
- * nothing. The faces are complete either way: the outlines come from the program,
- * so what is lost is text, not ink.
+ * The numbers say two things at once. The shortcut is still much cheaper, and
+ * its characters are the *program's*, which are not always the document's - a
+ * subset's own encoding disagrees with the PDF encoding for a handful of glyphs,
+ * and a program with no cmap at all (a Symbol subset) names nothing. What the
+ * shortcut cannot do at all is draw a font with *no program*: a substituted
+ * face, which three of these four documents draw on nearly every page, has no
+ * bytes to read and only a page handle can draw it. Since the plan is all or
+ * nothing per page, the display list stays; what the dictionaries replace is the
+ * text pass that used to infer a ligature's letters from the rendered page.
  *
  *   node tests/font-no-walk.mjs [pdf ...] [--pages N]
  *
@@ -37,10 +39,10 @@ import { PAPERS, paperFor, pdfName } from '../demo/papers.mjs';
 import { ensurePapers } from './pdf-cache.mjs';
 import { parseType1 } from './type1-program.mjs';
 import { glyphsFromProgram, pageGlyphs, programId, programsOnPage } from '../src/core/font/program.ts';
+import { drawLetters, pageEncodings } from '../src/core/font/encoding.ts';
 import { buildFontFromOutlines } from '../src/core/font/build.ts';
 import { parseSfnt, encodeWoff } from '../src/core/font/woff.ts';
-import { glyphLetters, LIGATURE_LETTERS } from '../src/core/svg/ligatures.ts';
-import { isSpaceChar } from '../src/core/svg/spaces.ts';
+import { LIGATURE_LETTERS } from '../src/core/svg/ligatures.ts';
 
 const args = process.argv.slice(2);
 const pagesArg = args.indexOf('--pages');
@@ -261,32 +263,26 @@ for (const document of documents) {
   const pages = MAX_PAGES > 0 ? Math.min(total, MAX_PAGES) : total;
   pageTotal += pages;
 
-  /* the walk: exactly what `DocumentFontPlan.walkPage` does, page by page */
+  /* the walk: the display list and the dictionaries, as `walkPage` does now */
   const walked = performance.now();
   const drawn = new Map(); // programId -> Map<gid, Set<code>>
   const textDrawn = new Map(); // programId -> Map<gid, letters>
+  const encodingCache = new Map();
+  let dictionaryMs = 0;
   for (let i = 0; i < pages; i++) {
     const page = doc.loadPage(i);
     try {
-      const { fonts, draws } = pageGlyphs(page);
+      const programs = programsOnPage(page);
+      const { fonts, draws } = pageGlyphs(page, programs);
       if (!fonts.length || !draws.length) continue;
-      const chars = [];
-      let line = 0;
-      const stext = page.toStructuredText('');
-      try {
-        stext.walk({ beginLine() { line++; }, onChar: (text, origin) => chars.push({ text, x: origin[0], y: origin[1], line }) });
-      } finally {
-        stext.destroy();
-      }
-      const placements = draws.map((d) => ({ fontId: d.fontId, gid: d.gid, code: d.code, matrix: d.matrix, attrs: [], start: 0, end: 0 }));
-      for (const [key, letters] of glyphLetters(chars, placements)) {
-        if ([...letters].length < 2) continue;
-        const [fontId, gid] = key.split(':').map(Number);
-        const program = fonts[fontId]?.program;
-        if (!program) continue;
-        const id = programId(program);
+      const reading = performance.now();
+      const letters = drawLetters(fonts, draws, pageEncodings(page, programs, encodingCache));
+      dictionaryMs += performance.now() - reading;
+      for (const [fontId, byGid] of letters) {
+        if (!fonts[fontId]?.program) continue;
+        const id = programId(fonts[fontId].program);
         if (!textDrawn.has(id)) textDrawn.set(id, new Map());
-        textDrawn.get(id).set(gid, letters);
+        for (const [gid, text] of byGid) textDrawn.get(id).set(gid, text);
       }
       for (const font of fonts) {
         if (!font.program) continue;
@@ -382,24 +378,30 @@ for (const document of documents) {
       `${namedPairs}/${pairs} | ${otherPairs} |`,
   );
   console.log(
-    `| | | | | | (discover ${discoverMs.toFixed(0)} + names ${sweepMs.toFixed(0)} + build ${shortcutMs.toFixed(0)}) | ` +
+    `| | | | display list ${(walkMs - dictionaryMs).toFixed(0)} + dictionaries ${dictionaryMs.toFixed(0)} | ` +
+      `| (discover ${discoverMs.toFixed(0)} + names ${sweepMs.toFixed(0)} + build ${shortcutMs.toFixed(0)}) | ` +
       `| ${noWalkGlyphs} glyphs${noCount ? `, ${noCount} programs uncounted` : ''} | same character ${samePairs} | |`,
   );
   doc.destroy();
 }
 
 console.log(
-  `\n"the walk" is the display list, the structured text and the letters between\n` +
-    `them for every page - ${(walkTotal / 1000).toFixed(1)} s of work over ${documents.length} document${documents.length === 1 ? '' : 's'}\n` +
-    `and ${pageTotal} pages, which is what the plan spends to learn what the programs\n` +
-    `already say. "no walk" is ${(noWalkTotal / 1000).toFixed(1)} s: page-tree metadata, a charmap sweep a\n` +
+  `\n"the walk" is what the plan does now - the display list and the dictionaries,\n` +
+    `page by page - ${(walkTotal / 1000).toFixed(1)} s of work over ${documents.length} document${documents.length === 1 ? '' : 's'}\n` +
+    `and ${pageTotal} pages. "no walk" is ${(noWalkTotal / 1000).toFixed(1)} s: page-tree metadata, a charmap sweep a\n` +
     `font, and a build that draws every glyph a program has rather than only the\n` +
-    `ones a page drew.\n\n` +
+    `ones a page drew. The dictionaries are the cheap half of the walk, and the\n` +
+    `display list is the half that stays.\n\n` +
     `The trade is in the last two columns. A program's own charmaps name the\n` +
     `glyphs it draws, but its *characters* are the font's, not the document's: a\n` +
     `subset whose encoding the PDF overrode, a symbol font with no cmap, and\n` +
     `pdfTeX's FalseType faces all disagree with the page for some glyphs. Those\n` +
-    `glyphs keep their ink (the outlines are the program's) and lose their text,\n` +
-    `so a plan that never reads a page still has to read the *dictionaries* -\n` +
-    `/ToUnicode, /Encoding, /CIDToGIDMap - to write the right characters.`,
+    `glyphs keep their ink (the outlines are the program's) and lose their text.\n\n` +
+    `What the shortcut cannot do at all is a font with *no program*: a substituted\n` +
+    `face has no bytes to read, and only a page handle can draw its glyphs. Three\n` +
+    `of these four documents draw one on nearly every page - 747 of the\n` +
+    `specification's 756, 69 of GPT-4's 100, 6 of ResNet's 12, 4 of Attention's 15\n` +
+    `- so a plan that never reads a page would give those pages up. Reading the\n` +
+    `dictionaries is what the walk keeps, and it is why the plan is a plan and not\n` +
+    `a scan of the page tree.`,
 );
