@@ -335,6 +335,12 @@ export class PdfViewer {
   private geometry: PageGeometry[] = [];
   /** Measured crop boxes, one entry per page; null for "not cropped". */
   private cropBoxes: (CropRect | null)[] = [];
+  /**
+   * Where the reader was when the crop boxes now being applied started to
+   * arrive: read once per batch, and in the coordinates of the layout the boxes
+   * have not changed yet.
+   */
+  private cropPlace: Place | null = null;
   /** The rules in force, empty for no crop at all. */
   private cropRules: CropRuleId[] = [];
   /** Page units kept around the content box, on every side. */
@@ -675,10 +681,11 @@ export class PdfViewer {
       // Only the margin moved. Nothing has to be measured again - every page
       // has been measured already - so the pages are re-laid-out and re-rendered
       // straight away, which is what makes the field feel like a control.
+      const place = this.placeHere();
       this.padding = pad;
       this.applyCropGeometry();
       this.invalidateAll();
-      this.relayout();
+      this.relayout(place);
       this.emitCrop(true);
       return;
     }
@@ -688,11 +695,12 @@ export class PdfViewer {
     this.cropEpoch++;
     this.cropRunning = false;
     if (next.length === 0) {
+      const place = this.placeHere();
       this.cropBoxes = [];
       this.cropMeasured = 0;
       this.applyCropGeometry();
       this.invalidateAll();
-      this.relayout();
+      this.relayout(place);
       this.emitCrop(true);
       return;
     }
@@ -818,6 +826,11 @@ export class PdfViewer {
     const previous = this.cropBoxes[index] ?? null;
     const width = box ? box.width : page.width;
     const height = box ? box.height : page.height;
+    // Read where the reader is *before* the page's window changes: a crop box is
+    // part of the coordinate system a position is expressed in, so a position
+    // read after this line would be a position in a document that no longer
+    // exists - and the reader would be moved by the box they were measured for.
+    this.cropPlace ??= this.placeHere();
     this.cropBoxes[index] = box;
     const changed = !previous || Math.abs(previous.width - width) > 1e-3 || Math.abs(previous.height - height) > 1e-3;
     // What is on screen was rendered through the old window onto the page.
@@ -836,30 +849,57 @@ export class PdfViewer {
    * Re-lay-out without moving the reader: whatever page they are on stays where
    * it is on screen, at the same point inside it.
    */
-  private relayout(): void {
+  /**
+   * Re-lay-out the pages without moving the reader.
+   *
+   * A crop arriving, the padding moving, a rule being unchecked: the pages change
+   * size, and what has to survive that is the *point in the document* the reader
+   * is on - a sentence is not supposed to slide down the screen because a margin
+   * above it was trimmed. So the position is read in the coordinates the document
+   * has until now, the layout is rebuilt, and the reader is put back on that
+   * point: under a crop that has just removed the top of a page, that is nearer
+   * the top of the screen than it was, which is exactly right - the page is
+   * shorter and the content has not moved.
+   *
+   * `place` is passed in by the callers that are *about* to change the boxes,
+   * because reading it after that would mix the new crop with the old layout.
+   */
+  private relayout(place: Place = this.placeHere()): void {
     if (this.geometry.length === 0) {
       this.rebuildLayout();
       return;
     }
-    const anchor = Math.max(0, Math.min(this.geometry.length - 1, this.currentPage - 1));
-    const delta = this.readingOffset() - this.layout.offsetOf(anchor);
     this.rebuildLayout();
-    this.scrollToOffset(this.layout.offsetOf(anchor) + delta);
+    this.goToPlace(place);
     this.update();
+  }
+
+  /** Scroll so that a remembered position is at the top of the page area. */
+  private goToPlace(place: Place): void {
+    const index = Math.max(0, Math.min(this.geometry.length - 1, place.page - 1));
+    this.scrollToOffset(
+      place.y === null ? this.layout.offsetOf(index) : this.layout.offsetOfPoint(index, this.shownY(index, place.y), this.scale),
+    );
   }
 
   /**
    * Boxes arrive once per page, and every arrival would otherwise re-lay-out the
    * whole document. One per frame is plenty, and the reader never sees a page
    * size change twice in a frame.
+   *
+   * The position `setCropBox` read before it changed anything is what the layout
+   * is rebuilt around, so a batch of boxes arriving between two frames is still
+   * one position rather than the last of them.
    */
   private scheduleCropLayout(): void {
     if (this.cropFrame || this.destroyed) return;
     this.cropFrame = requestAnimationFrame(() => {
       this.cropFrame = 0;
       if (this.destroyed) return;
+      const place = this.cropPlace ?? this.placeHere();
+      this.cropPlace = null;
       this.applyCropGeometry();
-      this.relayout();
+      this.relayout(place);
     });
   }
 
@@ -923,6 +963,22 @@ export class PdfViewer {
       y === null ? this.layout.offsetOf(index) : this.layout.offsetOfPoint(index, this.shownY(index, y), this.scale);
     this.scrollToOffset(offset);
     this.update();
+  }
+
+  /**
+   * Where the reader is now: the page, and the point within it in the document's
+   * own coordinates - exactly what `goToDestination` takes, so a host can write
+   * the position down and hand it back after a reload. `y` is `null` at the top
+   * of the page, which is what `goToPage` restores.
+   *
+   * Deliberately the *reading* position (the top of the page area, a host's
+   * chrome accounted for), not the scroll offset: two layouts of the same
+   * document at different zooms have nothing in common in pixels and everything
+   * in common in pages.
+   */
+  place(): { page: number; y: number | null } {
+    const place = this.placeHere();
+    return { page: place.page, y: place.y };
   }
 
   /**

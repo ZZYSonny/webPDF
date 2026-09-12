@@ -12,10 +12,18 @@
       (it is one small file and stays crisp at any size), with the PNG for the
       browsers and crawlers that will not take an SVG icon.
     -->
-    <link rel="icon" href="/demo/icon.svg" type="image/svg+xml" />
-    <link rel="icon" href="/demo/icon.png" type="image/png" sizes="512x512" />
-    <link rel="apple-touch-icon" href="/demo/icon.png" />
-    <link rel="stylesheet" href="/demo/styles.css" />
+    <link rel="icon" href="./demo/icon.svg" type="image/svg+xml" />
+    <link rel="icon" href="./demo/icon.png" type="image/png" sizes="512x512" />
+    <link rel="apple-touch-icon" href="./demo/icon.png" />
+    <link rel="stylesheet" href="./demo/styles.css" />
+    <!--
+      A hosted page (`?host=1`: the extension's viewer) is opened with a document
+      already and must never offer one: the card that offers one - and the example
+      papers on it - is hidden before the first paint, not a moment later when the
+      module graph has loaded. That takes one classic script in the head, and it is
+      put there (and emitted) by `hostMode()` in the Vite config, because a script
+      that is not a module cannot live in this file and still be built.
+    -->
   </head>
   <body>
     <!--

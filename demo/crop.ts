@@ -73,6 +73,13 @@ export interface CropMenu {
   rules(): CropRuleId[];
   /** Check every rule, or none of them. */
   setAll(on: boolean): void;
+  /**
+   * Put the panel back where a reader left it: exactly these rules, at this
+   * padding. A host restoring a document that was read before says what was in
+   * force rather than clicking rows, and the pages are re-cropped the same way
+   * checking them by hand would.
+   */
+  setRules(rules: readonly CropRuleId[], padding: number): void;
   /** Page units kept around the content, as the field has it. */
   readonly padding: number;
   destroy(): void;
@@ -190,6 +197,15 @@ export function createCropMenu(opts: CropMenuOptions): CropMenu {
   }
 
   /* --------------------------------------------------------------- render */
+
+  function setRules(rules: readonly CropRuleId[], next: number): void {
+    selected.clear();
+    for (const rule of CROP_RULES) if (rules.includes(rule.id)) selected.add(rule.id);
+    if (Number.isFinite(next)) padding = Math.min(MAX_PADDING, Math.max(0, next));
+    padInput.value = String(padding);
+    render();
+    emit();
+  }
 
   function render(): void {
     const list_ = elements();
@@ -348,6 +364,7 @@ export function createCropMenu(opts: CropMenuOptions): CropMenu {
     },
     rules: selection,
     setAll,
+    setRules,
     destroy(): void {
       destroyed = true;
       button.removeEventListener('keydown', onButtonKeyDown);

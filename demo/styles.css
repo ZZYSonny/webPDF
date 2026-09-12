@@ -795,6 +795,16 @@ body {
   background: var(--stage);
 }
 
+/*
+ * A hosted page (the extension's viewer, `?host=1`) was opened *with* a document:
+ * the card that offers one - and the example papers on it - is not for that page,
+ * and it is hidden by a class set before the first paint rather than by the
+ * module that would otherwise hide it a moment later.
+ */
+html.wpdf-host .empty {
+  display: none;
+}
+
 .empty-card {
   max-width: 560px;
   text-align: center;

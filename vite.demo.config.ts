@@ -108,6 +108,58 @@ function papers(): Plugin {
   };
 }
 
+/**
+ * Emit `host-mode.js` - the one script that has to run before the first paint -
+ * next to the built page.
+ *
+ * The page it is for is the *hosted* one (`?host=1`, the extension's viewer,
+ * which is opened with a document already): it must not flash the card that
+ * offers a document, so the class that hides the card has to be set while the
+ * shell is still parsing. That means a classic script in the head - and Vite
+ * bundles module scripts only, so a non-module script would be left pointing at
+ * `demo/host-mode.js`, which the build does not copy. Emitting it here keeps the
+ * reference and the file in step; the dev server serves it from the source tree.
+ */
+function hostMode(): Plugin {
+  const file = path.resolve(import.meta.dirname, 'demo/host-mode.js');
+  let serving = false;
+
+  return {
+    name: 'webpdf:host-mode',
+    configResolved: (config) => {
+      serving = config.command === 'serve';
+    },
+    buildStart() {
+      if (!serving) this.emitFile({ type: 'asset', fileName: 'host-mode.js', source: fs.readFileSync(file, 'utf8') });
+    },
+    // The tag itself is added here rather than written in the shell: a classic
+    // script in the source HTML is left alone by the build *and* complained about,
+    // and the only thing keeping it honest is that it must point at the emitted
+    // file. Injected after the build's own HTML pass, it is simply there.
+    transformIndexHtml: {
+      order: 'post',
+      handler: () => [
+        {
+          tag: 'script',
+          // The published site lives under a path of GitHub Pages' choosing, so
+          // the reference is relative to the page like every other asset; the dev
+          // server serves it from the source tree at the root.
+          attrs: { src: serving ? '/host-mode.js' : './host-mode.js' },
+          injectTo: 'head-prepend',
+        },
+      ],
+    },
+    configureServer: (server) => {
+      server.middlewares.use((req: IncomingMessage, res: ServerResponse, next: (err?: unknown) => void) => {
+        if (!serving || (req.url ?? '').split('?')[0] !== '/host-mode.js') return next();
+        res.setHeader('Content-Type', 'text/javascript; charset=utf-8');
+        res.setHeader('Cache-Control', 'no-cache');
+        res.end(fs.readFileSync(file, 'utf8'));
+      });
+    },
+  };
+}
+
 export default defineConfig({
   // Relative asset URLs, because the built site is published under a path of
   // GitHub Pages' choosing rather than at a domain root - `./assets/...` is
@@ -116,7 +168,13 @@ export default defineConfig({
   root: '.',
   // Nothing is copied verbatim; the cache is served by `papers()` above.
   publicDir: false,
-  plugins: [papers()],
+  plugins: [papers(), hostMode()],
+  build: {
+    outDir: 'dist/demo',
+    emptyOutDir: true,
+    target: 'es2022',
+    assetsInlineLimit: 0,
+  },
   optimizeDeps: { exclude: ['mupdf'] },
   worker: {
     format: 'es',
@@ -128,12 +186,6 @@ export default defineConfig({
         chunkFileNames: 'assets/[name]-[hash].js',
       },
     },
-  },
-  build: {
-    outDir: 'dist/demo',
-    emptyOutDir: true,
-    target: 'es2022',
-    assetsInlineLimit: 0,
   },
   server: { port: 5173, host: '127.0.0.1' },
 });

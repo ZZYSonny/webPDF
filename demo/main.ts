@@ -28,6 +28,7 @@ import {
   type DocumentInfo,
   type ViewerEvent,
 } from '../src/index.ts';
+import { createHostBridge, isHosted, type HostBridge, type HostDocument, type HostPlace, type HostState } from './host.ts';
 import { createSearch, type SearchController, type SearchState } from './search.ts';
 import { createCropMenu, type CropMenu } from './crop.ts';
 import { createMenu, type Menu } from './menu.ts';
@@ -125,8 +126,19 @@ const resolve = (url: string): string => new URL(url, BASE).href;
  * document came from, where `https://arxiv.org/...` mostly says what a browser
  * tab always says.
  */
-const nameOf = (source: File | string): string =>
-  typeof source === 'string' ? source.replace(/^[a-z][a-z0-9+.-]*:\/\//i, '') : source.name;
+const urlName = (url: string): string => url.replace(/^[a-z][a-z0-9+.-]*:\/\//i, '');
+const nameOf = (source: File | string): string => (typeof source === 'string' ? urlName(source) : source.name);
+
+/** Anything the reader, the page, or a host can hand to `openSource`. */
+type Source = File | string | ArrayBuffer | Uint8Array | Blob;
+
+/** What to call a document that arrived as bytes, or through a host. */
+function labelOf(source: Source, host?: HostDocument | null): string {
+  if (host?.name) return host.name;
+  if (typeof source === 'string') return urlName(source);
+  if (typeof File !== 'undefined' && source instanceof File) return source.name;
+  return 'document';
+}
 
 /** Fetch a document from a URL. */
 async function openUrl(url: string): Promise<void> {
@@ -266,6 +278,14 @@ function onViewerEvent(event: ViewerEvent): void {
       // The outline starts closed - the pages are what the page is for - and is
       // opened from the bar (or from Ctrl+B's panel-scrolling equivalent).
       setOutline(false);
+      // The bar is whole now, and its height is what every scroll of the pages
+      // stops short by. Measured here rather than when it was unhidden, because
+      // a bar whose controls are still hidden is a different height - and the
+      // observer that keeps this current runs a frame later, which is after the
+      // first scroll of a document: the one a host makes when it puts the reader
+      // back where they were, which would then come back wrong by exactly the
+      // height the bar grew.
+      measureTopbar();
       // Open one level *below* fit-width rather than at it. Fit-width is the
       // largest level that still shows the page's full width, and starting there
       // leaves the paper touching both edges of the window. Ctrl+0 still means
@@ -279,6 +299,9 @@ function onViewerEvent(event: ViewerEvent): void {
       els.pageno.value = String(event.page);
       highlightOutline(event.page);
       search?.refresh();
+      // A page turn moved the reader, and the reader's position is the one thing
+      // a host remembers that the page cannot work out for itself later.
+      hostBridge.notify();
       break;
     case 'zoom-change':
       // The box shows the *layout* zoom; a pinch is the browser's page scale and
@@ -294,6 +317,7 @@ function onViewerEvent(event: ViewerEvent): void {
     case 'crop-change':
       // Nothing to do but say so: the viewer has already re-laid-out the pages.
       crop?.setProgress({ measured: event.measured, total: event.total, running: event.running });
+      hostBridge.notify();
       break;
     case 'render':
       search?.refresh();
@@ -502,6 +526,7 @@ function setBionic(on: boolean, dim?: number): void {
   if (!viewer) return;
   viewer.setBionic(on, dim);
   fillBionicMenu();
+  hostBridge.notify();
 }
 
 /* ---------------------------------------------------------------- panels */
@@ -620,6 +645,7 @@ function setOutline(open: boolean): void {
   els.toc.hidden = !open;
   els.tocToggle.setAttribute('aria-expanded', String(open));
   els.tocToggle.classList.toggle('active', open);
+  hostBridge.notify();
 }
 
 function renderOutline(doc: DocumentInfo): void {
@@ -672,39 +698,123 @@ function highlightOutline(page: number): void {
 
 /* ------------------------------------------------------------------ load */
 
-async function openSource(source: File | string): Promise<void> {
-  const label = typeof source === 'string' ? source : source.name;
+/**
+ * Open a document, from wherever it came: a file the reader chose, a URL the
+ * page was asked for, or bytes a host handed over.
+ *
+ * `host` is what the host knows about the document that the page cannot work out
+ * for itself - its name, its size, and where the reader was the last time - and
+ * it is the only thing that differs between the reader's own document and one
+ * the extension brought. It ends with the host being told what was opened and
+ * where the reader is, which is what makes the position in the record match the
+ * position on the screen.
+ */
+async function openSource(source: Source, host?: HostDocument | null): Promise<void> {
+  const label = labelOf(source, host);
   // Read by `document-loaded`, which fires while `load` is still running.
-  sourceName = nameOf(source);
+  sourceName = host?.url ? urlName(host.url) : label;
   busy++;
   els.progress.hidden = false;
   try {
     const v = await ensureViewer();
-    const loaded = await v.load(source);
+    let loaded: DocumentInfo;
+    try {
+      loaded = await v.load(source);
+    } catch (error) {
+      // An encrypted document is the one failure the reader can answer for.
+      if ((error as Error)?.name !== 'PasswordRequiredError') throw error;
+      const password = await askPassword();
+      if (!password) throw error;
+      loaded = await v.load(source, password);
+    }
     notify(
       `${loaded.title || label} — ${loaded.pageCount} page${loaded.pageCount === 1 ? '' : 's'}` +
         (loaded.author ? ` · ${loaded.author}` : '') +
         (v.rendersInWorker ? ' · rendering in a worker' : ' · rendering inline'),
     );
+    if (host) restoreHost(host);
+    hostBridge.opened({ info: hostInfo(), name: label, size: sizeOf(source, host) });
   } catch (error) {
-    if ((error as Error)?.name === 'PasswordRequiredError') {
-      const password = window.prompt('This document is password protected. Password:');
-      if (password) {
-        try {
-          const v = await ensureViewer();
-          await v.load(source, password);
-        } catch (again) {
-          notify(`Error: ${String((again as Error).message)}`, 'error');
-        }
-      }
-    } else {
-      console.error(error);
-      notify(`Error: ${String((error as Error)?.message ?? error)}`, 'error');
-    }
+    console.error(error);
+    const message = String((error as Error)?.message ?? error);
+    notify(`Error: ${message}`, 'error');
+    hostBridge.failed(message);
   } finally {
     busy--;
     if (busy <= 0) els.progress.hidden = true;
   }
+}
+
+/** How big the document is, as far as anyone here can tell. */
+function sizeOf(source: Source, host?: HostDocument | null): number {
+  if (host?.size) return host.size;
+  if (typeof source === 'object' && source !== null && 'byteLength' in source) return source.byteLength;
+  if (typeof Blob !== 'undefined' && source instanceof Blob) return source.size;
+  return 0;
+}
+
+/**
+ * The password for an encrypted document. The reader is asked by whoever can
+ * actually put a dialog in front of them: the top-level extension page when this
+ * page is framed by one (a cross-origin frame cannot open a prompt), and the page
+ * itself otherwise.
+ */
+async function askPassword(): Promise<string | null> {
+  if (hostBridge.active) return hostBridge.askPassword();
+  return window.prompt('This document is password protected. Password:');
+}
+
+/**
+ * Put the page back the way the reader left it: zoom, crop, fade and outline
+ * first (they change the layout), then the position in it - a position is a page
+ * and a point on it, so it means the same thing at every zoom.
+ */
+function restoreHost(host: HostDocument): void {
+  const state = host.state ?? null;
+  if (state) applyHostState(state, null);
+  const place = state?.pos ?? (host.page ? { page: host.page, y: null } : null);
+  if (place) viewer?.goToDestination(place.page, place.y ?? null);
+}
+
+/** Apply remembered settings (and optionally a position) to the open document. */
+function applyHostState(state: HostState | null | undefined, pos?: HostPlace | null): void {
+  if (!viewer || !state) return;
+  const settings = state.settings;
+  if (settings) {
+    // A fit mode is re-resolved against this window; a fixed scale is restored
+    // as it was, which is what makes "as I left it" true on any screen.
+    if (settings.zoom) viewer.setZoom(settings.zoom.mode === 'custom' ? settings.zoom.level : settings.zoom.mode);
+    if (settings.crop) ensureCropMenu(viewer).setRules(settings.crop.rules, settings.crop.padding);
+    if (settings.bionic) setBionic(settings.bionic.on, settings.bionic.dim);
+    if (typeof settings.outline === 'boolean') setOutline(settings.outline);
+    syncZoomBox();
+  }
+  const place = pos ?? state.pos;
+  if (place) viewer.goToDestination(place.page, place.y ?? null);
+  hostBridge.notify();
+}
+
+/** What the host is told about the document on screen. */
+function hostInfo(): { title: string; pages: number; author: string } | null {
+  return info ? { title: info.title, pages: info.pageCount, author: info.author } : null;
+}
+
+/**
+ * Where the reader is, and how the document is set up, in one JSON-safe object -
+ * the whole of what a host remembers about a document. Everything in it is
+ * either a page number, a factor or a flag: no pixels, so it outlives a zoom, a
+ * resize and a different screen.
+ */
+function hostState(): HostState {
+  return {
+    pos: viewer?.place() ?? null,
+    settings: {
+      zoom: viewer ? { level: viewer.zoom, mode: viewer.zoomMode } : null,
+      crop: viewer ? { rules: [...viewer.crop], padding: viewer.cropPadding } : null,
+      bionic: viewer ? { on: viewer.bionic, dim: viewer.bionicDim } : null,
+      outline: !els.toc.hidden,
+    },
+  };
 }
 
 /* ---------------------------------------------------------------- events */
@@ -806,14 +916,23 @@ window.addEventListener('keydown', (event) => {
  * one line at every width now, but a font that loads late can still move it a
  * pixel, and the viewer reads this on every scroll.
  */
+/**
+ * How tall the sticky bar is, read now and kept current by the observer below.
+ *
+ * Read on demand rather than cached: with no document open the bar is not on
+ * screen at all, so the first measurement of a session is the one that matters,
+ * and it is taken the moment the bar arrives (see `document-loaded`).
+ */
+function measureTopbar(): void {
+  if (!topbar) return;
+  topbarHeight = topbar.offsetHeight;
+  document.documentElement.style.setProperty('--topbar-h', `${topbarHeight}px`);
+}
+
 if (topbar) {
-  const measure = (): void => {
-    topbarHeight = topbar.offsetHeight;
-    document.documentElement.style.setProperty('--topbar-h', `${topbarHeight}px`);
-  };
-  measure();
-  if (typeof ResizeObserver !== 'undefined') new ResizeObserver(measure).observe(topbar);
-  else window.addEventListener('resize', measure);
+  measureTopbar();
+  if (typeof ResizeObserver !== 'undefined') new ResizeObserver(measureTopbar).observe(topbar);
+  else window.addEventListener('resize', measureTopbar);
 }
 
 // A debug handle is genuinely useful when embedding (and when driving the demo
@@ -825,4 +944,31 @@ declare global {
 }
 window.webpdf = { viewer: () => viewer, info: () => info };
 
-notify('Ready — open a PDF to begin.');
+/**
+ * The host, when there is one: the extension this page is the viewer for, or any
+ * other application that opened it with `?host=1`. It is inert when the page is
+ * opened by a reader, which is every other way of getting here - so the calls to
+ * it below are the page saying what changed, not the page being a host's.
+ */
+const hostBridge: HostBridge = createHostBridge({
+  open: async (doc) => {
+    const bytes = doc.bytes ? (doc.bytes instanceof Uint8Array ? doc.bytes : new Uint8Array(doc.bytes)) : null;
+    const source: Source | null = bytes ?? doc.url ?? null;
+    if (!source) throw new Error('the host sent no document');
+    await openSource(source, doc);
+  },
+  state: hostState,
+  apply: applyHostState,
+  find: () => {
+    els.search.focus();
+    els.search.select();
+  },
+});
+
+if (isHosted()) {
+  // A hosted page has no reader to greet and no document to offer: it is waiting
+  // for the one it was opened for, which the card would only cover up.
+  els.empty.hidden = true;
+} else {
+  notify('Ready — open a PDF to begin.');
+}
