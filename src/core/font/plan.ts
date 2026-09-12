@@ -35,7 +35,7 @@ import { glyphsFromFont, glyphsFromProgram, pageGlyphs, programId, programsOnPag
 import { glyphLetters, ligatureCode } from '../svg/ligatures.ts';
 import { glyphKey, type GlyphOutline, type GlyphPlacement } from '../svg/glyphs.ts';
 import { type TextChar } from '../svg/spaces.ts';
-import { PUA_BASE, PUA_LIMIT, type OutlineGlyph } from './build.ts';
+import { PUA_BASE, PUA_LIMIT, type LigatureSubstitution, type OutlineGlyph } from './build.ts';
 import { FontRegistry, type FontAsset, type PageFontPlan } from './registry.ts';
 import { debug } from '../debug.ts';
 
@@ -58,6 +58,11 @@ interface Entry {
   letters: Map<number, string>;
   /** gid -> the code the text is written as. Decided when the font is built. */
   codeOf: Map<number, number>;
+  /**
+   * gid -> the letters the text is written as, for a ligature the built face
+   * has a `liga` rule for. Empty for a glyph written as its own character.
+   */
+  lettersOf: Map<number, string>;
   asset: FontAsset | null;
   /** What the built font was made of, so a growing font is rebuilt and not stale. */
   signature: string;
@@ -211,7 +216,7 @@ export class DocumentFontPlan {
         seen.add(asset.family);
         assets.push(asset);
       }
-      fonts.set(fontId, { family: asset.family, codes: entry.codeOf, asset });
+      fonts.set(fontId, { family: asset.family, codes: entry.codeOf, letters: entry.lettersOf, asset });
     }
 
     return { fonts, assets, built: 0, reused: assets.length };
@@ -313,6 +318,7 @@ export class DocumentFontPlan {
         codesByGid: new Map(),
         letters: new Map(),
         codeOf: new Map(),
+        lettersOf: new Map(),
         asset: null,
         signature: '',
       };
@@ -357,14 +363,22 @@ export class DocumentFontPlan {
     // encodings, and is why the text of such a page is the thing to distrust
     // rather than the drawing.
     entry.codeOf.clear();
+    entry.lettersOf.clear();
     const assigned = new Set<number>();
+    // A glyph that stands for several letters is not the letter the display
+    // list named it with: `fi` arrives as `f` from a document that names a
+    // ligature after its first letter, and a font that took that `f` would take
+    // it away from the real `f`, which would be left with a private-use
+    // stand-in. What this glyph is written as is decided below, from its
+    // letters.
     for (const [code, gid] of entry.byCode) {
-      if (!entry.outlines.has(gid) || assigned.has(code)) continue;
+      if (!entry.outlines.has(gid) || entry.letters.has(gid) || assigned.has(code)) continue;
       entry.codeOf.set(gid, code);
       assigned.add(code);
     }
-    // A ligature is written as the one character that means it, so `fi` copies
-    // as `fi` and not as the `f` the display list recorded for the glyph.
+    // A ligature keeps the one character Unicode has for it, so the glyph is
+    // reachable by name as well as by its letters; what the *text* says is the
+    // letters, and the rule written below is what draws the one glyph for them.
     for (const [gid, letters] of entry.letters) {
       if (!entry.outlines.has(gid)) continue;
       const code = ligatureCode(letters);
@@ -413,6 +427,31 @@ export class DocumentFontPlan {
       else codesOf.set(gid, [code]);
     }
 
+    // What the shaper will look up when it reads the letters of a ligature: the
+    // cmap as the font is about to be written, backwards. A letter this font has
+    // no glyph for is one the browser could not lay out, so the rule is not
+    // written for it and the glyph stays reachable under its own character -
+    // which is what every text upgrade did before there were rules at all.
+    const byCode = new Map<number, number>();
+    for (const [code, gid] of cmap) byCode.set(code, gid);
+    const ligatures: LigatureSubstitution[] = [];
+    for (const [gid, letters] of entry.letters) {
+      if (!codesOf.has(gid) || [...letters].length < 2) continue;
+      const components: number[] = [];
+      let complete = true;
+      for (const ch of letters) {
+        const component = byCode.get(ch.codePointAt(0) ?? 0);
+        if (component === undefined || component === gid || components.includes(component)) {
+          complete = false;
+          break;
+        }
+        components.push(component);
+      }
+      if (!complete) continue;
+      ligatures.push({ letters: components, gid });
+      entry.lettersOf.set(gid, letters);
+    }
+
     for (const gid of gids) {
       const codes = codesOf.get(gid);
       // A glyph no code could be found for is not reachable anyway, and the
@@ -423,9 +462,13 @@ export class DocumentFontPlan {
     }
     if (glyphs.length === 0) return;
 
-    const family = `wpdf-${hash([entry.key, ...glyphs.map((g) => `${g.gid}:${g.codes.join('.')}:${g.d}`)])}`;
+    const family = `wpdf-${hash([
+      entry.key,
+      ...glyphs.map((g) => `${g.gid}:${g.codes.join('.')}:${g.d}`),
+      ...ligatures.map((l) => `liga:${l.gid}<${l.letters.join(',')}>`),
+    ])}`;
     try {
-      const { asset } = await registry.shared(family, glyphs);
+      const { asset } = await registry.shared(family, glyphs, ligatures);
       entry.asset = asset;
       entry.signature = signature;
       debug('font plan: built', entry.name, family, glyphs.length, 'glyphs', asset.bytes, 'bytes');

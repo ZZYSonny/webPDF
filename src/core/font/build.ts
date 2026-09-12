@@ -7,6 +7,12 @@
  * straight out of the generated SVG. Re-emitting those outlines as a CFF
  * charstring guarantees that the browser draws *exactly* the same shape that
  * MuPDF would have drawn as a path.
+ *
+ * One thing a cmap cannot say is that a glyph is two letters: a character maps
+ * to one glyph, and `fi` is two characters. So a font that is handed
+ * `LigatureSubstitution`s also gets a `GSUB` with the `liga` feature, which is
+ * how the text can say `fi` - what a reader searches for and copies - while the
+ * browser draws the one glyph the page drew.
  */
 
 import * as opentypeModule from 'opentype.js';
@@ -51,10 +57,28 @@ export interface OutlineGlyph {
   advanceEm?: number;
 }
 
+/**
+ * A ligature the built face should make: these letters, drawn as this glyph.
+ *
+ * The glyph ids are the *source* ids the caller knows; the builder maps them to
+ * the indices the compiled font uses. A rule is how the text can say what the
+ * page meant (`fi`) while the pen puts down the one glyph the typesetter drew
+ * for it - see `svg/ligatures.ts` for why the characters and the glyph are not
+ * the same thing.
+ */
+export interface LigatureSubstitution {
+  /** Source glyph ids of the letters, in order. */
+  letters: number[];
+  /** Source glyph id that draws the letters together. */
+  gid: number;
+}
+
 export interface BuildFontOptions {
   familyName: string;
   styleName?: string;
   unitsPerEm?: number;
+  /** Ligature rules to write into the font's `GSUB`. */
+  ligatures?: readonly LigatureSubstitution[];
 }
 
 export interface BuiltFontData {
@@ -124,6 +148,8 @@ export function buildFontFromOutlines(glyphs: readonly OutlineGlyph[], opts: Bui
   // make the browser draw the wrong one.
   const claimed = new Set<number>();
   let nextPua = PUA_BASE;
+  /** Source glyph id -> index in the font being built, for the ligature rules. */
+  const index = new Map<number, number>();
 
   for (const g of glyphs) {
     let commands: PathCommand[];
@@ -156,6 +182,7 @@ export function buildFontFromOutlines(glyphs: readonly OutlineGlyph[], opts: Bui
       if (nextPua <= PUA_LIMIT) unicodes.push(nextPua++);
     }
     for (const c of unicodes) claimed.add(c);
+    index.set(g.gid, fontGlyphs.length);
     fontGlyphs.push(
       new opentype.Glyph({
         name: `gid${g.gid}`,
@@ -177,6 +204,27 @@ export function buildFontFromOutlines(glyphs: readonly OutlineGlyph[], opts: Bui
     descender,
     glyphs: fontGlyphs,
   });
+
+  // The ligature rules go in as glyph indices, which is why they are written
+  // after the glyphs are numbered and not before. A rule whose glyphs did not
+  // make it into the font is dropped rather than guessed at: a `liga` that
+  // substituted a glyph the text does not have would draw the wrong letter.
+  if (opts.ligatures?.length) {
+    // `@types/opentype.js` types `substitution` as a function; it is the object
+    // the runtime exposes, and `addLigature` is the writer on it.
+    const substitution = font.substitution as unknown as {
+      addLigature(feature: string, ligature: { sub: number[]; by: number }, script?: string): void;
+    };
+    for (const rule of opts.ligatures) {
+      const by = index.get(rule.gid);
+      const sub = rule.letters.map((gid) => index.get(gid));
+      if (by === undefined || sub.length < 2 || sub.some((i) => i === undefined)) continue;
+      // Both scripts: a browser shaping Latin should not have to reach the
+      // default script to find the rule, and one that only reaches the default
+      // must still find it. The lookup is small, and only one is written.
+      for (const script of ['DFLT', 'latn']) substitution.addLigature('liga', { sub: sub as number[], by }, script);
+    }
+  }
 
   return {
     data: font.toArrayBuffer(),

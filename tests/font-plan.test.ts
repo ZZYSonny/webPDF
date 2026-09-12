@@ -81,6 +81,24 @@ const documents = await (async () => {
 
 const PAGES = 3;
 
+/**
+ * The face behind an asset, parsed once per family.
+ *
+ * Both invariants below ask the font what a character reaches, so both need the
+ * bytes out of the `@font-face` rule the viewer would install.
+ */
+const faces = new Map<string, fontkit.Font>();
+function faceFor(asset: FontAsset): fontkit.Font {
+  let font = faces.get(asset.family);
+  if (!font) {
+    const base64 = /base64,([^)]+)\)/.exec(asset.css)?.[1];
+    assert.ok(base64, `${asset.family}: the face carries no bytes`);
+    font = fontkit.create(Buffer.from(base64, 'base64'));
+    faces.set(asset.family, font);
+  }
+  return font;
+}
+
 test('a document is planned whole, and its faces follow its fonts, not its pages', async () => {
   assert.ok(documents.length > 0, 'no corpus document could be read');
 
@@ -153,18 +171,6 @@ test('every character the plan writes reaches the glyph the page drew', async ()
   // two glyphs can be drawn with the same code under two encodings. Written
   // twice into the cmap, the second claim wins and the page draws the wrong
   // letter - invisible in the text, because the character is the right one.
-  const fonts = new Map<string, fontkit.Font>();
-  const fontFor = (asset: FontAsset): fontkit.Font => {
-    let font = fonts.get(asset.family);
-    if (!font) {
-      const base64 = /base64,([^)]+)\)/.exec(asset.css)?.[1];
-      assert.ok(base64, `${asset.family}: the face carries no bytes`);
-      font = fontkit.create(Buffer.from(base64, 'base64'));
-      fonts.set(asset.family, font);
-    }
-    return font;
-  };
-
   for (const document of documents) {
     const doc = mupdf.Document.openDocument(fs.readFileSync(document.file), 'application/pdf');
     try {
@@ -199,7 +205,7 @@ test('every character the plan writes reaches the glyph the page drew', async ()
             if (code === undefined) continue;
             assert.ok(isUsableCode(code), `${document.name}: U+${code.toString(16)} is not a character`);
             assert.equal(
-              fontFor(font.asset).glyphForCodePoint(code).name,
+              faceFor(font.asset).glyphForCodePoint(code).name,
               `gid${p.gid}`,
               `${document.name}: page ${index + 1} asks for U+${code.toString(16)} and gets another glyph`,
             );
@@ -215,6 +221,58 @@ test('every character the plan writes reaches the glyph the page drew', async ()
       doc.destroy();
     }
   }
+});
+
+test('every ligature the plan writes is drawn by the letters the text says', async () => {
+  assert.ok(documents.length > 0, 'no corpus document could be read');
+
+  // The other half of the cmap invariant. A glyph that stands for two letters
+  // is written as those letters - which is what a reader copies and searches
+  // for - and the face has to draw them as the one glyph the page drew, through
+  // the `liga` rule `buildFontFromOutlines` was given. A rule that is missing
+  // draws an `f` and an `i` beside each other, which is not the page, and one
+  // that points at another glyph draws the wrong letter. (`ligature.mjs` holds
+  // Chromium to the same promise in pixels.)
+  let checked = 0;
+  for (const document of documents) {
+    const doc = mupdf.Document.openDocument(fs.readFileSync(document.file), 'application/pdf');
+    try {
+      const registry = new FontRegistry();
+      const plan = new DocumentFontPlan({ preplanPages: 200 });
+      await plan.cover(doc, 0, registry);
+
+      for (let index = 0; index < Math.min(doc.countPages(), PAGES); index++) {
+        const page = doc.loadPage(index);
+        try {
+          const svg = pageSvg(page);
+          const placements = scanGlyphPlacements(svg);
+          const letters = glyphLetters(readChars(page), placements);
+          const pagePlan = await plan.planPage(scanGlyphOutlines(svg), placements, { letters });
+          assert.ok(pagePlan, `${document.name}: page ${index + 1} was covered by the plan and then declined`);
+
+          for (const p of placements) {
+            const font = pagePlan.fonts.get(p.fontId);
+            const text: string | undefined = font?.letters.get(p.gid);
+            if (!font || text === undefined) continue;
+            const run = faceFor(font.asset).layout(text, ['liga']);
+            assert.equal(run.glyphs.length, 1, `${document.name}: page ${index + 1} "${text}" is not one glyph`);
+            assert.equal(
+              run.glyphs[0].name,
+              `gid${p.gid}`,
+              `${document.name}: page ${index + 1} "${text}" draws another glyph`,
+            );
+            checked++;
+          }
+        } finally {
+          page.destroy();
+        }
+      }
+    } finally {
+      doc.destroy();
+    }
+  }
+  assert.ok(checked > 0, 'no ligature was found to check');
+  console.log(`      ${checked} ligatures draw their letters as the page's one glyph`);
 });
 
 test('the plan drives the same text upgrade the per-page fonts did', async () => {

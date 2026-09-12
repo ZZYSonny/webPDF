@@ -12,6 +12,12 @@
  * be drawn, the visual result is identical. Anything we are unsure about is
  * left untouched.
  *
+ * A glyph that stands for several letters - a ligature - is the one case where
+ * the characters written are not the character the glyph is named with: the text
+ * says what the page *meant*, `fi`, and the face draws that as the one glyph
+ * through a `liga` rule. `tspans` says why those letters are the one thing here
+ * that does not carry a position of its own.
+ *
  * The transform maths: an outline is placed with
  *
  *   <use transform="matrix(a b c d e f)"/>   applying to y-up em-unit outlines
@@ -29,7 +35,7 @@
 
 import type { GlyphPlacement, Attribute } from './glyphs.ts';
 import { ANCHOR_EPSILON, type SpaceMark } from './spaces.ts';
-import { bionicDim, bionicSegments } from './bionic.ts';
+import { bionicDim, bionicSegments, charCount } from './bionic.ts';
 
 export interface GlyphEncoding {
   /**
@@ -38,6 +44,13 @@ export interface GlyphEncoding {
    * glyph with the same outline.
    */
   codeFor(fontId: number, gid: number): number | null;
+  /**
+   * The letters to write for a glyph that stands for more than one - a
+   * ligature, which the font draws as its single glyph through a `liga` rule.
+   * Only return letters when the face really has that rule; null (or no method
+   * at all) leaves the glyph to `codeFor`.
+   */
+  lettersFor?(fontId: number, gid: number): string | null;
   /** Family name to use for a font id, or null to leave it as outlines. */
   familyFor(fontId: number): string | null;
 }
@@ -140,16 +153,17 @@ interface Run {
   source: string;
 }
 
-/** A glyph that will be written as text: the font to use, and its character. */
+/** A glyph that will be written as text: the font to use, and its characters. */
 interface ReadyGlyph {
   family: string;
-  code: number;
+  /** One character, or the several letters a ligature stands for. */
+  text: string;
 }
 
 interface RunItem {
   x: number;
   y: number;
-  code: number;
+  text: string;
   /** -1 for a character written back rather than drawn. */
   gid: number;
   /** A space: it has a position but no glyph of its own. */
@@ -233,50 +247,109 @@ function anchorSpaces(
   return out;
 }
 
+/** A stretch of text to write, and where its first character starts. */
+interface Written {
+  text: string;
+  x: string;
+  y: string;
+  /**
+   * Whether bionic reading fades this stretch: `true` faded, `false` at full
+   * strength. `null` is a stretch of nothing but whitespace between two words -
+   * drawn at full strength, but with a `<tspan>` of its own, because it belongs
+   * to neither word and joining it to one would put a space inside a fixation
+   * point.
+   */
+  fade: boolean | null;
+}
+
+function tspan(parts: readonly Written[], dim: number): string {
+  const x = parts.map((w) => w.x).join(' ');
+  const y = parts.map((w) => w.y).join(' ');
+  const fade = parts[0].fade === true ? ` fill-opacity="${String(dim)}"` : '';
+  return `<tspan${fade} x="${x}" y="${y}">${parts.map((w) => w.text).join('')}</tspan>`;
+}
+
+/**
+ * Whether bionic reading fades each glyph of a run.
+ *
+ * `text-vide` marks letters, and a glyph can stand for several of them: a
+ * ligature is one outline and cannot be drawn half dark, so it takes the answer
+ * of the stretch its *first* letter is in. `null` when the segments do not
+ * account for every character, which writes the run unfaded - the caller's
+ * concern, and `bionicSegments` says why it is the right fallback.
+ */
+function fades(chars: readonly string[], lens: readonly number[]): Array<boolean | null> | null {
+  const text = chars.join('');
+  const segments = bionicSegments(text);
+  let total = 0;
+  for (const len of lens) total += len;
+  if (segments.reduce((n, s) => n + s.chars, 0) !== total) return null;
+
+  const out: Array<boolean | null> = [];
+  let at = 0;
+  let seg = 0;
+  let start = 0;
+  for (const len of lens) {
+    while (seg < segments.length && at >= start + segments[seg].chars) {
+      start += segments[seg].chars;
+      seg++;
+    }
+    const segment = segments[seg];
+    // A stretch of nothing but whitespace is between two words rather than in
+    // one: fading it would be an attribute that draws no pixel.
+    out.push(segment ? (segment.text.trim() === '' ? null : !segment.fixation) : false);
+    at += len;
+  }
+  return out;
+}
+
 /**
  * The `<tspan>`s a run's characters go in.
  *
- * Normally one, with every position in a single list. With bionic reading on,
- * one per stretch `text-vide` marked: the fixation points stay the text as the
- * document set it, and everything between them is drawn back at a reduced
- * opacity (`bionic.ts` says why fading rather than bolding, and how faint a
- * fade can usefully be). Either way each tspan carries its own slice of the
- * position lists, so a character is drawn exactly where it was - nothing is
- * emboldened into its neighbour, and nothing moves.
+ * Normally one, with every position in a single list. A glyph written as
+ * several characters - a ligature, whose letters the face joins with a `liga`
+ * rule - gets a `<tspan>` of its own with one position and no list, because the
+ * shaper only joins letters it lays out together: with a position per character
+ * the browser draws `fi` as an `f` and an `i`, which is what the page did *not*
+ * draw. Everything else keeps its own explicit position, so nothing depends on
+ * an advance the rebuilt font only approximates.
+ *
+ * With bionic reading on, the stretches `text-vide` marked are separate
+ * tspans as well: the fixation points stay the text as the document set it, and
+ * everything between them is drawn back at a reduced opacity (`bionic.ts` says
+ * why fading rather than bolding, and how faint a fade can usefully be). Either
+ * way each tspan carries its own slice of the position lists, so a character is
+ * drawn exactly where it was - nothing is emboldened into its neighbour, and
+ * nothing moves.
  */
 function tspans(
   chars: readonly string[],
   xs: readonly string[],
   ys: readonly string[],
+  lens: readonly number[],
   bionic: boolean,
   dim: number,
 ): string {
-  const whole = (): string => `<tspan x="${xs.join(' ')}" y="${ys.join(' ')}">${chars.join('')}</tspan>`;
-  if (!bionic) return whole();
+  const fade = bionic ? fades(chars, lens) : null;
+  const out: string[] = [];
+  let group: Written[] = [];
+  const flush = (): void => {
+    if (group.length > 0) out.push(tspan(group, dim));
+    group = [];
+  };
 
-  const segments = bionicSegments(chars.join(''));
-  // The segments have to account for every glyph exactly once. `text-vide`
-  // decides where the words are and this decides where the glyphs are; if the
-  // two ever disagree - a release with different word rules, a character it
-  // reads as markup - the run is written plain, which is right, rather than
-  // faded in the wrong places, which is not.
-  if (segments.reduce((n, s) => n + s.chars, 0) !== chars.length) return whole();
-
-  let at = 0;
-  let out = '';
-  for (const segment of segments) {
-    const end = at + segment.chars;
-    if (end > at) {
-      // A stretch of nothing but whitespace is between two words rather than in
-      // one: fading it would be an attribute that draws no pixel.
-      const fade = !segment.fixation && segment.text.trim() !== '';
-      out +=
-        `<tspan${fade ? ` fill-opacity="${String(dim)}"` : ''}` +
-        ` x="${xs.slice(at, end).join(' ')}" y="${ys.slice(at, end).join(' ')}">${segment.text}</tspan>`;
+  for (let i = 0; i < chars.length; i++) {
+    const written: Written = { text: chars[i], x: xs[i], y: ys[i], fade: fade ? fade[i] : false };
+    if (lens[i] > 1) {
+      flush();
+      out.push(tspan([written], dim));
+      continue;
     }
-    at = end;
+    if (group.length > 0 && group[0].fade !== written.fade) flush();
+    group.push(written);
   }
-  return out;
+  flush();
+  return out.join('');
 }
 
 export function upgradeGlyphsToText(
@@ -297,10 +370,18 @@ export function upgradeGlyphsToText(
     if (hasStroke(p.attrs)) return null;
     const family = enc.familyFor(p.fontId);
     if (!family) return null;
+    // A glyph that stands for several letters is written as those letters and
+    // drawn by the face's own `liga` rule; the caller only offers them when the
+    // face really has the rule, so the promise is the same one `codeFor` makes.
+    const letters = enc.lettersFor?.(p.fontId, p.gid);
+    if (letters) {
+      if (simpleOnly && ![...letters].every((ch) => isSimpleCode(ch.codePointAt(0) ?? 0))) return null;
+      return { family, text: letters };
+    }
     const code = enc.codeFor(p.fontId, p.gid);
     if (code === null || code <= 0) return null;
     if (simpleOnly && !isSimpleCode(code)) return null;
-    return { family, code };
+    return { family, text: String.fromCodePoint(code) };
   });
   const spaces = anchorSpaces(placements, opts.spaces ?? [], ready);
 
@@ -336,20 +417,25 @@ export function upgradeGlyphsToText(
     const xs: string[] = [];
     const ys: string[] = [];
     const chars: string[] = [];
+    const lens: number[] = [];
     let synthetic = 0;
     for (const it of r.items) {
       const X = (D * it.x - C * it.y) / det;
       const Y = (-B * it.x + A * it.y) / det;
       xs.push(fmt(X));
       ys.push(fmt(Y));
-      chars.push(escapeText(String.fromCodePoint(it.code)));
+      const text = escapeText(it.text);
+      chars.push(text);
+      // Characters, not code units: a character outside the BMP is still one
+      // glyph, and an escaped `&amp;` is one character however long it writes.
+      lens.push(charCount(text));
       if (it.synthetic) synthetic++;
     }
 
     let out = `<text${r.attrs} transform="matrix(${fmt(A)} ${fmt(B)} ${fmt(C)} ${fmt(D)} 0 0)" font-size="${fmt(K)}" font-family="${r.family}" font-weight="normal" font-style="normal"`;
     if (precise) out += ' text-rendering="geometricPrecision"';
     out += ' xml:space="preserve">';
-    out += tspans(chars, xs, ys, bionic, dim);
+    out += tspans(chars, xs, ys, lens, bionic, dim);
     out += '</text>';
     pieces.push(out);
     stats.runs++;
@@ -357,7 +443,7 @@ export function upgradeGlyphsToText(
     stats.spaces += synthetic;
   };
 
-  const canExtend = (p: GlyphPlacement, family: string, code: number): boolean => {
+  const canExtend = (p: GlyphPlacement, family: string): boolean => {
     if (!run) return false;
     if (run.fontId !== p.fontId) return false;
     if (run.family !== family) return false;
@@ -368,7 +454,9 @@ export function upgradeGlyphsToText(
 
   /** The spaces in front of a glyph, in the order they were read. */
   const pushSpaces = (target: Run, marks: readonly SpaceMark[]): void => {
-    for (const mark of marks) target.items.push({ x: mark.x, y: mark.y, code: mark.code, gid: -1, synthetic: true });
+    for (const mark of marks) {
+      target.items.push({ x: mark.x, y: mark.y, text: String.fromCodePoint(mark.code), gid: -1, synthetic: true });
+    }
   };
 
   for (const [index, p] of placements.entries()) {
@@ -389,8 +477,8 @@ export function upgradeGlyphsToText(
       continue;
     }
 
-    const { family, code: cv } = planned;
-    if (!canExtend(p, family, cv)) {
+    const { family, text } = planned;
+    if (!canExtend(p, family)) {
       flush();
       pieces.push(svg.slice(cursor, p.start));
       cursor = p.start;
@@ -409,7 +497,7 @@ export function upgradeGlyphsToText(
     active.source += svg.slice(cursor, p.start) + svg.slice(p.start, p.end);
     cursor = p.end;
     prevEnd = p.end;
-    active.items.push({ x: p.matrix.e, y: p.matrix.f, code: cv, gid: p.gid });
+    active.items.push({ x: p.matrix.e, y: p.matrix.f, text, gid: p.gid });
   }
   flush();
   pieces.push(svg.slice(cursor));

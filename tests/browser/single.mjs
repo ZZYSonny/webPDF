@@ -218,6 +218,23 @@ try {
   else if (across.rects < 2) fail('a selection across two pages reported only one rectangle');
   else ok(`a range selected ${across.length} characters over two pages (${across.rects} rectangles)`);
 
+  // The characters, not just their number: a ligature is one glyph the page
+  // drew and two letters the text says (`src/core/svg/ligatures.ts`), so what
+  // comes back has to be the letters - not the ligature's own character, which
+  // is what a reader saw pasted into a word containing an `f`, and not a
+  // private-use stand-in for a glyph nothing could name.
+  await type('c', 'KeyC', 67, 2); // Ctrl+C
+  await sleep(400);
+  const acrossClipboard = String(await page.evaluate('navigator.clipboard.readText()').catch(() => ''));
+  const invented = [...acrossClipboard].filter((ch) => {
+    const code = ch.codePointAt(0) ?? 0;
+    return (code >= 0xe000 && code <= 0xf8ff) || (code >= 0xfb00 && code <= 0xfb06) || code === 0xfffd;
+  });
+  if (acrossClipboard.length < 10) fail(`the cross-page selection copied nothing to the clipboard: ${JSON.stringify(acrossClipboard)}`);
+  else if (invented.length)
+    fail(`the clipboard holds ${invented.length} characters the page never wrote: ${JSON.stringify(invented.slice(0, 8))}`);
+  else ok(`the clipboard from two pages holds only the page's own characters (${acrossClipboard.length} of them)`);
+
   // -------------------------------------------------------------- keyboard
   console.log('\n— the keys reach the viewer over a page —');
   const before = await page.evaluate('({ y: Math.round(window.scrollY), page: window.__shown() })');

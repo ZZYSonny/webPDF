@@ -87,20 +87,30 @@ SVG with real text, plus outlines kept for whatever could not be converted
 Each glyph is reachable under a real Unicode value where MuPDF recorded one
 (`data-text`), so copy, search and screen readers work. A ligature is the case
 that needs help: the outline device names a glyph by the *first* of the letters
-it was shown with, so the one glyph a typesetter drew for `fi` arrives as `f` and
-looks like a second glyph claiming a code point that is already taken. The text
-device knows the whole word — it takes the ligature apart and reports one
-character per letter — so the letters are read from there
-(`core/svg/ligatures.ts`) and the glyph is given the Unicode character that *is*
-that ligature (`U+FB01` for `fi`, and the six others Unicode names). Copying
-`efficient` then gives a ligature character - not a box - which normalising
-spells back into `ffi`, and which a search that normalises (ICU-based find in
-the browsers, a normalising index) matches against the decomposed spelling.
+it was shown with — the one glyph a typesetter drew for `fi` arrives as `f` — and
+a document whose own encoding is honest about it names the glyph `U+FB01`
+instead. Both are the same claim written two ways, and neither says *which* two
+letters the glyph is made of: only the text device knows, because it takes the
+ligature apart and reports one character per letter (`core/svg/ligatures.ts`).
+
+So the text carries the **letters** — `first` stays `first`, which is what a
+reader searches for, selects and copies, and what an extractor or a screen reader
+gets — and the glyph is still the one the page drew, because the face is built
+with a `liga` rule (`core/font/build.ts`): asked for `fi`, the shaper finds
+`f`+`i` → the ligature glyph. A glyph written as several characters is emitted in
+a `<tspan>` of its own with one position rather than a position per character,
+because a browser only joins letters it lays out together — measured: the same
+face with `x="0 300"` draws `f` then `i`, with `x="0"` it draws the ligature.
+`tests/browser/ligature.mjs` renders a real document's ligature both ways and
+holds the two rasters to the same pixels (0 differing of ~19000 on each of the
+corpus's three font containers), and `tests/font-plan.test.ts` holds every
+planned face to laying the letters out as the page's one glyph.
 
 Only what is left over falls back to a code point from the BMP Private Use Area
-(`U+E000…U+F8FF`): a ligature Unicode never named, a glyph drawn two different
-ways on one page, or one the text device did not describe. Every case produces a
-`cmap` entry pointing at the right outline, so nothing renders blank.
+(`U+E000…U+F8FF`): a ligature whose letters could not be established, or whose
+face has no glyph for one of them, a glyph drawn two different ways on one page,
+or one the text device did not describe. Every case produces a `cmap` entry
+pointing at the right outline, so nothing renders blank.
 
 ### Falling back
 
@@ -112,7 +122,7 @@ Anything not provably safe stays an outline, glyph by glyph:
 | glyph with no outline in `<defs>` | `<use>` outline kept |
 | stroked text (`stroke` attribute) | `<use>` outline kept |
 | right-to-left or complex-shaping scripts | `<use>` outline kept (see limitations) |
-| ligature whose letters cannot be established | private-use code point (see limitations) |
+| ligature whose letters cannot be established | the code point the page gave it (see limitations) |
 | more than 6400 unicode-less glyphs in one font | the excess stays outlines |
 | `textMode: 'paths'` | the whole page stays outlines |
 
@@ -258,7 +268,10 @@ page by page to the end of the paper, is 33 → 33 planned and 48 → 89 with
 `?plan=0`; every one of those 41 later registrations is a whole-document
 re-layout while the reader is reading. `tests/font-plan.test.ts` holds a planned
 page to the per-page render character for character, and every character to the
-glyph the page drew.
+glyph the page drew. What the document says is the page's own text and not a
+rendering of it: a word set with a ligature copies as its letters, and
+`tests/browser/single.mjs` copies a selection that spans two pages and refuses
+any character the page never wrote.
 
 Planning is not free, which is why it has a budget. The walk is a few milliseconds
 a page, and building the faces is a font compile each, so a small document is
@@ -374,12 +387,14 @@ marks are read back onto the glyphs afterwards. A glyph the fixation point
 reaches into is marked whole - it is a single outline and cannot be drawn half
 dark - which is why `find` marks `fin` and not the `n` alone.
 
-It changes how the text is **drawn** and nothing else. Every character carries its
-own x and y, and the fade is an attribute of the character's own `<tspan>`: the
-words do not reflow, the pages do not change size, and nothing has to be measured
-again. Toggling it re-renders what is on screen; the text, the selection and the
-position of every character are identical either way. The demo test checks that
-down to the ink: the same page, the same edges, less of it dark.
+It changes how the text is **drawn** and nothing else. A character carries its
+own x and y — the letters of a ligature are the one exception, because the shaper
+has to lay them out together, so they share the `<tspan>` that starts at the
+glyph's own position — and the fade is an attribute of the character's own
+`<tspan>`: the words do not reflow, the pages do not change size, and nothing has
+to be measured again. Toggling it re-renders what is on screen; the text, the
+selection and the position of every character are identical either way. The demo
+test checks that down to the ink: the same page, the same edges, less of it dark.
 
 #### Spaces, and why a copy works
 
@@ -1063,7 +1078,7 @@ src/
       svg-path.ts           SVG path data parser (M/L/H/V/C/Z + implicit repeats)
       program.ts            a glyph read out of the PDF's own font program, by id
       plan.ts               one font per font, for the whole document
-      build.ts              outlines + cmap → OpenType/CFF (opentype.js)
+      build.ts              outlines + cmap + ligatures → OpenType/CFF (opentype.js)
       woff.ts               sfnt → WOFF (zlib via CompressionStream)
       registry.ts           per-page planning, caching, @font-face rules
   worker/
@@ -1123,8 +1138,9 @@ tests/
   font-program.test.ts      a glyph drawn from the PDF's own font program is the
                             outline the page drew, glyph for glyph
   font-plan.test.ts         a document's faces follow its fonts and not its pages,
-                            every character reaches the glyph the page drew, and a
-                            planned page draws what the per-page fonts drew
+                            every character reaches the glyph the page drew, every
+                            ligature draws its letters as the page's one glyph,
+                            and a planned page draws what the per-page fonts drew
   font-plan-cost.mjs        what planning costs and saves, per corpus paper: the
                             table the viewer section quotes
   font-programs.mjs         what the corpus embeds, and what a browser takes
@@ -1132,6 +1148,7 @@ tests/
   browser/                  headless-Chromium verification over CDP
     demo.mjs                the built demo, driven through its own UI
     single.mjs              one document: selection, clipboard, keys, wheel, faces
+    ligature.mjs            the letters and the ligature glyph are the same pixels
     pinch.mjs               the pinch/zoom contract
     bridge.mjs              the host protocol: a new page, an old host
     pwa.mjs                 the service worker, and a server killed mid-test
@@ -1327,14 +1344,19 @@ the workflow to point that somewhere else, or to nothing at all.
   run still ends where the document's own line does, so a word hyphenated across
   a line break arrives as `trans-` and `formation` on either side of the space
   the break stands for - which is what a PDF's own copy gives you too.
-* **A ligature is one glyph, so it is one character.** Where a document draws
-  `fi` as a single glyph, the text carries the ligature's own Unicode character
-  (`U+FB01`) rather than the two letters, because one glyph can only be one
-  character. Everything that normalises text spells it back into `fi`, but a
-  plain substring search for `efficient` - in a program that neither normalises
-  nor compares the way the browsers' find-in-page does - will not match the
-  copied text. A ligature Unicode has no character for (`fj`, say) gets a
-  private-use code point instead, which renders correctly and reads as nothing.
+* **A ligature is drawn by a `liga` rule, so it needs a shaper to honour it.**
+  The text says `fi` and the face's `GSUB` joins the letters into the one glyph
+  the page drew. Every browser tested does this (Chromium, with the exact
+  settings the pipeline emits, in `tests/browser/ligature.mjs`), but it is a
+  promise the *font* makes and the browser keeps, not one the SVG makes on its
+  own: a shaper that ignored the rule would draw an `f` and an `i` beside each
+  other. Where the letters cannot be established, or the face has no glyph for
+  one of them (the per-page pipeline on a page whose only `f` is inside the
+  ligature), the glyph keeps the code point the page named it with - normally the
+  ligature's own character (`U+FB01`), or a private-use code point for a ligature
+  Unicode never named (`fj`, say) - which draws identically and copies as that
+  one character. Finding *which* words a document sets with a ligature needs the
+  text device (`tests/ligatures.test.ts`).
 * **Bionic reading fades rather than emboldens.** A fixation point is the
   document's own ink at full strength and the rest of the word is half faded; a
   reader who expects the fixation points to be *bolder* (as the original Bionic

@@ -715,6 +715,7 @@ export class PdfEngine implements PdfEngineLike {
           {
             familyFor: (fontId) => plan.fonts.get(fontId)?.family ?? null,
             codeFor: (fontId, gid) => plan.fonts.get(fontId)?.codes.get(gid) ?? null,
+            lettersFor: (fontId, gid) => plan.fonts.get(fontId)?.letters.get(gid) ?? null,
           },
           { spaces: text.spaces, bionic: opts.bionic, bionicDim: opts.bionicDim },
         );

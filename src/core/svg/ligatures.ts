@@ -6,7 +6,11 @@
  * outline device names a glyph by the text it was shown with, and for a ligature
  * that is only the *first* letter: the "fi" in "specific" arrives as
  * `data-text="f"`, indistinguishable from a plain "f" until it turns out that
- * two glyphs claim the same code point.
+ * two glyphs claim the same code point. A document whose own encoding is honest
+ * about the ligature names it with the ligature's character instead - `U+FB01`
+ * arrives as `data-text="&#xfb01;"` - which is the same claim written the other
+ * way round: either way the glyph is one glyph and the letters are two, and
+ * either way it is the text device that knows which two.
  *
  * The text device knows the whole word. It takes the ligature apart and reports
  * one character per letter, placing the first at the glyph's own origin and the
@@ -122,9 +126,16 @@ export function glyphLetters(
     const start = starts[index];
     if (start < 0) return;
     const first = chars[start];
-    // MuPDF's own name for the glyph has to be the first of its letters, or
-    // this is a glyph the text device read differently and nothing is certain.
-    if (p.code > 0 && first.text.codePointAt(0) !== p.code) return;
+    // MuPDF names a glyph by the text it was shown with. For a ligature that is
+    // usually only the first letter - the display list has no room for the
+    // second - but a document whose own encoding says the glyph *is* the
+    // ligature (`U+FB01`, and pdfTeX writes that) names it with the ligature's
+    // character instead. The name to match is the first letter either way; the
+    // rest of the letters come from the text device, which is the only one that
+    // has them.
+    const named = LIGATURE_LETTERS.get(p.code);
+    const head = named?.slice(0, 1) ?? (p.code > 0 ? String.fromCodePoint(p.code) : first.text);
+    if (p.code > 0 && first.text !== head) return;
 
     let letters = first.text;
     const next = starts[index + 1];
@@ -133,6 +144,10 @@ export function glyphLetters(
         if (!isSpaceChar(chars[i].text)) letters += chars[i].text;
       }
     }
+    // A glyph named after a ligature whose letters the text device does not
+    // spell that way is one the two devices read differently, and nothing about
+    // it is certain: `fi` and `fx` are not the same claim.
+    if (named !== undefined && letters !== named) return;
 
     const key = glyphKey(p.fontId, p.gid);
     const known = seen.get(key);

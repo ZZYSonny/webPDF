@@ -73,7 +73,7 @@ const FIXATION = /<b>([\s\S]*?)<\/b>/g;
 const ENTITY = /&(?:[a-zA-Z][a-zA-Z0-9]*|#[0-9]+|#x[0-9a-fA-F]+);/y;
 
 /** Characters, not code units: a character outside the BMP is still one glyph. */
-function charCount(text: string): number {
+export function charCount(text: string): number {
   let n = 0;
   for (let i = 0; i < text.length; ) {
     ENTITY.lastIndex = i;

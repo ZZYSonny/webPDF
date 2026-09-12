@@ -6,13 +6,14 @@
  * write into the SVG, and compile a subset TrueType font. Where a glyph has a
  * real Unicode value (MuPDF records it as `data-text`) we use it, so text stays
  * selectable and searchable; where it stands for several letters at once - a
- * ligature - we use the Unicode character for that ligature, which the caller
- * has read off the page (`svg/ligatures.ts`); otherwise we use a Private Use
- * Area code point, which keeps every glyph reachable without inventing a
+ * ligature - the letters are what the text says, and the glyph is kept reachable
+ * through a `liga` rule the face is built with (`svg/ligatures.ts` and
+ * `build.ts` say how the letters are read and why); otherwise we use a Private
+ * Use Area code point, which keeps every glyph reachable without inventing a
  * meaning.
  */
 
-import { buildFontFromOutlines, PUA_BASE, PUA_LIMIT, type OutlineGlyph } from './build.ts';
+import { buildFontFromOutlines, PUA_BASE, PUA_LIMIT, type LigatureSubstitution, type OutlineGlyph } from './build.ts';
 import { encodeWoff } from './woff.ts';
 import { glyphKey, isUsableCode, type GlyphOutline, type GlyphPlacement } from '../svg/glyphs.ts';
 import { ligatureCode } from '../svg/ligatures.ts';
@@ -30,8 +31,16 @@ export interface FontAsset {
 }
 
 export interface PageFontPlan {
-  /** fontId (as used in `font_N_gid`) -> plan for that font. */
-  fonts: Map<number, { family: string; codes: Map<number, number>; asset: FontAsset }>;
+  /**
+   * fontId (as used in `font_N_gid`) -> plan for that font.
+   *
+   * `codes` is the font's cmap as a page's glyphs see it, and `letters` is the
+   * other spelling of the same thing: for a glyph that stands for several
+   * letters, the letters to write - the font draws them as that one glyph
+   * through its `liga` rule, so the text says `fi` and the page still shows the
+   * ligature. Only glyphs whose rule the font actually got are in it.
+   */
+  fonts: Map<number, { family: string; codes: Map<number, number>; letters: Map<number, string>; asset: FontAsset }>;
   /** Every `@font-face` rule the page needs, deduplicated. */
   assets: FontAsset[];
   built: number;
@@ -216,13 +225,42 @@ export class FontRegistry {
 
       if (glyphs.length === 0) continue;
 
+      // A ligature is written as its letters and drawn through the rule, so
+      // the text can say what the page meant. The rule is only written when
+      // every letter is a glyph this font already has: a browser asked to lay
+      // out a character with no glyph would draw nothing where the page drew
+      // something, which is worse than the ligature's own character.
+      const byCode = new Map<number, number>();
+      for (const [gid, code] of codes) if (!byCode.has(code)) byCode.set(code, gid);
+      const ligatures: LigatureSubstitution[] = [];
+      const lettersOfGid = new Map<number, string>();
+      const inFont = new Set(glyphs.map((g) => g.gid));
+      for (const gid of gids) {
+        const letters = lettersOf(gid);
+        if (letters === undefined || [...letters].length < 2 || !inFont.has(gid)) continue;
+        const components: number[] = [];
+        let complete = true;
+        for (const ch of letters) {
+          const component = byCode.get(ch.codePointAt(0) ?? 0);
+          if (component === undefined || component === gid || components.includes(component)) {
+            complete = false;
+            break;
+          }
+          components.push(component);
+        }
+        if (!complete) continue;
+        ligatures.push({ letters: components, gid });
+        lettersOfGid.set(gid, letters);
+      }
+      parts.push(`liga\u0001${ligatures.map((l) => `${l.gid}<${l.letters.join(',')}>`).join('|')}`);
+
       parts.sort();
       const family = `wpdf-${contentHash(parts)}`;
       let asset = this.cache.get(family);
       if (asset) {
         reused++;
       } else {
-        asset = await this.compile(family, glyphs);
+        asset = await this.compile(family, glyphs, ligatures);
         this.cache.set(family, asset);
         this.order.push(family);
         built++;
@@ -231,7 +269,7 @@ export class FontRegistry {
         seen.add(asset.family);
         assets.push(asset);
       }
-      fonts.set(fontId, { family: asset.family, codes, asset });
+      fonts.set(fontId, { family: asset.family, codes, letters: lettersOfGid, asset });
     }
 
     return { fonts, assets, built, reused };
@@ -247,18 +285,26 @@ export class FontRegistry {
    * same insertion order, so `assets()` and `stylesheet()` are still the single
    * list of what the document has registered.
    */
-  async shared(family: string, glyphs: OutlineGlyph[]): Promise<{ asset: FontAsset; built: boolean }> {
+  async shared(
+    family: string,
+    glyphs: OutlineGlyph[],
+    ligatures: readonly LigatureSubstitution[] = [],
+  ): Promise<{ asset: FontAsset; built: boolean }> {
     const existing = this.cache.get(family);
     if (existing) return { asset: existing, built: false };
-    const asset = await this.compile(family, glyphs);
+    const asset = await this.compile(family, glyphs, ligatures);
     this.cache.set(family, asset);
     this.order.push(family);
     return { asset, built: true };
   }
 
-  private async compile(family: string, glyphs: OutlineGlyph[]): Promise<FontAsset> {
+  private async compile(
+    family: string,
+    glyphs: OutlineGlyph[],
+    ligatures: readonly LigatureSubstitution[] = [],
+  ): Promise<FontAsset> {
     debug('compile: build', family, glyphs.length, 'glyphs');
-    const sfnt = buildFontFromOutlines(glyphs, { familyName: family });
+    const sfnt = buildFontFromOutlines(glyphs, { familyName: family, ligatures });
     debug('compile: built', sfnt.data.byteLength, 'bytes');
     const sfntBytes = new Uint8Array(sfnt.data);
 

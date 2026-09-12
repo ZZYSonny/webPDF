@@ -6,9 +6,9 @@
  * Makes sure the test corpus is in the cache (the papers are public URLs, so a
  * cold cache is a download), builds the demo, serves it - the Vite config mounts
  * that cache at `/pdf`, which is how the picker offers a local copy of a paper -
- * checks that the text render reproduces MuPDF's outlines, then drives the demo
- * UI, including a paper fetched from its public URL, because that is what a
- * published page loads.
+ * checks that the text render reproduces MuPDF's outlines and that a ligature is
+ * drawn by the letters the text says, then drives the demo UI, including a paper
+ * fetched from its public URL, because that is what a published page loads.
  */
 
 import { spawn } from 'node:child_process';
@@ -83,6 +83,12 @@ try {
     });
   }
   if (!samples.length) console.log('\n(no paper in the cache - fidelity skipped)');
+
+  console.log('\n› a ligature is drawn by the letters the text says');
+  await run([path.join(here, 'ligature.mjs')], { stdio: 'inherit' }).catch((err) => {
+    failed = true;
+    console.error(String(err.message));
+  });
 
   console.log('\n› demo application');
   await run([path.join(here, 'demo.mjs'), url], { stdio: 'inherit' });

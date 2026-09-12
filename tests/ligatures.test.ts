@@ -11,9 +11,13 @@
  * missed - "fi" left out of the fixation point of "find".
  *
  * The text device knows the whole word, so the letters come from there
- * (`svg/ligatures.ts`) and the glyph is given the Unicode character that *is*
- * the ligature. Bionic reading then counts the word in letters rather than in
- * glyphs (`svg/bionic.ts`), which is what its fixation points are made of.
+ * (`svg/ligatures.ts`) and they are what the text says: the glyph is still in the
+ * font, and a `liga` rule the font is built with (`font/build.ts`) draws it for
+ * those letters - the page shows one glyph and the reader copies two letters.
+ * Bionic reading then counts the word in letters rather than in glyphs
+ * (`svg/bionic.ts`), which is what its fixation points are made of. A glyph no
+ * letters could be established for keeps its private-use stand-in, which draws
+ * identically and claims nothing about what it means.
  *
  *   node tests/ligatures.test.ts
  */
@@ -131,6 +135,22 @@ test('a ligature at the very end of the page keeps the name it had', () => {
   assert.equal(glyphLetters(chars, [glyph(1, 7, 0, 0, 0x66)]).get('1:7'), 'f');
 });
 
+test('a glyph the document itself calls a ligature is read by its letters', () => {
+  // pdfTeX writes the glyph's own Unicode value into the page's encoding, so
+  // the display list names it `U+FB01` rather than the `f` the outline device
+  // can only fit. That is the same claim written the other way round, and the
+  // text device still has the two letters.
+  const chars = [...at(0, 0, 'f'), ...at(8, 0, 'i'), ...at(9, 0, 'c')];
+  assert.equal(glyphLetters(chars, [glyph(1, 7, 0, 0, 0xfb01), glyph(1, 8, 9, 0, 0x63)]).get('1:7'), 'fi');
+});
+
+test('a glyph called a ligature whose letters are other letters is left out', () => {
+  // The name says `fi` and the text device says `fx`: the two disagree, and a
+  // glyph the two devices read differently is not one to write text from.
+  const chars = [...at(0, 0, 'f'), ...at(8, 0, 'x')];
+  assert.equal(glyphLetters(chars, [glyph(1, 7, 0, 0, 0xfb01)]).has('1:7'), false);
+});
+
 /* ---------------------------------------------------------- in the built font */
 
 const SQUARE = 'M0 0L.5 0L.5 .5L0 .5Z';
@@ -236,7 +256,6 @@ const bytes = file instanceof Error || !file ? null : new Uint8Array(fs.readFile
 
 /** Page 14: the one that made the ligature visible - "We find that improved…". */
 const INDEX = 13;
-const LIGATURE = '\ufb01';
 
 /** The characters an escaped piece of SVG text stands for. */
 const unescape = (s: string): string =>
@@ -320,7 +339,7 @@ function pageLines(doc: mupdf.Document, index: number): string[] {
   return lines;
 }
 
-test('a real page: the ligature is the character it is, not a private-use stand-in', { skip: bytes ? false : 'no cached paper' }, async () => {
+test('a real page: the ligature is written as its letters, not a stand-in', { skip: bytes ? false : 'no cached paper' }, async () => {
   assert.ok(bytes);
   const engine = new PdfEngine();
   try {
@@ -329,16 +348,18 @@ test('a real page: the ligature is the character it is, not a private-use stand-
     const text = textOf(rendered.svg);
 
     // "task-specific fine-tuning" and "We find that": every ligature on this
-    // page is the character it stands for, and it is in the word it belongs to.
-    assert.ok(text.includes(`speci${LIGATURE}c`), 'the fi of "specific" is the fi character');
-    assert.ok(text.includes(`${LIGATURE}ne-tuning`), 'and the one in "fine-tuning"');
-    assert.ok(text.includes(`We ${LIGATURE}nd`), 'and the one in "find"');
+    // page is written as the letters it stands for, which is what a reader
+    // searches for, selects, and copies.
+    assert.ok(text.includes('specific'), 'the fi of "specific" is written as its letters');
+    assert.ok(text.includes('fine-tuning'), 'and the one in "fine-tuning"');
+    assert.ok(text.includes('We find'), 'and the one in "find"');
     assert.equal(/[\ue000-\uf8ff]/.test(text), false, 'no glyph is left as a private-use code point');
+    assert.equal(/[\ufb00-\ufb06]/.test(text), false, 'and no letter is written as a ligature the page never wrote');
 
     // And the page says exactly what it draws: every character, in order, named
-    // the way the page's own text names it. NFKC is what puts the ligature's
-    // letters back; U+FFFD is what the text device writes for a glyph the
-    // document gives no meaning to, which stays an outline here.
+    // the way the page's own text names it. U+FFFD is what the text device
+    // writes for a glyph the document gives no meaning to, which stays an
+    // outline here.
     const doc = mupdf.Document.openDocument(bytes, 'application/pdf');
     const lines = pageLines(doc, INDEX);
     doc.destroy();
@@ -398,9 +419,11 @@ test('a real page: the fixation points are the ones the page itself has', { skip
       );
     }
 
-    // Said the small way round, because this is what a reader saw: the ligature
-    // is part of the fixation point of "find", and the rest of the word is not.
-    assert.ok(plain.includes(`${LIGATURE}n`), 'the fi of "find" is marked');
+    // Said the small way round, because this is what a reader saw: the fi of
+    // "find" is part of the fixation point, and the d after it is not. The
+    // ligature is a tspan of its own - it is one glyph and the shaper has to
+    // lay its letters out together - so the marks are read per word.
+    assert.equal(got.find((w) => w.word === 'find')?.fixed, 'fin', 'the fi of "find" is marked');
     assert.ok(faded.some((s) => s.startsWith('d')), 'and the d after it is not');
     for (const stretch of faded) assert.ok(/\S/.test(stretch), 'a faded stretch draws something');
   } finally {
