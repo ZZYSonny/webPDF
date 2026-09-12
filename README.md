@@ -10,7 +10,7 @@ const viewer = await createViewer({ container: '#viewer', source: file });
 viewer.setZoom('fit-width');
 ```
 
-![the demo: a paper downloaded from arXiv, rendered as SVG with its real fonts, one line of chrome above it, and every match of a search boxed](docs/demo.png)
+![the demo: a paper downloaded from arXiv, rendered as SVG with its real fonts, one line of chrome above it, every match of a search boxed, and a toast saying the document's fonts are planned and the pages are one document now](docs/demo.png)
 
 ---
 
@@ -211,20 +211,24 @@ createViewer({
   keepPages: 1,           // pages either side of the viewport that stay in the DOM
   overscanViewports: 1,   // how far past the viewport the rendered window reaches
   prepareAhead: 3,        // pages past the window rendered while nothing else is happening
-  preplanPages: 64,       // pages worth planning the fonts for before the first is drawn
+  renderMode: 'frames',   // how a page is drawn while the document's fonts are planned
+  planFonts: true,        // plan one face per font for the whole document, in the background
 });
 ```
 
 * A page is rendered about a viewport before it can be read, so arriving at it is
   not the moment its render starts.
-* **The document's fonts are planned before the first page is laid out.** The
-  engine walks the document once, text only, drawing nothing, and builds one
-  `@font-face` per *font* rather than one per page (`EngineOptions.preplanPages`,
-  default 64 pages; `tests/font-plan-cost.mjs` prints the table). That is what
-  lets the pages be **one document**: a face registered into a document that
-  already holds pages makes Chromium lay out every text run in it again, so
-  "once, before anything is drawn" and "once per page" are the difference between
-  a smooth scroll and a hitch at every page boundary.
+* **The document's fonts are planned in the background, and the pages become one
+  document when the plan is ready.** The engine walks the document once, text
+  only, drawing nothing, and builds one `@font-face` per *font* rather than one
+  per page (`EngineOptions.planFonts`). Nothing waits for that walk: until it is
+  done each page is drawn with the faces *that page* drew, in a frame of its own,
+  where registering them cannot touch another page; the moment it is done, the
+  viewer writes every planned face into its own document in one go and replaces
+  the frames with it. `renderMode` is exactly that story (`'progressive'`), a
+  frame per page for good (`'frames'`), or one document with nothing drawn until
+  the plan is ready (`'global'`). The demo starts in `'frames'` and offers all
+  three on the card; the library's own default is `'progressive'`.
 * A finished page is installed at a **quiet moment** — 150 ms after the view has
   stopped moving — unless the reader is looking at it or is one page away from
   it, in which case it goes in straight away.
@@ -253,46 +257,57 @@ separate document contains that — shadow roots do not help, because Chromium
 
 Before the plan existed, a page was drawn in a same-origin frame of its own, so
 that the face it brought could only invalidate that frame (measured: 0 nodes in
-the viewer's document, 450 in the pages' own). The frames worked, and they cost a
-document, an iframe, 675 nodes and ~0.18 MB per page, measured — and they are why
-a selection could not cross a page boundary, find-in-page boxes stopped at a
-page, and there was no caret from one page to the next. Planning the faces is
-what removes the reason for them: a planned document registers every face it will
-ever need before the first page is laid out and none after it, so the pages are
-one document and the browser's own text behaviour is the reader's.
+the viewer's document, 450 in the pages' own). Those are the two answers, and the
+viewer now uses both: a **frame per page**, with that page's own faces, while the
+document's plan is being walked; then **one planned document**, where every face
+is registered in one write and none after it, so the pages are one document and
+the browser's own text behaviour - selection across a page boundary,
+find-in-page, a caret - is the reader's. The frames are not free (a document, an
+iframe, 675 nodes and ~0.18 MB per page, measured), which is why they are the
+interim rather than the destination, and why a host that wants one document from
+the first pixel asks for `renderMode: 'global'` and sees nothing until the plan
+is ready.
 
-That is measured, not asserted. `tests/browser/single.mjs` counts the faces as
-they are registered and finds **33 at open and 33 after reading the document from
-end to end**, with no iframe anywhere in the viewer. The same count on the demo,
-page by page to the end of the paper, is 33 → 33 planned and 48 → 89 with
-`?plan=0`; every one of those 41 later registrations is a whole-document
-re-layout while the reader is reading. `tests/font-plan.test.ts` holds a planned
-page to the per-page render character for character, and every character to the
-glyph the page drew. What the document says is the page's own text and not a
-rendering of it: a word set with a ligature copies as its letters, and
-`tests/browser/single.mjs` copies a selection that spans two pages and refuses
-any character the page never wrote.
+That is measured, not asserted. `tests/browser/modes.mjs` holds all three modes
+to it: in the frame mode the viewer's own document is told about **no face at
+all** while pages arrive, and the faces a page brings leave every page already on
+screen exactly as it was - the same face count in every frame, before and after;
+in the progressive mode the first page is on screen *before* the plan is ready
+and the switch then draws it again under the document's faces; in the global mode
+no frame ever exists. `tests/browser/single.mjs` counts the faces after the
+switch and finds **33, and 33 again after reading the document from end to end**,
+with no iframe anywhere in the viewer. The same count on the demo, page by page
+to the end of the paper, is 33 → 33 planned and 48 → 89 with `planFonts: false`;
+every one of those 41 later registrations is a whole-document re-layout while the
+reader is reading. `tests/font-plan.test.ts` holds a planned page to the per-page
+render character for character, and every character to the glyph the page drew.
+What the document says is the page's own text and not a rendering of it: a word
+set with a ligature copies as its letters, and `tests/browser/single.mjs` copies
+a selection that spans two pages and refuses any character the page never wrote.
 
-Planning is not free, which is why it has a budget. The walk is a few milliseconds
-a page, and building the faces is a font compile each, so a small document is
-planned whole at open — 0.9 s for the 15-page paper, 0.7 s for the 12-page one —
-and a long one is not:
+Planning is not free, and it is not free of the reader either — which is the
+whole reason it runs behind the frames. `open` costs the document read and
+nothing else; the plan is then walked and built in the background while pages are
+drawn a frame at a time, and the document becomes one document when it is ready:
 
-| document | pages | plan | at open | while reading | faces | bytes |
-|---|---|---|---|---|---|---|
-| *Attention* | 15 | whole | 0.9-1.0 s | — | 33 | 94 kB |
-| *ResNet* | 12 | whole | 0.6 s | — | 28 | 82 kB |
-| *GPT-4* | 100 | window | 0.8 s | 2.2 s | 168 | 827 kB |
-| specification | 756 | window | 0.8 s | 17.6 s | 259 | 1.2 MB |
+| document | pages | open | plan ready after | faces | bytes |
+|---|---|---|---|---|---|
+| *Attention* | 15 | 0.20 s | 0.73 s | 33 | 94 kB |
+| *ResNet* | 12 | 0.13 s | 0.54 s | 28 | 83 kB |
+| *GPT-4* | 100 | 0.05 s | 2.32 s | 77 | 249 kB |
+| specification | 756 | 0.11 s | 18.30 s | 48 | 216 kB |
 
-(`node tests/font-plan-cost.mjs`.) "Whole" means every page was walked before the
-first was drawn; "window" means the plan stayed 24 pages ahead of the reader, so
-its cost arrives alongside the render and never as a wait. Whole-planning the
-100-page report costs 2.3 s and the specification 17.7 s, which is why the budget
-is 64 pages and not "all of them". The alternative — a face per page's glyph set,
-which is what `preplanPages: 0` still does and what `?plan=0` on the demo selects
-— mints 89 families on *Attention*, 88 on *ResNet*, 326 on *GPT-4* and 2684 on
-the specification.
+(`node tests/font-plan-cost.mjs`; `tests/font-plan.test.ts` prints the first row
+from inside the engine, where the document has been read once already: *Attention*
+opens in **58 ms with the plan not ready**, and its plan is ready 428 ms later.) Planning the document *whole* is what keeps
+the face count small, and the background is what keeps it out of the way. The
+alternative — a face per page's glyph set, which is what
+`EngineOptions.planFonts: false` does and what the demo's `IFrame + Per Page
+Font` selects — mints **89 families over *Attention*'s 15 pages** against the
+plan's 26, and 88 over *ResNet*'s 12 against 27, because a page's font is a
+subset of the glyphs that page happened to draw (`tests/font-plan.test.ts`), and
+every one of those extra families is registered into the document while the
+reader is reading it.
 
 #### Cropping pages to their content
 
@@ -569,6 +584,19 @@ viewer:
   public URLs and nothing else. Once a document is open the card is gone, and
   another file arrives by drag and drop over the pages or by Ctrl+O - the bar
   itself never carries a way to open one.
+* **The rendering mode is chosen on the card too, and remembered.** It sits on
+  the same line as the file picker and the examples, because it is a property of
+  the session rather than of a document: the engine and the viewer are built once,
+  for the mode in force when the first document is opened. *IFrame + Per Page
+  Font* draws every page in its own frame with its own fonts and plans nothing;
+  *IFrame → Global Font* does that until the document's fonts are planned and then
+  replaces the frames with one document; *Global Font Only* shows nothing until
+  they are planned. The first is starred - a star is a recommendation and not a
+  state, the same as the crop menu's - and the row in force is the one the menu
+  opens on and colours. The choice is written down with the document it was made
+  for, like every other setting, so the next visit starts the way this one was set
+  up; `?mode=` names one for a test, and `?plan=0` (the name this page used before
+  there was a menu) still means the frame mode.
 * **One bar, one line, no status bar.** The bar is the document's chrome and it
   arrives with the first page; it stays a single row at every window width, and
   what gives way to keep it there is the find box: below 560px the page count and
@@ -981,13 +1009,17 @@ The library was written with content scripts in mind:
   and the `window.webpdf` handle the demo installs for itself.
 * **Shadow DOM** (`shadowDom: true`) keeps a host page's CSS from touching the
   viewer, and vice versa.
-* **The pages are one document.** A `@font-face` belongs to a document, and
-  registering one makes Chromium lay out every text run in that document again, so
-  the faces have to be in place before the pages are: the engine plans the
-  document's fonts while it opens it and the viewer writes them in once, before
-  the first page is laid out. Nothing registers while the reader scrolls, which is
-  what makes one document possible — and with it selection across a page boundary,
-  find-in-page over the whole paper, and a caret that behaves. A host page's CSP
+* **The pages become one document, and until they do every page is one of its
+  own.** A `@font-face` belongs to a document, and registering one makes Chromium
+  lay out every text run in that document again, so the faces have to be in place
+  before the pages are: the engine plans the document's fonts in the background,
+  one face per font, while the viewer draws a frame per page with the faces that
+  page brought. When the plan is ready the viewer writes every face in once and
+  replaces the frames with its own document. Nothing registers while the reader
+  scrolls, which is what makes one document possible — and with it selection
+  across a page boundary, find-in-page over the whole paper, and a caret that
+  behaves; a host that needs those from the first pixel asks for
+  `renderMode: 'global'`. A host page's CSP
   applies to the faces exactly as it does to the viewer's own styles: they arrive
   as `data:` URLs, so a page with `default-src 'self'` needs `font-src data:` for
   text to be drawn with the document's fonts.
@@ -1137,8 +1169,9 @@ tests/
                             and the asset's format label matches its bytes
   font-program.test.ts      a glyph drawn from the PDF's own font program is the
                             outline the page drew, glyph for glyph
-  font-plan.test.ts         a document's faces follow its fonts and not its pages,
-                            every character reaches the glyph the page drew, every
+  font-plan.test.ts         a document opens before its fonts are planned, and its
+                            faces then follow its fonts and not its pages; every
+                            character reaches the glyph the page drew, every
                             ligature draws its letters as the page's one glyph,
                             and a planned page draws what the per-page fonts drew
   font-plan-cost.mjs        what planning costs and saves, per corpus paper: the
@@ -1148,6 +1181,8 @@ tests/
   browser/                  headless-Chromium verification over CDP
     demo.mjs                the built demo, driven through its own UI
     single.mjs              one document: selection, clipboard, keys, wheel, faces
+    modes.mjs               frames until the plan is ready, then one document: the
+                            three rendering modes, and the mode a reader keeps
     ligature.mjs            the letters and the ligature glyph are the same pixels
     pinch.mjs               the pinch/zoom contract
     bridge.mjs              the host protocol: a new page, an old host
@@ -1278,15 +1313,24 @@ the workflow to point that somewhere else, or to nothing at all.
   text would otherwise be reordered by the bidi algorithm or reshaped, undoing
   MuPDF's already-resolved per-glyph positioning. Latin, Greek, Cyrillic, CJK
   and punctuation are all emitted as text.
-* **The plan costs a walk of the document, and a long one is planned as it
-  goes.** One face per font has to know every glyph the document draws, which
-  means walking it — a text-only pass, a few milliseconds a page, plus a font
-  compile per face. Up to `preplanPages` (64) that happens before the first page
-  is laid out, so nothing registers afterwards; past it the plan stays a window
-  ahead of the reader and its cost arrives alongside the render. A very long
-  document therefore still registers a face the reader is about to reach, and
-  each registration re-lays-out the pages on screen. `preplanPages: 0` gives
-  every page its own faces, which is what the viewer did before the plan existed.
+* **A planned document is a whole-document walk, and it costs what it costs.**
+  One face per font has to know every glyph the document draws, which means
+  walking it once — text only, a few milliseconds a page — and compiling a font
+  per face: **0.06 s to open a paper, 0.8 s for its plan to be ready**, and
+  18.3 s for the 756-page specification. None of it is in front of the first
+  page, because the pages are drawn in frames with their own faces until the plan
+  arrives, but it is CPU spent on the reader's machine, and on a long document it
+  is a long time during which the pages are not one document. A host that would
+  rather not pay it at all sets `EngineOptions.planFonts: false` and draws every
+  page with the faces that page drew, which is what the demo's `IFrame + Per Page
+  Font` does.
+* **A page in a frame is a document of its own.** While the plan is being
+  walked, selection, find-in-page and the caret stop at a page boundary, because
+  that is what a frame is; they become the browser's own over the whole document
+  when the plan is ready and the frames are replaced. A host that needs that
+  behaviour from the first pixel asks for `renderMode: 'global'` and shows
+  nothing until the pages can be one document. The demo starts in `'frames'`;
+  the library's default is `'progressive'`.
 * **Offline is the site's, and it is bounded.** The first visit has to reach the
   network for the shell and the engine, and only the documents this browser has
   actually opened are available without it — the last eight, by URL, with the
@@ -1317,13 +1361,14 @@ the workflow to point that somewhere else, or to nothing at all.
   Reading the glyphs out of the program is what makes one face per *font* for the
   whole document possible: `src/core/font/plan.ts` walks the document once, text
   only, keeps the glyphs, the codes and the ligature letters of every font it
-  meets, and the engine builds those faces before the first page is laid out
-  (`EngineOptions.preplanPages`). Over the corpus that is 33 faces against 89 for
-  *Attention* (15 pages), 28 against 88 for *ResNet* (12), 77 against 326 for
-  *GPT-4* (100), and 48 against 2684 for the 756-page specification — measured by
-  `tests/font-plan.test.ts` and `tests/font-plan-cost.mjs`. It is **on by
-  default**; `preplanPages: 0` gives every page its own subset, which is the old
-  behaviour and a fair A/B (`?plan=0` in the demo).
+  meets, and builds those faces in the background from the moment the document is
+  open (`EngineOptions.planFonts`). Over the corpus that is 33 faces for
+  *Attention* (15 pages), 28 for *ResNet* (12), 77 for *GPT-4* (100) and 48 for
+  the 756-page specification, against 89, 88, 326 and 2684 families built a page
+  at a time — measured by `tests/font-plan.test.ts` and
+  `tests/font-plan-cost.mjs`. It is **on by default**; `planFonts: false` gives
+  every page its own subset, which is the old behaviour and a fair A/B (the
+  demo's `IFrame + Per Page Font`, and `?plan=0`).
   A planned page is not a *different* drawing: `tests/font-plan.test.ts` renders
   pages both ways and holds the text runs to be character for character the same,
   and separately holds every character to the glyph the page drew — the first bug

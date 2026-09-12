@@ -1,17 +1,20 @@
 /**
  * One document, and the browser's own text behaviour over it.
  *
- * A page used to be drawn in a same-origin frame, because a `@font-face` belongs
- * to a document and registering one re-lays-out every text run in it. The engine
- * now plans the document's fonts before the first page is laid out - one face per
- * *font* - so the pages are one document and nothing registers while the reader
- * scrolls. What that buys, beyond a smooth boundary, is a page behaving like
- * text: selection, the clipboard, find-in-page and a caret are the browser's own
- * over the whole document, and a selection can cross a page boundary, which it
- * could not between frames.
+ * A page is drawn in a same-origin frame while the engine is planning the
+ * document's fonts, because a `@font-face` belongs to a document and
+ * registering one re-lays-out every text run in it. The plan builds one face
+ * per *font*, in the background, and the moment it is ready the viewer writes
+ * every face into its own document and replaces the frames with it. What that
+ * buys, beyond a smooth boundary, is a page behaving like text: selection, the
+ * clipboard, find-in-page and a caret are the browser's own over the whole
+ * document, and a selection can cross a page boundary, which it could not
+ * between frames.
  *
- * This file is the bill for that. The checks are written the way a reader would
- * notice them going missing.
+ * This file is the bill for that, and it is about the end of the mode: it asks
+ * the demo for `IFrame → Global Font` and does not start checking until the
+ * frames are gone. `modes.mjs` is where the frame half is checked, and where
+ * the mode that never leaves a frame is checked.
  *
  *   node tests/browser/single.mjs [url]
  */
@@ -19,6 +22,7 @@
 import { launch } from './cdp.mjs';
 
 const url = process.argv[2] ?? 'http://127.0.0.1:5178/';
+const at = `${url}${url.includes('?') ? '&' : '?'}mode=progressive`;
 const PUBLIC_EXAMPLE = 'https://arxiv.org/pdf/1706.03762v7';
 const CACHED_PREFIX = '/pdf/';
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -42,7 +46,11 @@ await page.send('Page.addScriptToEvaluateOnNewDocument', {
     };
     window.__svgOf = (n) => {
       const el = window.__pages().find((p) => Number(p.dataset.page) === Number(n));
-      return el?.querySelector('svg.wpdf-page-svg') ?? null;
+      if (!el) return null;
+      // While the pages are drawn one to a frame the SVG is in the page's own
+      // document; after the switch it is in the slot itself.
+      const doc = el.querySelector('iframe')?.contentDocument ?? el;
+      return doc.querySelector('svg.wpdf-page-svg') ?? null;
     };
     window.__shown = () => Number(document.getElementById('pageno').value);
     window.__frames = () =>
@@ -96,7 +104,7 @@ try {
     })
     .catch(() => undefined);
 
-  await page.goto(url);
+  await page.goto(at);
   await page.waitFor(() => typeof window.webpdf === 'object', { label: 'demo bootstrap', timeout: 90000 });
 
   const options = await page.evaluate(() => {
@@ -109,6 +117,9 @@ try {
     row.click();
   })()`);
   await page.waitFor(() => window.__pages().length > 0 && window.__svgOf(1), { label: 'first page', timeout: 120000 });
+  // The switch is what this file is about: until it happens the pages are
+  // frames, and everything below would be asking the wrong document.
+  await page.waitFor(() => window.__frames() === 0, { label: 'the pages to become one document', timeout: 120000 });
   await sleep(1500);
 
   // ------------------------------------------------------- a document at all

@@ -25,7 +25,14 @@ import type {
   RenderedPage,
   EngineOptions,
 } from './core/engine.ts';
-import { DEFAULT_ZOOM_STEPS, PdfViewer, type PdfViewerOptions, type ViewerEvent } from './viewer/viewer.ts';
+import {
+  DEFAULT_ZOOM_STEPS,
+  PdfViewer,
+  type PageMode,
+  type PdfViewerOptions,
+  type RenderMode,
+  type ViewerEvent,
+} from './viewer/viewer.ts';
 import type { CropRuleId } from './core/crop.ts';
 import { createWorkerEngine } from './worker/client.ts';
 import { loadEngine } from './core/engine-wasm.ts';
@@ -48,12 +55,12 @@ export interface CreateViewerOptions extends Omit<PdfViewerOptions, 'container' 
   disableCompression?: boolean;
   onWarn?: (message: string) => void;
   /**
-   * Forwarded to a freshly created engine: how many pages are worth planning its
-   * fonts for before the first one is laid out (see `EngineOptions`). `0` gives
-   * every page its own fonts, which is what the viewer did before the plan
-   * existed - slower to scroll, but useful for measuring the difference.
+   * Forwarded to a freshly created engine: whether the document's fonts are
+   * planned as one face per *font*, in the background (see `EngineOptions`).
+   * `false` gives every page its own faces, which is what a viewer that draws
+   * each page in its own frame wants.
    */
-  preplanPages?: number;
+  planFonts?: boolean;
 }
 
 function resolveContainer(container: HTMLElement | string): HTMLElement {
@@ -65,9 +72,9 @@ function resolveContainer(container: HTMLElement | string): HTMLElement {
 
 /** Create a viewer, optionally opening a document straight away. */
 export async function createViewer(opts: CreateViewerOptions): Promise<PdfViewer> {
-  const { source, engine, worker, workerUrl, disableCompression, onWarn, preplanPages, ...viewerOpts } = opts;
+  const { source, engine, worker, workerUrl, disableCompression, onWarn, planFonts, ...viewerOpts } = opts;
 
-  const engineOpts = { disableCompression, onWarn, preplanPages };
+  const engineOpts = { disableCompression, onWarn, planFonts };
   let backend: PdfEngineLike | undefined = engine;
   if (!backend && (worker ?? true)) {
     backend = (await createWorkerEngine(workerUrl, engineOpts)) ?? undefined;
@@ -124,7 +131,7 @@ export async function* renderDocument(
   // document-wide face would put every glyph the document drew into every page
   // that uses the font. The plan exists for a viewer, where a face is registered
   // once and shared; here it is a bigger file for no one's benefit.
-  const engine = new PdfEngine({ ...opts, preplanPages: opts.preplanPages ?? 0 });
+  const engine = new PdfEngine({ ...opts, planFonts: false });
   try {
     await engine.open(source);
     const count = engine.documentInfo.pageCount;
@@ -150,7 +157,7 @@ export async function* renderDocument(
   }
 }
 
-export type { DocumentInfo, PdfSource, RenderedPage, ViewerEvent };
+export type { DocumentInfo, PdfSource, RenderedPage, ViewerEvent, RenderMode, PageMode };
 export { PdfViewer, DEFAULT_ZOOM_STEPS };
 export { WorkerEngine, createWorkerEngine } from './worker/client.ts';
 export type { PdfEngineLike, RenderOptions, RenderStats, OutlineNode, PageGeometry, TextMode } from './core/engine.ts';

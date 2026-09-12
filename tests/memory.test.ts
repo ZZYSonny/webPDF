@@ -117,6 +117,25 @@ test('the settings a document was left with are the ones the next one starts wit
   assert.equal(inherited({}), null);
 });
 
+/**
+ * The rendering mode is the one setting the *viewer* cannot be told at any time:
+ * the engine and the viewer are built once, before the first document is open,
+ * each with the mode it will use for the session. So it is remembered with the
+ * document that was read under it, and the next visit builds them with it - which
+ * is what "the mode I chose" means across a reload.
+ */
+test('the rendering mode is remembered with the document it was chosen for', () => {
+  const memory = put({}, 'url:a', { pos: place(1), settings: { renderMode: 'global' } }, at(1));
+  assert.equal(inherited(memory)?.renderMode, 'global');
+  const restored = read(write(memory));
+  assert.equal(inherited(restored)?.renderMode, 'global');
+
+  // And it does not disturb what is already there: a document read after it
+  // inherits the mode along with the zoom and the crop.
+  const next = put(memory, 'url:b', { pos: place(3), settings: { renderMode: 'global', outline: true } }, at(2));
+  assert.deepEqual(inherited(next), { renderMode: 'global', outline: true });
+});
+
 test('the memory is a string, and comes back as what it was', () => {
   const memory = put(memoryOf(['a', 'b']), 'url:c', { pos: place(4, 12.5), settings: { outline: true } }, at(7));
   const restored = read(write(memory));

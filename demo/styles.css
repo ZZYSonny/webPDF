@@ -207,7 +207,14 @@ body {
   white-space: normal;
 }
 
-/* The value in force: one star per list, on the row it belongs to. */
+/**
+ * One star per list, on the row the list wants to point at: the value in force
+ * where the list is a set of values the reader settled on (bionic reading's
+ * fade), and the recommended setting where it is a list of modes (the crop
+ * rules, and the rendering mode). The distinction matters where the two differ -
+ * a recommendation is not a state, and the row in force is marked by
+ * `aria-selected` above.
+ */
 .star {
   margin-left: 6px;
   color: var(--accent);
@@ -896,8 +903,15 @@ html.wpdf-host .empty {
   line-height: 1.62;
 }
 
+/**
+ * The three ways in: a file, an example paper, and how the pages are to be
+ * drawn. One line where there is room for it - the card is 560px and the three
+ * controls fit - and wrapped rather than squeezed when there is not, because a
+ * sentence-shaped button reads as prose at 360px.
+ */
 .empty-actions {
   display: flex;
+  flex-wrap: wrap;
   gap: 8px;
   justify-content: center;
 }

@@ -77,8 +77,8 @@ async function findLigature(paper) {
   const doc = mupdf.Document.openDocument(fs.readFileSync(file), 'application/pdf');
   try {
     const registry = new FontRegistry({ disableCompression: true });
-    const plan = new DocumentFontPlan({ preplanPages: 8 });
-    await plan.cover(doc, 0, registry);
+    const plan = new DocumentFontPlan();
+    await plan.start(doc, registry);
     for (let index = 0; index < Math.min(doc.countPages(), 8); index++) {
       const page = doc.loadPage(index);
       try {

@@ -196,8 +196,10 @@ try {
     () => {
       const sr = document.getElementById('viewer')?.shadowRoot;
       const pages = [...(sr?.querySelectorAll('.wpdf-page') ?? [])];
-      // The pages are in the viewer's own document, so the SVG is in the slot.
-      return pages.some((el) => el.querySelector('svg.wpdf-page-svg'));
+      // A page is drawn in a frame of its own until the document's fonts are
+      // planned, and in the slot itself after that, so the SVG is looked for in
+      // whichever document holds it.
+      return pages.some((el) => (el.querySelector('iframe')?.contentDocument ?? el).querySelector('svg.wpdf-page-svg'));
     },
     { label: 'first page render', timeout: 90000 },
   );

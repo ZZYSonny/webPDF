@@ -28,7 +28,7 @@
 import { createViewer } from '../src/api.ts';
 import { BIONIC_DIM } from '../src/core/svg/bionic.ts';
 import { configureEngineWasm, type EngineWasmSource } from '../src/core/engine-wasm.ts';
-import { DEFAULT_ZOOM_STEPS } from '../src/viewer/viewer.ts';
+import { DEFAULT_ZOOM_STEPS, type RenderMode } from '../src/viewer/viewer.ts';
 import type { DocumentInfo, PdfViewer, ViewerEvent } from '../src/index.ts';
 import { engine } from 'virtual:webpdf/engine';
 import { createHostBridge, isHosted, type HostBridge, type HostDocument } from './host.ts';
@@ -57,6 +57,9 @@ const els = {
   file: $<HTMLInputElement>('file'),
   exampleBtn: $<HTMLButtonElement>('example-btn'),
   exampleMenu: $('example-menu'),
+  modeBtn: $<HTMLButtonElement>('mode-btn'),
+  modeMenu: $('mode-menu'),
+  modeLabel: $('mode-label'),
   tocToggle: $<HTMLButtonElement>('toc-toggle'),
   toc: $('toc'),
   tocBody: $('toc-body'),
@@ -127,6 +130,8 @@ let topbarHeight = 0;
  * own - see `document-loaded` below.
  */
 let sourceName = '';
+/** True while a document's pages are drawn one to a frame (see `render-mode`). */
+let pagesWereFramed = false;
 
 /* ---------------------------------------------------------------- sources */
 
@@ -249,11 +254,141 @@ const bionicMenu: Menu = createMenu({
   items: () => [...els.bionicMenu.querySelectorAll<HTMLElement>('.menu-option')],
 });
 
+/* ---------------------------------------------------------- render mode */
+
+/**
+ * How the pages are drawn, chosen once on the card that offers a document.
+ *
+ * The engine plans a document's fonts the moment it is open - one `@font-face`
+ * per *font*, for every page of it - and until that plan is ready each page is
+ * drawn with the faces that page drew itself. Where those faces are registered
+ * is what the choice is about: telling a document about a face makes the
+ * browser lay out every text run in it again, so a page's own faces belong in a
+ * frame of the page's own (nothing else is touched at all), and the document's
+ * faces belong in the one document, all at once, once they are planned.
+ *
+ * The plan is 0.6-2.3 s for the corpus papers and 18 s for the 756-page
+ * specification, which is exactly why it runs in the background and why there
+ * are three answers to "what do I look at while it does".
+ */
+const RENDER_MODES: ReadonlyArray<{ id: RenderMode; label: string; note: string }> = [
+  {
+    id: 'frames',
+    label: 'IFrame + Per Page Font',
+    note: 'a frame and its own fonts per page — nothing is shared, nothing is planned',
+  },
+  {
+    id: 'progressive',
+    label: 'IFrame → Global Font',
+    note: 'frames with the page’s own fonts until the document’s fonts are planned, then one document',
+  },
+  {
+    id: 'global',
+    label: 'Global Font Only',
+    note: 'one document — nothing is drawn until the document’s fonts are planned',
+  },
+];
+
+/**
+ * The mode this page starts in, and the one it stars.
+ *
+ * A star in this page is a recommendation and not a state - the crop menu's
+ * works the same way, and its README says so - so the row it sits on is the
+ * setting worth choosing and the row *in force* is the one the menu opens on and
+ * colours (`aria-selected`). A frame and a face per page is the recommended one
+ * because every document is then drawn exactly as the file sets it, page by
+ * page, with nothing shared between pages and nothing to wait for - which is
+ * also why it is where a reader who has chosen nothing starts. The other two are
+ * one click away on the same dropdown.
+ */
+const RECOMMENDED_MODE: RenderMode = 'frames';
+
+function modeNamed(value: unknown): RenderMode | null {
+  return RENDER_MODES.some((mode) => mode.id === value) ? (value as RenderMode) : null;
+}
+
+function requestedMode(): RenderMode {
+  const params = new URLSearchParams(location.search);
+  if (params.get('plan') === '0') return 'frames';
+  return modeNamed(params.get('mode')) ?? modeNamed(inherited(memory)?.renderMode) ?? RECOMMENDED_MODE;
+}
+
+let renderMode = requestedMode();
+
+const modeMenu: Menu = createMenu({
+  anchors: [els.modeBtn],
+  menu: els.modeMenu,
+  prepare: fillModeMenu,
+  items: () => [...els.modeMenu.querySelectorAll<HTMLElement>('.menu-option')],
+});
+
+function modeOption(mode: (typeof RENDER_MODES)[number]): HTMLButtonElement {
+  const el = document.createElement('button');
+  el.type = 'button';
+  el.className = 'menu-option';
+  el.setAttribute('role', 'option');
+  // The row in force, which is what the menu opens on and colours...
+  el.setAttribute('aria-selected', String(mode.id === renderMode));
+  el.dataset.mode = mode.id;
+  const name = document.createElement('span');
+  name.className = 'menu-name';
+  name.textContent = mode.label;
+  // ...and the row this page recommends, which is the one that carries the star.
+  if (mode.id === RECOMMENDED_MODE) {
+    const star = document.createElement('span');
+    star.className = 'star';
+    star.setAttribute('aria-hidden', 'true');
+    star.textContent = '★';
+    star.title = 'the recommended mode';
+    name.appendChild(star);
+  }
+  const note = document.createElement('span');
+  note.className = 'menu-note';
+  note.textContent = mode.note;
+  el.append(name, note);
+  el.addEventListener('click', () => {
+    chooseMode(mode.id);
+    modeMenu.close();
+  });
+  return el;
+}
+
+function fillModeMenu(): void {
+  els.modeMenu.replaceChildren(...RENDER_MODES.map(modeOption));
+}
+
+function syncModeLabel(): void {
+  const chosen = RENDER_MODES.find((mode) => mode.id === renderMode);
+  els.modeLabel.textContent = chosen?.label ?? renderMode;
+  els.modeBtn.title = chosen ? `Rendering mode — ${chosen.note}` : 'Rendering mode';
+}
+
+/**
+ * Take the mode for the session.
+ *
+ * The card is only on screen while no document is open, so this is a choice
+ * about the engine and the viewer that are about to be built rather than about
+ * a document: both are made once, on the first open, and neither can change its
+ * mind afterwards. It is remembered with the document that is opened under it,
+ * like every other setting, so the next visit starts the way this one was set
+ * up.
+ */
+function chooseMode(mode: RenderMode): void {
+  if (mode === renderMode) return;
+  renderMode = mode;
+  syncModeLabel();
+  fillModeMenu();
+  rememberHere();
+}
+
+syncModeLabel();
+fillModeMenu();
+
 /**
  * Everything that can be open over the pages. A scroll puts all of it away (see
  * `dismissOnScroll`), and so does a pinch.
  */
-const menus: readonly Menu[] = [zoomMenu, exampleMenu, bionicMenu];
+const menus: readonly Menu[] = [zoomMenu, exampleMenu, bionicMenu, modeMenu];
 
 /* --------------------------------------------------------- examples menu */
 
@@ -308,11 +443,12 @@ async function ensureViewer(): Promise<PdfViewer> {
     // neither a render nor a font registration - see the README.
     keepPages: 1,
     shadowDom: true,
-    // The document's fonts are planned before the first page is laid out, which
-    // is what makes one document possible at all. `?plan=0` gives every page its
-    // own faces instead - the way the viewer worked before the plan existed -
-    // and that is the A/B the README's numbers are measured against.
-    preplanPages: new URLSearchParams(location.search).get('plan') === '0' ? 0 : undefined,
+    // Frames with the page's own fonts until the document's plan is ready, then
+    // one document - see `RENDER_MODES` above, and `RenderMode` in the viewer.
+    renderMode,
+    // A frame holds its own faces, so a document-wide plan would be built and
+    // then never used: the frame mode does not ask for one.
+    planFonts: renderMode !== 'frames',
     // Read at each scroll rather than captured, so chrome that changes height
     // (the outline's own header, a bar that grows a pixel) is accounted for.
     scrollMargin: () => topbarHeight,
@@ -368,6 +504,16 @@ function onViewerEvent(event: ViewerEvent): void {
       viewer?.stepZoom(-1);
       break;
     }
+    case 'render-mode':
+      // How the pages are drawn changed. Only the change is worth saying out
+      // loud: the first document's fonts were planned while the reader was
+      // looking at frames, and the pages are one document from here on.
+      if (event.mode === 'frames') pagesWereFramed = true;
+      else if (pagesWereFramed) {
+        pagesWereFramed = false;
+        notify('The document’s fonts are planned — the pages are one document now.');
+      }
+      break;
     case 'page-change':
       currentPage = event.page;
       els.pageno.value = String(event.page);
@@ -1177,6 +1323,9 @@ function hostState(): { pos: Place | null; settings: Settings } {
       crop: viewer && viewer.crop.length ? { rules: [...viewer.crop], padding: viewer.cropPadding } : null,
       bionic: viewer ? { on: viewer.bionic, dim: viewer.bionicDim } : null,
       outline: !els.toc.hidden,
+      // Not something the viewer is told; it is what the *next* visit builds the
+      // engine and the viewer with (see `requestedMode`).
+      renderMode,
     },
   };
 }
@@ -1325,10 +1474,24 @@ if (topbar) {
 // is what makes it worth driving from a test rather than reaching into the page.
 declare global {
   interface Window {
-    webpdf?: { viewer(): PdfViewer | null; info(): DocumentInfo | null; open(url: string): Promise<void> };
+    webpdf?: {
+      viewer(): PdfViewer | null;
+      info(): DocumentInfo | null;
+      open(url: string): Promise<void>;
+      /** The rendering mode this session was started in. */
+      mode(): RenderMode;
+      /** Whether the pages are drawn one to a frame at this moment. */
+      pagesInFrames(): boolean;
+    };
   }
 }
-window.webpdf = { viewer: () => viewer, info: () => info, open: (url) => openSource(resolve(url)) };
+window.webpdf = {
+  viewer: () => viewer,
+  info: () => info,
+  open: (url) => openSource(resolve(url)),
+  mode: () => renderMode,
+  pagesInFrames: () => viewer?.pagesInFrames ?? false,
+};
 
 /**
  * The host, when there is one: the extension this page is the viewer for, or any

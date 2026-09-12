@@ -14,6 +14,17 @@ import { launch } from './cdp.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const url = process.argv[2] ?? 'http://127.0.0.1:5175/';
+/**
+ * The rendering mode this run is about.
+ *
+ * The demo starts in the frame mode - a page and its own fonts per frame (see
+ * `RenderMode`) - and the checks below are about the *planned* document: one
+ * document, one face per font, every face before the first page and none after
+ * it. So this run asks for the mode that ends there and lets the switch happen
+ * before it starts. The frame half of the story, and the mode that never leaves
+ * a frame, are `modes.mjs`.
+ */
+const at = `${url}${url.includes('?') ? '&' : '?'}mode=progressive`;
 const out = process.argv[3] ?? path.join(here, 'out', 'demo.png');
 fs.mkdirSync(path.dirname(out), { recursive: true });
 
@@ -76,6 +87,17 @@ await page.send('Page.addScriptToEvaluateOnNewDocument', {
     };
     window.__pageLinks = (kind) =>
       window.__pageSvgs().flatMap((svg) => [...svg.querySelectorAll('a[data-wpdf-link="' + kind + '"]')]);
+    /** What is on screen, for a failure that is about one document too few. */
+    window.__diag = () => ({
+      pageno: document.getElementById('pageno')?.value ?? '',
+      pagecount: document.getElementById('pagecount')?.textContent ?? '',
+      framed: window.webpdf?.pagesInFrames?.() ?? null,
+      frames: document.getElementById('viewer')?.shadowRoot?.querySelectorAll('iframe').length ?? -1,
+      live: window.__pageSvgs().length,
+      texts: window.__pageTexts().length,
+      uses: window.__pageSvgs().reduce((n, svg) => n + svg.querySelectorAll('use').length, 0),
+      outlines: window.__pageSvgs().reduce((n, svg) => n + (svg.querySelector('defs')?.children.length ?? 0), 0),
+    });
     /** A rect in the page's own coordinates: the pages are in this document. */
     window.__pageRect = (el) => {
       const r = el.getBoundingClientRect();
@@ -127,11 +149,6 @@ await page.send('Page.addScriptToEvaluateOnNewDocument', {
 });
 
 /**
- * Open one of the example papers, from the dropdown on the empty card. The
- * value is embedded in the expression because `page.evaluate(fn, args)` takes
- * evaluation options as its second argument, not arguments for the function.
- */
-/**
  * A page that has never been asked to draw anything.
  *
  * The memory belongs to the page - it is read once, at start-up, and written back
@@ -141,13 +158,29 @@ await page.send('Page.addScriptToEvaluateOnNewDocument', {
  */
 const forgetMemory = async () => {
   await page.evaluate("localStorage.removeItem('webpdf.memory')");
-  await page.goto(url);
+  await page.goto(at);
   // The page's own handle is installed at the end of its module graph, which is
   // what says the buttons on it are wired.
   await page.waitFor(() => !!window.webpdf?.info, { label: 'the demo to come back up' });
 };
 
+/**
+ * Open one of the example papers, from the dropdown on the empty card, and wait
+ * until the *new* document is the one on screen.
+ *
+ * The click starts a fetch and an open, and both are the page's own: until they
+ * finish, the viewer is still holding the document before it. Waiting for "a
+ * page is drawn" would therefore be answered by the page already there, and
+ * every check after it would be about the wrong document - so this waits for the
+ * tab's own title to change, and then for the pages to be one document (this run
+ * is `IFrame → Global Font`, so a page of the new document spends its first
+ * moments in a frame).
+ *
+ * The value is embedded in the expression because `page.evaluate(fn, args)` takes
+ * evaluation options as its second argument, not arguments for the function.
+ */
 const open = async (value) => {
+  const before = await page.evaluate('document.title');
   await page.evaluate(`document.getElementById('example-btn').click()`);
   await page.evaluate(`(() => {
     const url = ${JSON.stringify(value)};
@@ -155,6 +188,32 @@ const open = async (value) => {
     if (!row) throw new Error('no example row for ' + url);
     row.click();
   })()`);
+  try {
+    // A predicate that carries the old title: `waitFor` calls what it is given
+    // with no arguments, so the value has to be inside it.
+    await page.waitFor(new Function(`return document.title !== ${JSON.stringify(before)};`), {
+      label: `the document at ${value}`,
+      timeout: 120000,
+    });
+  } catch (error) {
+    console.log(
+      '  open diagnostics: ' +
+        JSON.stringify(
+          await page.evaluate(() => ({
+            title: document.title,
+            pagecount: document.getElementById('pagecount')?.textContent ?? '',
+            toast: document.getElementById('toast')?.textContent ?? '',
+            loading: document.getElementById('progress')?.hidden === false,
+          })),
+        ),
+    );
+    console.log('  console: ' + JSON.stringify(page.consoleMessages.slice(-6)));
+    throw error;
+  }
+  await page.waitFor(() => window.webpdf.pagesInFrames() === false, {
+    label: `one document for ${value}`,
+    timeout: 120000,
+  });
 };
 
 /**
@@ -329,7 +388,7 @@ const waitForPage = async (n, timeout = 30000) => {
 };
 
 try {
-  await page.goto(url);
+  await page.goto(at);
   // The module graph includes a 10 MB wasm fetch, so wait until the app has
   // actually finished bootstrapping before touching its UI.
   await page.waitFor(() => typeof window.webpdf === 'object', { label: 'demo bootstrap', timeout: 90000 });
@@ -341,7 +400,7 @@ try {
     // nothing for it to hold, and the card that offers one stands alone.
     barHidden: document.querySelector('.topbar')?.hidden === true,
     emptyHidden: document.getElementById('empty')?.hidden,
-    offered: ['example-btn', 'empty-open'].map((id) => !!document.getElementById(id)?.offsetParent),
+    offered: ['example-btn', 'empty-open', 'mode-btn'].map((id) => !!document.getElementById(id)?.offsetParent),
     // Nothing that opens a document, and none of the controls that were taken
     // off the bar, is still in the document at all.
     gone: ['open', 'sample', 'prev', 'next', 'zoom-in', 'zoom-out', 'stats'].filter((id) => document.getElementById(id)),
@@ -349,7 +408,29 @@ try {
   }));
   if (!beforeLoad.barHidden) fail('the bar should not be in the way before a document is open');
   if (beforeLoad.emptyHidden !== false) fail('the empty state should be showing before a document is open');
-  if (beforeLoad.offered.includes(false)) fail('the empty card should offer both a file and the example papers');
+  if (beforeLoad.offered.includes(false)) fail('the empty card should offer a file, the example papers and the rendering mode');
+  // The rendering mode: three ways to draw a page while the document's fonts
+  // are being planned. A star here is a recommendation and not a state - the
+  // crop menu's is the same - so the starred row is the recommended mode, and
+  // the row in force is the one the menu marks as selected. This run asks for
+  // `IFrame → Global Font` on the URL, so that is the choice; the mode a reader
+  // gets with no URL at all, and the one they are remembered as having chosen,
+  // are `modes.mjs`.
+  const chosenMode = await page.evaluate('window.webpdf.mode()');
+  const modes = await page.evaluate(() => {
+    document.getElementById('mode-btn').click();
+    return [...document.querySelectorAll('#mode-menu .menu-option')].map((o) => ({
+      mode: o.dataset.mode,
+      starred: !!o.querySelector('.star'),
+      selected: o.getAttribute('aria-selected') === 'true',
+    }));
+  });
+  await page.evaluate(() => document.getElementById('mode-btn').click());
+  const starred = modes.filter((row) => row.starred).map((row) => row.mode);
+  const selected = modes.filter((row) => row.selected).map((row) => row.mode);
+  if (modes.length !== 3) fail(`the rendering mode should offer three modes, got ${JSON.stringify(modes)}`);
+  if (starred.join() !== 'frames') fail(`the card should star the recommended mode, got ${JSON.stringify(starred)}`);
+  if (selected.join() !== chosenMode) fail(`the card should mark the mode in force (${chosenMode}), got ${JSON.stringify(selected)}`);
   if (beforeLoad.gone.length) fail(`the bar still carries ${beforeLoad.gone.join(', ')}`);
   if (!beforeLoad.options.includes(PUBLIC_EXAMPLE)) {
     fail(`the picker should offer the public example ${PUBLIC_EXAMPLE}, got ${JSON.stringify(beforeLoad.options)}`);
@@ -934,6 +1015,7 @@ try {
       await new Promise((r) => setTimeout(r, 500));
       const untouchable = (await linkCandidates('external')).filter((l) => l.href === null);
       if (!untouchable.length) {
+        console.log('  diagnostics: ' + JSON.stringify(await page.evaluate('window.__diag()')));
         fail('the GPT-4 report should offer its `file:` link as a hit area with no href');
       } else {
         const link = untouchable[0];
@@ -1638,18 +1720,23 @@ try {
 
   // ------------------------------------------------------------- the fonts
   /**
-   * Every face goes in once, before the first page, and never again.
+   * Every face goes in once, when the plan is ready, and never again.
    *
    * This is the cost that used to land on a page boundary: telling a document
    * about a `@font-face` makes the browser lay out every text run in that
    * document again, so a page arriving with a face of its own used to re-lay-out
-   * the whole viewport. The engine now plans the document's fonts while it opens
-   * it - one face per *font*, not per page - and the viewer writes them into its
-   * own document before the first page is laid out. There is one document, no
-   * page is a document of its own, and a redraw (a fade on and off, which
+   * the whole viewport. The engine plans the document's fonts - one face per
+   * *font*, not per page - in the background, and the viewer writes all of them
+   * into its own document in one go the moment the plan is ready, replacing the
+   * frames the pages were drawn in until then. After that there is one document,
+   * no page is a document of its own, and a redraw (a fade on and off, which
    * re-renders every page) registers nothing at all.
    */
-  console.log('— every face goes in once, before the first page —');
+  console.log('— every face goes in once, when the plan is ready —');
+  await page.waitFor(() => window.webpdf.pagesInFrames() === false, {
+    label: 'the pages to become one document',
+    timeout: 90000,
+  });
   const facesBefore = await page.evaluate('window.__allFaces()');
   const framesBefore = await page.evaluate(
     "document.getElementById('viewer').shadowRoot.querySelectorAll('iframe').length",
@@ -1824,6 +1911,7 @@ try {
     };
   });
   console.log('example: ' + JSON.stringify(remote));
+  if (remote.textElements < 20) console.log('  diagnostics: ' + JSON.stringify(await page.evaluate('window.__diag()')));
   if (Number(remote.pages) < 5) fail(`the example should be a real multi-page paper, got ${remote.pages} pages`);
   if (remote.textElements < 20) fail(`the example rendered almost no text (${remote.textElements} elements)`);
   if (!remote.prose) fail('the rendered page 1 of the example has no recognisable prose');

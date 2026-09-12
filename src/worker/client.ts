@@ -9,11 +9,18 @@
 import type { DocumentInfo, EngineOptions, PdfEngineLike, PdfSource, RenderOptions, RenderedPage } from '../core/engine.ts';
 import type { CropRect, CropRuleId } from '../core/crop.ts';
 import type { FontAsset } from '../core/font/registry.ts';
+import type { FontPlanProgress } from '../core/font/plan.ts';
 import { engineWasmSources } from '../core/engine-wasm.ts';
 
 interface Pending {
   resolve: (value: unknown) => void;
   reject: (error: Error) => void;
+}
+
+/** An unsolicited message from the worker, as opposed to a reply to a call. */
+interface PlanMessage {
+  wpdf: 'plan';
+  progress: FontPlanProgress | null;
 }
 
 function reviveError(raw: { name?: string; message?: string } | undefined): Error {
@@ -32,6 +39,15 @@ export class WorkerEngine implements PdfEngineLike {
   private readonly staged = new Set<string>();
   /** Faces the host has already been given, so it never registers one twice. */
   private readonly delivered = new Set<string>();
+  /**
+   * The plan's state, as last reported.
+   *
+   * Kept here rather than asked for, so that `planProgress` - the question a
+   * viewer asks the moment a document is loaded - is answered without a round
+   * trip, and answered about the *same* moment as the page it is about to draw.
+   */
+  private planState: FontPlanProgress | null = null;
+  private readonly planReady = new Set<() => void>();
 
   constructor(worker: Worker, options?: EngineOptions) {
     this.worker = worker;
@@ -49,19 +65,29 @@ export class WorkerEngine implements PdfEngineLike {
     // one throws, and a viewer that quietly fell back to the main thread because
     // a host passed a warning sink would be a trap.
     const sent = options
-      ? { disableCompression: options.disableCompression, preplanPages: options.preplanPages }
+      ? { disableCompression: options.disableCompression, planFonts: options.planFonts }
       : undefined;
     if (sources.length || sent) this.worker.postMessage({ wpdf: 'engine', sources, options: sent });
     this.worker.addEventListener('message', (event: MessageEvent) => {
-      const { id, ok, result, error } = event.data as {
-        id: number;
-        ok: boolean;
+      const data = event.data as {
+        id?: number;
+        ok?: boolean;
         result?: unknown;
         error?: { name?: string; message?: string };
+        wpdf?: string;
+        progress?: FontPlanProgress | null;
       };
-      const entry = this.pending.get(id);
+      // The document's plan is walked on the other side, so its end arrives on
+      // its own rather than as the answer to anything.
+      if (data?.wpdf === 'plan') {
+        this.planState = data.progress ?? null;
+        if (this.planState?.ready) for (const cb of [...this.planReady]) cb();
+        return;
+      }
+      const { id, ok, result, error } = data;
+      const entry = this.pending.get(id as number);
       if (!entry) return;
-      this.pending.delete(id);
+      this.pending.delete(id as number);
       if (ok) entry.resolve(result);
       else entry.reject(reviveError(error));
     });
@@ -84,11 +110,18 @@ export class WorkerEngine implements PdfEngineLike {
     this.fonts = [];
     this.staged.clear();
     this.delivered.clear();
+    this.planState = null;
     const info = await this.call<DocumentInfo>('open', [source, password]);
-    // A planned document built every face it will ever need while it was being
-    // opened, and they are part of opening it: handing them over here is what
-    // lets the viewer write them all in before the first page is laid out, and
-    // never touch the document's fonts again.
+    // How far the plan had got by the time the document was open. Asked for
+    // here rather than pushed later, so that a host that looks at
+    // `planProgress()` the moment `open` resolves sees an answer about this
+    // document and not the one before it.
+    this.planState = await this.call<FontPlanProgress | null>('planProgress', []);
+    // A document planned up front would have built every face while it was
+    // being opened, and they are part of opening it: handing them over here is
+    // what lets the viewer write them all in before the first page is laid out.
+    // Nothing is planned up front any more (see `EngineOptions.planFonts`), so
+    // this is normally empty and the faces arrive with `plannedFonts()`.
     for (const asset of await this.call<FontAsset[]>('drainNewFonts', [])) {
       this.staged.add(asset.family);
       this.fonts.push(asset);
@@ -130,6 +163,26 @@ export class WorkerEngine implements PdfEngineLike {
     this.staged.clear();
     for (const asset of out) this.delivered.add(asset.family);
     return out;
+  }
+
+  /** The plan's state, as the worker last reported it. */
+  planProgress(): FontPlanProgress | null {
+    return this.planState;
+  }
+
+  onPlanReady(cb: () => void): () => void {
+    this.planReady.add(cb);
+    if (this.planState?.ready) setTimeout(cb, 0);
+    return () => this.planReady.delete(cb);
+  }
+
+  /** Every face the plan built, for a host that is about to draw one document. */
+  plannedFonts(): Promise<FontAsset[]> {
+    return this.call<FontAsset[]>('plannedFonts', []);
+  }
+
+  planDone(): Promise<void> {
+    return this.call('planDone', []).then(() => undefined);
   }
 
   /**

@@ -30,7 +30,18 @@ import { configureEngineWasm, loadEngine, type EngineWasmConfig } from '../core/
 
 interface Request {
   id: number;
-  method: 'probe' | 'open' | 'renderPage' | 'measureCrop' | 'save' | 'drainNewFonts' | 'trimCaches' | 'close';
+  method:
+    | 'probe'
+    | 'open'
+    | 'renderPage'
+    | 'measureCrop'
+    | 'save'
+    | 'drainNewFonts'
+    | 'plannedFonts'
+    | 'planProgress'
+    | 'planDone'
+    | 'trimCaches'
+    | 'close';
   args: unknown[];
 }
 
@@ -38,7 +49,7 @@ interface Request {
 interface EngineMessage extends EngineWasmConfig {
   wpdf: 'engine';
   /** The engine options that survive a structured clone - never `onWarn`. */
-  options?: Pick<EngineOptions, 'disableCompression' | 'preplanPages'>;
+  options?: Pick<EngineOptions, 'disableCompression' | 'planFonts'>;
 }
 
 function isEngineMessage(data: unknown): data is EngineMessage {
@@ -56,13 +67,32 @@ function getEngine(): Promise<PdfEngineLike> {
 
 const handlers = {
   probe: () => true,
-  open: (e: PdfEngineLike, args: unknown[]) => e.open(args[0] as PdfSource, args[1] as string | undefined),
+  /**
+   * Opening the document also starts listening for the end of its font plan.
+   *
+   * The plan is walked *here*, so the page cannot watch it: the engine's
+   * `onPlanReady` becomes one message with the progress in it, which is what
+   * `WorkerEngine.onPlanReady` hands back as a callback. It is subscribed after
+   * the open and not when the engine is built, because opening is what clears
+   * the listeners of the document before it - a subscription is about the
+   * document it was made for.
+   */
+  open: async (e: PdfEngineLike, args: unknown[]) => {
+    const info = await e.open(args[0] as PdfSource, args[1] as string | undefined);
+    e.onPlanReady?.(() => {
+      (self as unknown as Worker).postMessage({ wpdf: 'plan', progress: e.planProgress?.() ?? null });
+    });
+    return info;
+  },
   renderPage: (e: PdfEngineLike, args: unknown[]) =>
     e.renderPage(args[0] as number, args[1] as RenderOptions | undefined),
   measureCrop: (e: PdfEngineLike, args: unknown[]) =>
     e.measureCrop?.(args[0] as number, args[1] as CropRuleId[]) ?? null,
   save: (e: PdfEngineLike) => e.save?.() ?? null,
   drainNewFonts: (e: PdfEngineLike) => e.drainNewFonts(),
+  plannedFonts: (e: PdfEngineLike) => e.plannedFonts?.() ?? [],
+  planProgress: (e: PdfEngineLike) => e.planProgress?.() ?? null,
+  planDone: (e: PdfEngineLike) => e.planDone?.() ?? null,
   trimCaches: (e: PdfEngineLike, args: unknown[]) => e.trimCaches?.(args[0] as number[]),
   close: (e: PdfEngineLike) => e.close(),
 } satisfies Record<Request['method'], (engine: PdfEngineLike, args: unknown[]) => unknown>;

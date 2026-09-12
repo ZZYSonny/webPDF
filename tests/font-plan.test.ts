@@ -106,8 +106,8 @@ test('a document is planned whole, and its faces follow its fonts, not its pages
     const doc = mupdf.Document.openDocument(fs.readFileSync(document.file), 'application/pdf');
     try {
       const registry = new FontRegistry();
-      const plan = new DocumentFontPlan({ preplanPages: 200 });
-      await plan.cover(doc, 0, registry);
+      const plan = new DocumentFontPlan();
+      await plan.start(doc, registry);
       assert.equal(plan.planned, true, `${document.name}: a document this size should be planned whole`);
 
       // The same pages through the old pipeline, so the number means something.
@@ -175,8 +175,8 @@ test('every character the plan writes reaches the glyph the page drew', async ()
     const doc = mupdf.Document.openDocument(fs.readFileSync(document.file), 'application/pdf');
     try {
       const registry = new FontRegistry();
-      const plan = new DocumentFontPlan({ preplanPages: 200 });
-      await plan.cover(doc, 0, registry);
+      const plan = new DocumentFontPlan();
+      await plan.start(doc, registry);
 
       let checked = 0;
       let unnamed = 0;
@@ -238,8 +238,8 @@ test('every ligature the plan writes is drawn by the letters the text says', asy
     const doc = mupdf.Document.openDocument(fs.readFileSync(document.file), 'application/pdf');
     try {
       const registry = new FontRegistry();
-      const plan = new DocumentFontPlan({ preplanPages: 200 });
-      await plan.cover(doc, 0, registry);
+      const plan = new DocumentFontPlan();
+      await plan.start(doc, registry);
 
       for (let index = 0; index < Math.min(doc.countPages(), PAGES); index++) {
         const page = doc.loadPage(index);
@@ -282,8 +282,8 @@ test('the plan drives the same text upgrade the per-page fonts did', async () =>
   const doc = mupdf.Document.openDocument(fs.readFileSync(document.file), 'application/pdf');
   try {
     const registry = new FontRegistry();
-    const plan = new DocumentFontPlan({ preplanPages: 200 });
-    await plan.cover(doc, 0, registry);
+    const plan = new DocumentFontPlan();
+    await plan.start(doc, registry);
 
     const page = doc.loadPage(0);
     try {
@@ -323,8 +323,8 @@ test('a ligature keeps the character that stands for both letters', async () => 
   const doc = mupdf.Document.openDocument(fs.readFileSync(document.file), 'application/pdf');
   try {
     const registry = new FontRegistry();
-    const plan = new DocumentFontPlan({ preplanPages: 200 });
-    await plan.cover(doc, 0, registry);
+    const plan = new DocumentFontPlan();
+    await plan.start(doc, registry);
 
     let checked = 0;
     for (let index = 0; index < Math.min(doc.countPages(), PAGES); index++) {
@@ -362,18 +362,87 @@ test('a ligature keeps the character that stands for both letters', async () => 
 });
 
 /**
- * The point of the whole plan: a document whose fonts it covers registers every
- * face it will ever need *before* the first page is laid out, so nothing is
- * registered while the reader is scrolling - which is the cost the viewer's
- * per-page frames exist to hide.
+ * Opening a document is not opening its fonts.
+ *
+ * The plan is what makes the pages one document, and it is 0.6-2.3 s of work
+ * for a corpus paper - 18 s for the 756-page specification - so it is walked in
+ * the background and never in front of the first page. This is the check that
+ * `open` returns without it, that the plan does arrive, and that every face it
+ * built is handed over in *one* write when it does.
  */
-test('a planned engine hands every face over at the first page, and none after', async () => {
+test('a document opens before its fonts are planned, and the plan arrives behind it', async () => {
   const document = documents[0];
   assert.ok(document, 'no corpus document could be read');
 
-  const engine = new PdfEngine({ preplanPages: 64 });
+  const engine = new PdfEngine();
+  try {
+    const opening = Date.now();
+    await engine.open(new Uint8Array(fs.readFileSync(document.file)));
+    const openMs = Date.now() - opening;
+    const atOpen = engine.planProgress();
+    assert.ok(atOpen, 'the engine should be planning this document');
+    assert.equal(atOpen.ready, false, `open waited for the plan (${openMs} ms)`);
+
+    // A page is served while the plan is still running, with the faces of its
+    // own page: there is nothing else it could be drawn with yet.
+    const during = await engine.renderPage(0);
+    assert.ok(during.fonts.length > 0, 'a page drawn before the plan needs fonts of its own');
+    assert.ok(during.stats.glyphsAsText > 100, `only ${during.stats.glyphsAsText} glyphs became text`);
+
+    const planned = Date.now();
+    await engine.planDone();
+    const planMs = Date.now() - planned;
+    const progress = engine.planProgress();
+    assert.equal(progress?.ready, true, 'the plan never became ready');
+    assert.equal(progress?.covered, progress?.total, 'the plan should cover the whole document');
+    assert.ok(engine.plannedFonts().length > 0, 'the plan built nothing');
+
+    // Every face, in one list: this is the write that makes the planned
+    // document one document. (The page drawn a moment ago built faces of its
+    // own, which are in the registry too and come out of the same drain - they
+    // are simply never asked for again.)
+    const upFront = engine.drainNewFonts();
+    const plannedFamilies = new Set(engine.plannedFonts().map((font) => font.family));
+    assert.ok(plannedFamilies.size > 0, 'the plan built nothing');
+    for (const family of plannedFamilies) {
+      assert.ok(
+        upFront.some((font) => font.family === family),
+        `${family} was planned and never handed over`,
+      );
+    }
+
+    const after = await engine.renderPage(0);
+    assert.equal(engine.drainNewFonts().length, 0, 'a planned page should register nothing of its own');
+    assert.ok(after.stats.glyphsAsText > 100, `only ${after.stats.glyphsAsText} glyphs became text`);
+    // The plan is the document's fonts, so the two renders of one page are the
+    // same text under different families.
+    assert.notDeepEqual(
+      [...during.fonts.map((f) => f.family)].sort(),
+      [...after.fonts.map((f) => f.family)].sort(),
+      'a page drawn before the plan should not already be using the document’s faces',
+    );
+    console.log(
+      `      open ${openMs} ms (plan not ready), ${during.fonts.length} own faces for page 1; ` +
+        `plan ready ${planMs} ms later, ${upFront.length} document faces handed over in one write`,
+    );
+  } finally {
+    engine.close();
+  }
+});
+
+/**
+ * The point of the whole plan: a document whose fonts it covers registers every
+ * face it will ever need *once*, in one write, so nothing registers while the
+ * reader is scrolling.
+ */
+test('a planned engine hands every face over at once, and none after', async () => {
+  const document = documents[0];
+  assert.ok(document, 'no corpus document could be read');
+
+  const engine = new PdfEngine();
   try {
     await engine.open(new Uint8Array(fs.readFileSync(document.file)));
+    await engine.planDone();
     assert.ok(engine.plannedFonts().length > 0, 'the engine planned nothing');
 
     const first = await engine.renderPage(0);
@@ -430,9 +499,10 @@ test('a planned page draws what the per-page fonts drew', async () => {
   };
 
   const planned = new PdfEngine();
-  const perPage = new PdfEngine({ preplanPages: 0 });
+  const perPage = new PdfEngine({ planFonts: false });
   try {
     await planned.open(bytes);
+    await planned.planDone();
     await perPage.open(bytes);
     let runs = 0;
     for (let index = 0; index < Math.min(5, planned.documentInfo.pageCount); index++) {
@@ -456,18 +526,20 @@ test('a planned page draws what the per-page fonts drew', async () => {
   }
 });
 
-test('a document is planned by default, and `preplanPages: 0` is how a host opts out', async () => {
+test('a document is planned by default, and `planFonts: false` is how a host opts out', async () => {
   const document = documents[0];
   assert.ok(document, 'no corpus document could be read');
   const bytes = new Uint8Array(fs.readFileSync(document.file));
 
   const planned = new PdfEngine();
-  const plain = new PdfEngine({ preplanPages: 0 });
+  const plain = new PdfEngine({ planFonts: false });
   try {
     await planned.open(bytes);
+    await planned.planDone();
     await plain.open(bytes);
     assert.ok(planned.plannedFonts().length > 0, 'a document should be planned without being asked');
-    assert.equal(plain.plannedFonts().length, 0, '`preplanPages: 0` should plan nothing');
+    assert.equal(plain.plannedFonts().length, 0, '`planFonts: false` should plan nothing');
+    assert.equal(plain.planProgress(), null, 'an unplanned document has no progress to report');
 
     const mine = await plain.renderPage(0);
     assert.ok(mine.fonts.length > 0, 'a page rendered without the plan still needs its own fonts');
@@ -490,36 +562,62 @@ test('a document is planned by default, and `preplanPages: 0` is how a host opts
 });
 
 /**
- * A document past the preplan budget is planned the other way: the window
- * advances with the reading, and every page it reaches is still covered. This is
- * the path a long document takes, and it used to build nothing at all - `cover`
- * only built once the document was complete, so a long document silently got no
- * planned fonts and quietly fell back to a face per page.
+ * A long document is planned exactly like a short one - the whole of it, in the
+ * background - and the pages rendered while it is being walked are still pages:
+ * drawn with the faces of their own, and drawn again under the document's once
+ * the plan is ready.
+ *
+ * This is the path a reader of the 100-page report takes, and the one the viewer
+ * leans on hardest: the plan is 2.3 s of work that must not once be waited for.
  */
-test('a document past the budget is planned a window ahead, page by page', async () => {
-  // Longer than the window itself, or the first cover would walk the whole
-  // document and there would be nothing left to grow into.
+test('a long document is planned in the background while its pages are drawn', async () => {
   const files = await ensurePapers([PAPERS[2].url]);
   const file = files.get(PAPERS[2].url);
   assert.ok(typeof file === 'string', `${PAPERS[2].label} could not be read`);
 
-  const engine = new PdfEngine({ preplanPages: 3 });
+  const engine = new PdfEngine();
   try {
     await engine.open(new Uint8Array(fs.readFileSync(file)));
-    assert.ok(engine.documentInfo.pageCount > 25, `${PAPERS[2].label} should be longer than the window`);
-    assert.ok(engine.plannedFonts().length > 0, 'the first window should be planned at open');
-    const atOpen = engine.plannedFonts().length;
-    let text = 0;
+    const count = engine.documentInfo.pageCount;
+    assert.ok(count > 25, `${PAPERS[2].label} should be a long document`);
+    assert.equal(engine.planProgress()?.ready, false, 'open waited for the plan');
+
+    // Read the first twenty pages the way a reader would, while the plan runs.
+    let during = 0;
+    const firstPass = [];
     for (let index = 0; index < 20; index++) {
       const page = await engine.renderPage(index);
-      text += page.stats.glyphsAsText;
+      during += page.stats.glyphsAsText;
+      firstPass.push(page.fonts.map((font) => font.family).sort().join(','));
     }
+    assert.ok(during > 5000, `only ${during} glyphs became text while the plan ran`);
+
+    await engine.planDone();
+    const progress = engine.planProgress();
+    assert.equal(progress?.ready, true, 'the plan never became ready');
+    assert.equal(progress?.total, count, 'the plan should be about the whole document');
+
+    // The same pages again, now under the document's own faces: the plan is one
+    // face per font, so a page's families change and the characters do not.
+    let after = 0;
+    for (let index = 0; index < 20; index++) {
+      const page = await engine.renderPage(index);
+      after += page.stats.glyphsAsText;
+      assert.notEqual(
+        page.fonts.map((font) => font.family).sort().join(','),
+        firstPass[index],
+        `page ${index + 1} was drawn with the same families before and after the plan`,
+      );
+    }
+    assert.equal(after, during, 'the planned pages should have the same text as the pages before them');
     assert.ok(
-      engine.plannedFonts().length > atOpen,
-      `a windowed plan must keep building: ${atOpen} faces at open, ${engine.plannedFonts().length} after 20 pages`,
+      engine.plannedFonts().length < 168,
+      `the plan should mint a face per font, not one per page's glyph set: ${engine.plannedFonts().length} faces`,
     );
-    assert.ok(text > 5000, `only ${text} glyphs became text through the window`);
-    console.log(`      ${atOpen} faces at open, ${engine.plannedFonts().length} after 20 pages, ${text} glyphs as text`);
+    console.log(
+      `      ${count} pages: 20 read during the plan (${during} glyphs as text), ` +
+        `${engine.plannedFonts().length} document faces after it, same text either way`,
+    );
   } finally {
     engine.close();
   }

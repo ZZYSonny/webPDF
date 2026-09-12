@@ -96,6 +96,9 @@ try {
   console.log('\n› one document, and the browser’s own text behaviour over it');
   await run([path.join(here, 'single.mjs'), url], { stdio: 'inherit' });
 
+  console.log('\n› how a page is drawn while the document’s fonts are being planned');
+  await run([path.join(here, 'modes.mjs'), url], { stdio: 'inherit' });
+
   console.log('\n› pinch / zoom contract');
   await run([path.join(here, 'pinch.mjs'), url], { stdio: 'inherit' });
 

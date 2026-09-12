@@ -79,7 +79,10 @@ const PROBE = `(() => {
     const sr = document.getElementById('viewer')?.shadowRoot;
     if (!sr) return [];
     return [...sr.querySelectorAll('.wpdf-page')]
-      .map((el) => el.querySelector('svg.wpdf-page-svg'))
+      // A page is drawn in a frame of its own until the document's fonts are
+      // planned, and in the slot itself after that (see RenderMode), so the
+      // question "is this page drawn" is asked of whichever document holds it.
+      .map((el) => (el.querySelector('iframe')?.contentDocument ?? el).querySelector('svg.wpdf-page-svg'))
       .filter(Boolean);
   };
   window.__kept = async () => {

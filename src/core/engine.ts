@@ -12,7 +12,7 @@ import * as mupdf from 'mupdf';
 import { scanGlyphOutlines, scanGlyphPlacements } from './svg/glyphs.ts';
 import { upgradeGlyphsToText } from './svg/text-upgrade.ts';
 import { FontRegistry, type FontAsset } from './font/registry.ts';
-import { DocumentFontPlan } from './font/plan.ts';
+import { DocumentFontPlan, type FontPlanProgress } from './font/plan.ts';
 import { debug } from './debug.ts';
 import { inlineFontCss, namespaceSvgIds, readSvgDimensions, rewriteSvgRoot, stripXmlProlog } from './svg/package.ts';
 import { injectSvgLinks, type PageLink } from './links.ts';
@@ -144,31 +144,25 @@ export interface EngineOptions {
   disableCompression?: boolean;
   onWarn?: (message: string) => void;
   /**
-   * How many pages are worth planning before the first one is laid out.
-   * Defaults to `PREPLAN_PAGES`; `0` turns the plan off and gives every page its
-   * own fonts.
+   * Plan the document's fonts as one face per *font*, for the whole document,
+   * in the background. Default true.
    *
-   * A page's own font is a new `@font-face` for that page, and registering a
-   * face re-lays-out the document it lands in. A document no longer than this is
-   * walked once, text only, before anything is drawn, and every face it will
-   * ever need is built under one family per *font* - so nothing registers while
-   * the reader is scrolling. Past this many pages the plan keeps a window ahead
-   * of the page being rendered instead, which is still one face per font rather
-   * than one per page, and still registers each face before the page that needs
-   * it. See `core/font/plan.ts`.
+   * The plan is what lets every page be drawn in one document: a face built
+   * from the document's own font programs serves every page that uses the font,
+   * so nothing registers while the reader scrolls - and registering a face
+   * re-lays-out every text run of the document it lands in. Building it is not
+   * free (0.6-2.3 s over the corpus papers, 18.3 s for a 756-page
+   * specification), so it is never done before the first page: `open` returns
+   * as soon as the document is read, pages are drawn from their own fonts while
+   * the plan runs, and a host that wants the planned document waits for
+   * `planDone()` or watches `planProgress()`.
+   *
+   * `false` turns it off: every page builds a face from the glyphs it drew,
+   * which is what a standalone SVG wants (see `renderDocument`) and what a
+   * viewer drawing each page in its own frame wants. See `core/font/plan.ts`.
    */
-  preplanPages?: number;
+  planFonts?: boolean;
 }
-
-/**
- * The page count a document is planned whole within.
- *
- * Measured over the test corpus: 64 pages of walking and building costs about a
- * second, which is what a document of that length can spend on being one
- * document instead of one per page, and one paper of 100 pages is the first
- * thing in the corpus that is past it.
- */
-export const PREPLAN_PAGES = 64;
 
 /**
  * The surface the viewer needs from a rendering backend.
@@ -200,6 +194,25 @@ export interface PdfEngineLike {
    */
   save?(): Promise<Uint8Array>;
   drainNewFonts(): FontAsset[];
+  /**
+   * How far the document's font plan has got, or null when this engine is not
+   * planning one (see `EngineOptions.planFonts`).
+   */
+  planProgress?(): FontPlanProgress | null;
+  /**
+   * Called when the plan is ready, and immediately (on a later turn) when it
+   * already is. Returns the unsubscribe.
+   */
+  onPlanReady?(cb: () => void): () => void;
+  /**
+   * Every face the plan has built. A host that is about to draw the document as
+   * one document wants them all at once: registering a face re-lays-out every
+   * text run in the document however many rules arrive with it, so the one
+   * write is the cheapest there is.
+   */
+  plannedFonts?(): FontAsset[] | Promise<FontAsset[]>;
+  /** Resolves when the plan has finished, been cancelled, or was never started. */
+  planDone?(): Promise<void>;
   /** Optional: drop everything outside `keep` so memory stays bounded. */
   trimCaches?(keep: readonly number[]): void;
   /** True for a worker-backed engine. Purely informational. */
@@ -468,8 +481,13 @@ export class PdfEngine implements PdfEngineLike {
   private measured = 0;
   private info: DocumentInfo | null = null;
   private readonly opts: EngineOptions;
-  /** One face per font for the whole document, when it can be had. */
+  /** One face per font for the whole document, walking in the background. */
   private plan: DocumentFontPlan | null = null;
+  /** The walk itself, so a caller can wait for the planned document. */
+  private planning: Promise<void> | null = null;
+  /** Renders and measurements in flight. The plan gives way to these. */
+  private busy = 0;
+  private readonly planListeners = new Set<() => void>();
 
   constructor(opts: EngineOptions = {}) {
     this.opts = opts;
@@ -479,6 +497,54 @@ export class PdfEngine implements PdfEngineLike {
   /** The faces the document font plan has built, for a host that wants them all. */
   plannedFonts(): FontAsset[] {
     return this.plan?.families() ?? [];
+  }
+
+  /** How far the plan has got, or null when this document is not planned. */
+  planProgress(): FontPlanProgress | null {
+    return this.plan ? this.plan.progress() : null;
+  }
+
+  /**
+   * Called once, when the planned document is ready to be drawn.
+   *
+   * The subscription is about the plan of the document that is open: opening
+   * another one clears it, because a listener that heard "ready" for the
+   * document before this one has nothing to say about this one.
+   */
+  onPlanReady(cb: () => void): () => void {
+    this.planListeners.add(cb);
+    // A plan that is already ready is not going to say so again, and a host
+    // that registers late - a viewer handed a one-page document, say - still
+    // has to hear it.
+    if (this.plan?.planned) setTimeout(cb, 0);
+    return () => this.planListeners.delete(cb);
+  }
+
+  /** Resolves when the background walk is done, one way or another. */
+  planDone(): Promise<void> {
+    return this.planning ?? Promise.resolve();
+  }
+
+  private notifyPlanReady(): void {
+    for (const cb of [...this.planListeners]) {
+      try {
+        cb();
+      } catch (error) {
+        this.opts.onWarn?.(`a plan-ready listener failed: ${String(error)}`);
+      }
+    }
+  }
+
+  /**
+   * Wait until nothing more urgent is in flight.
+   *
+   * The plan walks on the same thread the pages are rendered on, so a page the
+   * reader asked for is only not queued behind it because the plan checks. One
+   * turn of the event loop at a time, because a render is several of them (it
+   * has awaits of its own) and the plan must not hold the thread while it waits.
+   */
+  private async idle(): Promise<void> {
+    while (this.busy > 0) await new Promise((resolve) => setTimeout(resolve, 0));
   }
 
   /** Every `@font-face` rule discovered so far, newest last. */
@@ -507,6 +573,7 @@ export class PdfEngine implements PdfEngineLike {
 
   async open(source: PdfSource, password?: string): Promise<DocumentInfo> {
     this.close();
+    this.planListeners.clear();
     const bytes = await readSource(source);
     const doc = mupdf.Document.openDocument(bytes, 'application/pdf');
     if (doc.needsPassword()) {
@@ -517,15 +584,30 @@ export class PdfEngine implements PdfEngineLike {
     }
     this.doc = doc;
     this.info = this.readInfo(doc);
-    // One face per font, for the whole document, built before any page is laid
-    // out - which is what lets the viewer be a single document rather than one
-    // frame per page. `preplanPages: 0` keeps the per-page fonts.
-    const budget = this.opts.preplanPages ?? PREPLAN_PAGES;
-    this.plan =
-      budget > 0
-        ? new DocumentFontPlan({ preplanPages: budget, onWarn: this.opts.onWarn })
-        : null;
-    if (this.plan) await this.plan.cover(doc, 0, this.registry);
+    // The document's fonts are planned from here, in the *background*: a page is
+    // drawn with its own face until the plan is ready, and `planProgress` /
+    // `onPlanReady` say when the pages can become one document. Nothing below
+    // waits for it - which is the whole point, because planning a 756-page
+    // specification is 18 seconds that have no business being in front of the
+    // first page.
+    this.plan = null;
+    this.planning = null;
+    if (this.opts.planFonts !== false) {
+      const plan = new DocumentFontPlan({
+        onWarn: this.opts.onWarn,
+        onProgress: (progress) => {
+          if (progress.ready) this.notifyPlanReady();
+        },
+      });
+      this.plan = plan;
+      this.planning = plan.start(doc, this.registry, {
+        pause: () => this.idle(),
+        // The document this walk belongs to: `close` drops it before it destroys
+        // anything, so a walk that comes back after that stops where it is
+        // rather than reading a page out of a document that is gone.
+        cancelled: () => this.doc !== doc,
+      });
+    }
     return this.info;
   }
 
@@ -604,6 +686,15 @@ export class PdfEngine implements PdfEngineLike {
    * crop to" - an empty page, or no rules - and the page keeps its own size.
    */
   async measureCrop(index: number, rules: readonly CropRuleId[]): Promise<CropRect | null> {
+    this.busy++;
+    try {
+      return await this.measurePageCrop(index, rules);
+    } finally {
+      this.busy--;
+    }
+  }
+
+  private async measurePageCrop(index: number, rules: readonly CropRuleId[]): Promise<CropRect | null> {
     const wanted = normaliseRules(rules);
     if (wanted.length === 0) return null;
     const key = `${wanted.join(',')}|${index}`;
@@ -645,14 +736,22 @@ export class PdfEngine implements PdfEngineLike {
 
   /** Render one page to SVG, upgrading glyphs to text where it is provably safe. */
   async renderPage(index: number, opts: RenderOptions = {}): Promise<RenderedPage> {
+    // A page is a reader waiting, and the plan is not: nothing in this method
+    // has to think about the walk, because the walk yields to whatever is in
+    // here (see `idle`).
+    this.busy++;
+    try {
+      return await this.renderPageNow(index, opts);
+    } finally {
+      this.busy--;
+    }
+  }
+
+  private async renderPageNow(index: number, opts: RenderOptions = {}): Promise<RenderedPage> {
     const started = Date.now();
     const textMode = opts.textMode ?? 'auto';
     const doc = this.doc;
     if (!doc) throw new DocumentNotOpenError();
-    // Keep the plan level with the page being rendered: a planned font is one
-    // face for the whole document, so the sooner it is planned the fewer faces
-    // the document ever registers.
-    if (this.plan) await this.plan.cover(doc, index, this.registry);
     const page = this.loadPage(index);
     const links = opts.links === false ? [] : readLinks(doc, page);
     const content = await this.measureCrop(index, opts.crop ?? []);
@@ -699,23 +798,25 @@ export class PdfEngine implements PdfEngineLike {
         debug('renderPage: plan fonts', placements.length, 'placements', outlines.size, 'outlines');
         const text = readText(page);
         const letters = glyphLetters(text.chars, placements);
-        // The document plan first: a font it knows is one face shared by every
-        // page, and the page never registers anything of its own. A page it
-        // cannot place - a font it never saw, or a glyph it never drew - falls
-        // back to building the page's own font, which is always correct.
-        const plan =
-          (await this.plan?.planPage(outlines, placements, { letters })) ??
+        // The document plan, once it is ready: a font it knows is one face
+        // shared by every page, and the page never registers anything of its
+        // own. A page it cannot place - a font it never saw, a glyph it never
+        // drew, or a plan that is still being walked - falls back to building
+        // the page's own font, which is always correct.
+        const ready = this.plan?.planned ? this.plan : null;
+        const pagePlan =
+          (await ready?.planPage(outlines, placements, { letters })) ??
           (await this.registry.planPage(outlines, placements, { letters }));
-        debug('renderPage: planned', plan.fonts.size, 'fonts');
-        stats.fontsBuilt = plan.built;
-        stats.fontsReused = plan.reused;
+        debug('renderPage: planned', pagePlan.fonts.size, 'fonts');
+        stats.fontsBuilt = pagePlan.built;
+        stats.fontsReused = pagePlan.reused;
         const upgraded = upgradeGlyphsToText(
           svg,
           placements,
           {
-            familyFor: (fontId) => plan.fonts.get(fontId)?.family ?? null,
-            codeFor: (fontId, gid) => plan.fonts.get(fontId)?.codes.get(gid) ?? null,
-            lettersFor: (fontId, gid) => plan.fonts.get(fontId)?.letters.get(gid) ?? null,
+            familyFor: (fontId) => pagePlan.fonts.get(fontId)?.family ?? null,
+            codeFor: (fontId, gid) => pagePlan.fonts.get(fontId)?.codes.get(gid) ?? null,
+            lettersFor: (fontId, gid) => pagePlan.fonts.get(fontId)?.letters.get(gid) ?? null,
           },
           { spaces: text.spaces, bionic: opts.bionic, bionicDim: opts.bionicDim },
         );
@@ -725,7 +826,7 @@ export class PdfEngine implements PdfEngineLike {
         stats.glyphsAsText = upgraded.stats.converted;
         stats.glyphsAsOutlines = upgraded.stats.kept;
         stats.spaces = upgraded.stats.spaces;
-        fonts = plan.assets;
+        fonts = pagePlan.assets;
       }
     }
 
@@ -788,6 +889,10 @@ export class PdfEngine implements PdfEngineLike {
     this.pageCache.clear();
     this.boxCache.clear();
     this.measured = 0;
+    // Dropped before the document is destroyed, so a walk that is between two
+    // pages stops at its next check instead of reading a page that is gone.
+    this.plan = null;
+    this.planning = null;
     if (this.doc) {
       try {
         this.doc.destroy();
@@ -798,7 +903,6 @@ export class PdfEngine implements PdfEngineLike {
     }
     this.info = null;
     this.drained = 0;
-    this.plan = null;
     this.registry = new FontRegistry({ disableCompression: this.opts.disableCompression, onWarn: this.opts.onWarn });
   }
 }

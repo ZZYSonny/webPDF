@@ -20,7 +20,7 @@
  * - a type-only import, which is gone by the time this runs.
  */
 
-import type { CropRuleId, ZoomMode } from '../src/index.ts';
+import type { CropRuleId, RenderMode, ZoomMode } from '../src/index.ts';
 
 /** Where the reader is: a page, and a point within it in the document's units. */
 export interface Place {
@@ -39,6 +39,16 @@ export interface Settings {
   crop?: { rules: CropRuleId[]; padding: number } | null;
   bionic?: { on: boolean; dim: number } | null;
   outline?: boolean;
+  /**
+   * How the pages were drawn for this reader (`RenderMode`).
+   *
+   * It is not a setting of the *viewer* the way the others are - the engine and
+   * the viewer are built once, before the first document is open, so nothing can
+   * change its mind afterwards - which is exactly why it is remembered here:
+   * a reader who chose one mode chose it for the session that starts when the
+   * page loads, and the page they chose it on is the one that comes back.
+   */
+  renderMode?: RenderMode;
   [setting: string]: unknown;
 }
 

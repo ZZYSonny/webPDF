@@ -70,11 +70,11 @@ const ASSET = (family: string): FontAsset => ({
 
 test('the options a worker is built with survive the trip, and `onWarn` is not sent', () => {
   const { worker, sent } = fakeWorker(() => null);
-  new WorkerEngine(worker, { preplanPages: 7, disableCompression: true, onWarn: () => undefined });
+  new WorkerEngine(worker, { planFonts: false, disableCompression: true, onWarn: () => undefined });
 
   const message = sent.find((m) => m.wpdf === 'engine');
   assert.ok(message, 'the worker was told nothing before it was asked to work');
-  assert.deepEqual(message.options, { disableCompression: true, preplanPages: 7 });
+  assert.deepEqual(message.options, { disableCompression: true, planFonts: false });
   // The real check: whatever is in the message has to be postable at all. A
   // function in here throws on the way to a real worker.
   assert.doesNotThrow(() => structuredClone(message), 'the engine message is not structured-cloneable');

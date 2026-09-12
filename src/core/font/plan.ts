@@ -17,16 +17,20 @@
  * glyph ids, the codes they were drawn for, and the letters behind any ligature.
  *
  * The walk is cheap (measured: 4.3 ms a page on a 756-page specification, 12-19
- * on the papers) but it is not free, so a document is planned in one of two ways:
+ * on the papers) but the build is not - drawing every glyph a font program has
+ * and compiling it is tens to hundreds of milliseconds a face - so a plan is not
+ * something to make a reader wait for. It runs in the *background*, from the
+ * moment the document is open, a slice at a time: `start()` walks and builds
+ * while the host draws its pages the other way (a face per page, in a frame of
+ * its own), and hands the thread back between slices so that a page the reader
+ * asks for is never queued behind it. When the last face is built the plan is
+ * `planned`, and the host can switch to it.
  *
- *   - small enough to afford it (`preplanPages`, 64 by default), and the whole
- *     document is walked and every face built *before the first page is laid
- *     out*. Nothing registers after that, which is what lets the pages be one
- *     document.
- *   - otherwise the plan is kept a window ahead of whatever is being rendered,
- *     and a face met for the first time later is built then - still one per
- *     *font* and not per page, and still before the page that needs it. Its cost
- *     arrives alongside the render rather than as a wait at open.
+ * Planning the whole document is worth it in *work* even when it is not worth
+ * waiting for in time: a face that grows is a face rebuilt, so a plan that keeps
+ * up with the reader a page at a time mints a family for every growth, against
+ * one per font here. What the background buys is that none of it is on the path
+ * to the first page.
  */
 
 import * as mupdf from 'mupdf';
@@ -111,17 +115,46 @@ function readChars(page: mupdf.Page): TextChar[] {
 
 /* ------------------------------------------------------------------ */
 
-export interface DocumentFontPlanOptions {
-  /**
-   * How many pages are worth walking before the first page is laid out. Below
-   * this, one `@font-face` per font exists before any page is shown and nothing
-   * registers again for the life of the document.
-   */
-  preplanPages?: number;
-  /** How far ahead of the page being rendered the plan is kept. */
-  ahead?: number;
-  onWarn?: (message: string) => void;
+export interface FontPlanProgress {
+  /** Pages walked so far. */
+  covered: number;
+  /** Pages in the document. */
+  total: number;
+  /** True once every page has been walked and every face built. */
+  ready: boolean;
 }
+
+/**
+ * The thread the walk is running on, as the plan needs to see it.
+ *
+ * The plan is the least urgent work in the process: a reader waiting for a page
+ * always matters more than a face for a page they have not reached. `pause` is
+ * where the plan waits for that reader, and `cancelled` is how it is told that
+ * the document it was walking has gone away.
+ */
+export interface PlanHost {
+  /** Resolves when nothing more urgent is in flight. */
+  pause(): Promise<void>;
+  /** True once the document being walked is no longer the open one. */
+  cancelled(): boolean;
+}
+
+export interface DocumentFontPlanOptions {
+  /** How long the walk may hold the thread before handing it back, in ms. */
+  sliceMs?: number;
+  onWarn?: (message: string) => void;
+  /** Called after every page walked, and once more when the plan is ready. */
+  onProgress?: (progress: FontPlanProgress) => void;
+}
+
+/**
+ * Walking the page before handing the thread back.
+ *
+ * A page of a paper takes 12-19 ms to walk, so this is one page on the slow
+ * ones and a few on the fast - which is the granularity at which a render
+ * request can be answered while the plan is running.
+ */
+const SLICE_MS = 8;
 
 export class DocumentFontPlan {
   private readonly entries = new Map<string, Entry>();
@@ -129,19 +162,20 @@ export class DocumentFontPlan {
    * The entries that have grown since they were last built.
    *
    * Building a face means hashing every glyph in it, so a plan that rebuilt
-   * everything every time a page was covered would spend the document hashing
-   * fonts that had not changed. A windowed plan walks a page at a time, so this
-   * is what keeps the one-time cost one-time.
+   * everything again every time a page was walked would spend the document
+   * hashing fonts that had not changed.
    */
   private readonly dirty = new Set<Entry>();
-  private readonly opts: Required<Pick<DocumentFontPlanOptions, 'preplanPages' | 'ahead'>> & DocumentFontPlanOptions;
+  private readonly opts: DocumentFontPlanOptions;
   private registry: FontRegistry | null = null;
+  private task: Promise<void> | null = null;
   /** Pages walked so far, in order. */
   private covered = 0;
+  private total = 0;
   private complete = false;
 
   constructor(opts: DocumentFontPlanOptions = {}) {
-    this.opts = { preplanPages: 200, ahead: 24, ...opts };
+    this.opts = opts;
   }
 
   /** True once every page has been walked, so no font can appear later. */
@@ -149,29 +183,46 @@ export class DocumentFontPlan {
     return this.complete;
   }
 
+  progress(): FontPlanProgress {
+    return { covered: this.covered, total: this.total, ready: this.complete };
+  }
+
   /**
-   * Walk the document far enough that a render of `index` is covered.
+   * Walk the document and build its faces, in the background.
    *
-   * A document small enough to be planned whole is planned whole on the first
-   * call, whatever page is asked for; past that the plan just stays a window
-   * ahead, so the pass costs a page's walk and never a document's.
+   * Returns the one walk: a second call joins the first rather than starting a
+   * second pass, and the promise resolves when the plan is ready, when the host
+   * says the document is gone, or when the walk failed (which is a warning to
+   * the host, not an exception - a document whose fonts cannot be planned is a
+   * document drawn with a face per page, which is what every page did before
+   * there was a plan).
    */
-  async cover(doc: mupdf.Document, index: number, registry: FontRegistry): Promise<void> {
+  start(doc: mupdf.Document, registry: FontRegistry, host?: PlanHost): Promise<void> {
     this.registry = registry;
-    const count = doc.countPages();
-    const whole = count <= this.opts.preplanPages;
-    const upto = whole ? count : Math.min(count, index + this.opts.ahead + 1);
-    if (upto > this.covered) {
-      const started = Date.now();
-      for (let i = this.covered; i < upto; i++) this.walkPage(doc, i);
-      this.covered = upto;
-      debug('font plan: walked', upto, 'pages in', Date.now() - started, 'ms');
+    this.task ??= this.run(doc, host).catch((err) => {
+      this.opts.onWarn?.(`could not plan the document's fonts: ${String(err)}`);
+    });
+    return this.task;
+  }
+
+  private async run(doc: mupdf.Document, host?: PlanHost): Promise<void> {
+    this.total = doc.countPages();
+    const started = Date.now();
+    let sliced = started;
+    while (this.covered < this.total) {
+      if (host?.cancelled()) return;
+      this.walkPage(doc, this.covered++);
+      this.opts.onProgress?.(this.progress());
+      if (host && Date.now() - sliced >= (this.opts.sliceMs ?? SLICE_MS)) {
+        sliced = Date.now();
+        await host.pause();
+      }
     }
-    if (whole) this.complete = true;
-    // Whatever has been walked is built, whether or not the document is done: a
-    // windowed plan is the only way a long document is covered at all, and an
-    // entry that is not built is an entry whose pages keep their outlines.
-    await this.buildAll();
+    debug('font plan: walked', this.total, 'pages in', Date.now() - started, 'ms');
+    await this.buildAll(host);
+    if (host?.cancelled()) return;
+    this.complete = true;
+    this.opts.onProgress?.(this.progress());
   }
 
   /**
@@ -327,20 +378,30 @@ export class DocumentFontPlan {
     return entry;
   }
 
-  /** Draw every glyph the entries that grew are missing, and build those faces. */
-  private async buildAll(): Promise<void> {
-    if (this.dirty.size === 0) return;
+  /**
+   * Draw every glyph the entries that grew are missing, and build those faces.
+   *
+   * One font at a time, with the thread handed back in between: a face is the
+   * one part of this that cannot be made smaller - drawing a program's glyphs
+   * and compiling them is a single synchronous step of tens to hundreds of
+   * milliseconds - so it is the unit the plan is sliced into.
+   */
+  private async buildAll(host?: PlanHost): Promise<void> {
     const entries = [...this.dirty];
     this.dirty.clear();
     for (const entry of entries) {
-      if (!entry.program) continue;
-      const fresh = [...entry.seen].filter((gid) => !entry.outlines.has(gid));
-      if (fresh.length === 0) continue;
-      const { outlines, advances } = glyphsFromProgram(entry.program, fresh);
-      for (const [gid, d] of outlines) entry.outlines.set(gid, d);
-      for (const [gid, advance] of advances) entry.advances.set(gid, advance);
+      if (host?.cancelled()) return;
+      if (entry.program) {
+        const fresh = [...entry.seen].filter((gid) => !entry.outlines.has(gid));
+        if (fresh.length > 0) {
+          const { outlines, advances } = glyphsFromProgram(entry.program, fresh);
+          for (const [gid, d] of outlines) entry.outlines.set(gid, d);
+          for (const [gid, advance] of advances) entry.advances.set(gid, advance);
+        }
+      }
+      await this.build(entry);
+      await host?.pause();
     }
-    for (const entry of entries) await this.build(entry);
   }
 
   private async build(entry: Entry): Promise<void> {
