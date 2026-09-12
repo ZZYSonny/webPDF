@@ -1,0 +1,24 @@
+{
+  "name": "webpdf — PDF pages as SVG with real text",
+  "short_name": "webpdf",
+  "description": "A PDF reader that renders every page to SVG with real, selectable text. Works offline once a document has been opened.",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "theme_color": "#171a21",
+  "background_color": "#171a21",
+  "icons": [
+    {
+      "src": "./icon.svg",
+      "type": "image/svg+xml",
+      "sizes": "any",
+      "purpose": "any"
+    },
+    {
+      "src": "./icon.png",
+      "type": "image/png",
+      "sizes": "512x512",
+      "purpose": "any"
+    }
+  ]
+}

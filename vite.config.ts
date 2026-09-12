@@ -8,7 +8,8 @@ import { resolve } from 'node:path';
  * host application should place and version itself. Set them up with
  * `globalThis.$libmupdf_wasm_Module = { locateFile }` when you need to control
  * where the MuPDF binary is fetched from (browser extensions must, for example,
- * list it under `web_accessible_resources`).
+ * list it under `web_accessible_resources`) - or, without reaching for a global,
+ * call `configureEngineWasm` once before the first document is opened.
  */
 export default defineConfig({
   // Emit relative asset URLs so `new URL(worker, import.meta.url)` resolves next
@@ -29,6 +30,17 @@ export default defineConfig({
     },
     rollupOptions: {
       external: ['mupdf', 'opentype.js'],
+      // This entry exports `PdfEngine` as a value, so the engine is imported
+      // statically as well as on demand (by `engine-wasm.ts`), and Rollup points
+      // out that the dynamic import cannot therefore split it into a chunk of its
+      // own. That is the intended shape of the *package* entry: a host that
+      // imports `webpdf` wants the engine. A page that would rather not fetch the
+      // wasm on the main thread imports `./api.ts` instead - which is what the
+      // demo does, and how it keeps the engine out of its own bundle.
+      onwarn: (warning, warn) => {
+        if (warning.code === 'MIXED_DYNAMIC_AND_STATIC_IMPORT') return;
+        warn(warning);
+      },
     },
     sourcemap: true,
   },

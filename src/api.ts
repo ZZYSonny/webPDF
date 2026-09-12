@@ -10,19 +10,25 @@
  * Nothing here touches globals, assumes a document structure, or requires a
  * particular bundler, which is what makes the library usable from a content
  * script, an extension page or an embedded widget.
+ *
+ * The engine module - and with it the 10 MB MuPDF wasm - is imported *inside*
+ * the calls that need it rather than at the top of this file, for two reasons:
+ * a page that only draws with a worker should not also build an engine on the
+ * main thread, and whatever the host said about where the wasm comes from has to
+ * be in place before the module that reads it is evaluated (see `engine-wasm.ts`).
  */
 
-import {
-  PdfEngine,
-  type DocumentInfo,
-  type PdfEngineLike,
-  type PdfSource,
-  type RenderedPage,
-  type EngineOptions,
+import type {
+  DocumentInfo,
+  PdfEngineLike,
+  PdfSource,
+  RenderedPage,
+  EngineOptions,
 } from './core/engine.ts';
 import { DEFAULT_ZOOM_STEPS, PdfViewer, type PdfViewerOptions, type ViewerEvent } from './viewer/viewer.ts';
 import type { CropRuleId } from './core/crop.ts';
 import { createWorkerEngine } from './worker/client.ts';
+import { loadEngine } from './core/engine-wasm.ts';
 
 export interface CreateViewerOptions extends Omit<PdfViewerOptions, 'container' | 'engine'> {
   /** A container element or a CSS selector to resolve against `document`. */
@@ -58,7 +64,12 @@ export async function createViewer(opts: CreateViewerOptions): Promise<PdfViewer
   if (!backend && (worker ?? true)) {
     backend = (await createWorkerEngine(workerUrl)) ?? undefined;
   }
-  backend ??= new PdfEngine({ disableCompression, onWarn });
+  if (!backend) {
+    // Only now, and only when there is no worker to draw in: the engine brings
+    // the wasm with it.
+    const { PdfEngine } = await loadEngine();
+    backend = new PdfEngine({ disableCompression, onWarn });
+  }
 
   const viewer = PdfViewer.create({ ...viewerOpts, container: resolveContainer(opts.container), engine: backend });
   if (source !== undefined) await viewer.load(source);
@@ -100,6 +111,7 @@ export async function* renderDocument(
   source: PdfSource,
   opts: RenderDocumentOptions = {},
 ): AsyncGenerator<RenderedPage, void, void> {
+  const { PdfEngine } = await loadEngine();
   const engine = new PdfEngine(opts);
   try {
     await engine.open(source);
@@ -127,9 +139,8 @@ export async function* renderDocument(
 }
 
 export type { DocumentInfo, PdfSource, RenderedPage, ViewerEvent };
-export { PdfEngine, PdfViewer, DEFAULT_ZOOM_STEPS };
+export { PdfViewer, DEFAULT_ZOOM_STEPS };
 export { WorkerEngine, createWorkerEngine } from './worker/client.ts';
-export { DocumentNotOpenError, PasswordRequiredError } from './core/engine.ts';
 export type { PdfEngineLike, RenderOptions, RenderStats, OutlineNode, PageGeometry, TextMode } from './core/engine.ts';
 export { CROP_RULES, MIN_DRAWING_HEIGHT, contentBox, cropRule, cropViewBox, normaliseRules } from './core/crop.ts';
 export type { CropRect, CropRule, CropRuleId, CropSpan } from './core/crop.ts';

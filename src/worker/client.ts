@@ -9,6 +9,7 @@
 import type { DocumentInfo, PdfEngineLike, PdfSource, RenderOptions, RenderedPage } from '../core/engine.ts';
 import type { CropRect, CropRuleId } from '../core/crop.ts';
 import type { FontAsset } from '../core/font/registry.ts';
+import { engineWasmSources } from '../core/engine-wasm.ts';
 
 interface Pending {
   resolve: (value: unknown) => void;
@@ -34,6 +35,14 @@ export class WorkerEngine implements PdfEngineLike {
 
   constructor(worker: Worker) {
     this.worker = worker;
+    // Where the engine may come from is a decision made in *this* realm, and the
+    // worker cannot see it: tell it before anything is asked of it, so that the
+    // request which starts the engine - the probe `createWorkerEngine` sends, or
+    // the first `open` - finds the sources already there. Sent only when there is
+    // something to say, so a worker whose host configured nothing keeps MuPDF's
+    // own resolution.
+    const sources = engineWasmSources();
+    if (sources.length) this.worker.postMessage({ wpdf: 'engine', sources });
     this.worker.addEventListener('message', (event: MessageEvent) => {
       const { id, ok, result, error } = event.data as {
         id: number;

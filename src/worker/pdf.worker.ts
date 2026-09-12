@@ -12,15 +12,20 @@
  *    that arrives while the module graph is still evaluating is dispatched (and
  *    lost) if no handler exists yet.
  * 2. The engine is therefore pulled in with a dynamic `import()`, so the handler
- *    is live immediately and requests simply queue behind the promise.
+ *    is live immediately and requests simply queue behind the promise. That
+ *    import goes through `loadEngine`, which fetches the wasm from the first
+ *    source the page configured before the module is evaluated.
  *
  * The protocol is deliberately tiny - `{ id, method, args }` in, `{ id, ok,
  * result | error }` out - because the very same `PdfEngine` also runs inline;
- * there is no second implementation to keep in sync.
+ * there is no second implementation to keep in sync. One message is not part of
+ * it: `{ wpdf: 'engine', sources }`, which this worker's realm needs because it
+ * cannot see the page's modules.
  */
 
 import type { PdfEngineLike, PdfSource, RenderOptions } from '../core/engine.ts';
 import type { CropRuleId } from '../core/crop.ts';
+import { configureEngineWasm, loadEngine, type EngineWasmConfig } from '../core/engine-wasm.ts';
 
 interface Request {
   id: number;
@@ -28,10 +33,19 @@ interface Request {
   args: unknown[];
 }
 
+/** Where to get the engine, sent by whoever created this worker. */
+interface EngineMessage extends EngineWasmConfig {
+  wpdf: 'engine';
+}
+
+function isEngineMessage(data: unknown): data is EngineMessage {
+  return (data as EngineMessage | null)?.wpdf === 'engine';
+}
+
 let engine: Promise<PdfEngineLike> | null = null;
 
 function getEngine(): Promise<PdfEngineLike> {
-  engine ??= import('../core/engine.ts').then((mod) => new mod.PdfEngine());
+  engine ??= loadEngine().then((mod) => new mod.PdfEngine());
   return engine;
 }
 
@@ -48,8 +62,15 @@ const handlers = {
   close: (e: PdfEngineLike) => e.close(),
 } satisfies Record<Request['method'], (engine: PdfEngineLike, args: unknown[]) => unknown>;
 
-self.onmessage = async (event: MessageEvent<Request>) => {
-  const { id, method, args } = event.data ?? ({} as Request);
+self.onmessage = async (event: MessageEvent<Request | EngineMessage>) => {
+  const data = event.data;
+  // Before anything is awaited: the next message may be the request that starts
+  // the engine, and it has to find the sources already in place.
+  if (isEngineMessage(data)) {
+    configureEngineWasm(data);
+    return;
+  }
+  const { id, method, args } = data ?? ({} as Request);
   const reply = (payload: Record<string, unknown>) => (self as unknown as Worker).postMessage({ id, ...payload });
   try {
     const handler = handlers[method];

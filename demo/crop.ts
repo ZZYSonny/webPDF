@@ -15,7 +15,9 @@
  * script's own behaviour; "Disable all" is how a reader gets their page back.
  */
 
-import { CROP_RULES, type CropRuleId, type CropRule } from '../src/index.ts';
+// The rules come from the module that defines them rather than from the package
+// entry, which re-exports them alongside the engine: see the note in `main.ts`.
+import { CROP_RULES, type CropRuleId, type CropRule } from '../src/core/crop.ts';
 import { scrollIntoPanel } from './panels.ts';
 
 export interface CropMenuOptions {

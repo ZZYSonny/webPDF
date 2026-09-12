@@ -3,7 +3,12 @@
  *
  * Deliberately built only on the public API - no private reach-ins - so it
  * doubles as a test that the integration surface is sufficient for a real app
- * (and, by extension, for a browser extension content script).
+ * (and, by extension, for a browser extension content script). The imports name
+ * the modules that API lives in rather than the package entry, because the entry
+ * also exports `PdfEngine`, and importing that would build a second engine - and
+ * fetch the 10 MB wasm for it - on the main thread of a page that draws in a
+ * worker. Nothing here is drawn from outside the public surface: every one of
+ * these names is re-exported by `src/index.ts`.
  *
  * The chrome is one bar and nothing else, and that bar is one line however
  * narrow the window is: the document, its outline and the page number on the
@@ -20,15 +25,14 @@
  * the pages puts the chrome away the way a pinch does - see `dismissOnScroll`.
  */
 
-import {
-  createViewer,
-  BIONIC_DIM,
-  DEFAULT_ZOOM_STEPS,
-  PdfViewer,
-  type DocumentInfo,
-  type ViewerEvent,
-} from '../src/index.ts';
+import { createViewer } from '../src/api.ts';
+import { BIONIC_DIM } from '../src/core/svg/bionic.ts';
+import { configureEngineWasm, type EngineWasmSource } from '../src/core/engine-wasm.ts';
+import { DEFAULT_ZOOM_STEPS } from '../src/viewer/viewer.ts';
+import type { DocumentInfo, PdfViewer, ViewerEvent } from '../src/index.ts';
+import { engine } from 'virtual:webpdf/engine';
 import { createHostBridge, isHosted, type HostBridge, type HostDocument } from './host.ts';
+import { createOffline } from './offline.ts';
 import { get, inherited, keyOfFile, keyOfUrl, MEMORY_KEY, put, read, write, type Memory, type Place, type Settings } from './memory.ts';
 import { createSearch, type SearchController, type SearchState } from './search.ts';
 import { createCropMenu, type CropMenu } from './crop.ts';
@@ -128,15 +132,55 @@ let sourceName = '';
 
 /**
  * Where this page lives, so a document URL or an upload can be resolved against
- * it rather than against a domain root: the built demo is published under a
- * path ([user].github.io/<repo>/) that it has no other way of knowing.
+ * it rather than against a domain root: the built demo is published under a path
+ * ([user].github.io/<repo>/) that it has no other way of knowing.
+ *
+ * It is the *page's* directory, not the module's: the module is one of the
+ * hashed files under `assets/`, and a reader typing a relative URL - or an
+ * address this build hands the page for something it serves itself, like the
+ * engine's wasm - means it relative to the page they are looking at.
  */
-const BASE = (() => {
-  const src = document.querySelector<HTMLScriptElement>('script[type="module"][src]')?.src;
-  return src ? new URL('.', src).href : new URL('.', document.baseURI).href;
-})();
+const BASE = new URL('.', document.baseURI).href;
 
 const resolve = (url: string): string => new URL(url, BASE).href;
+
+/**
+ * Where the engine may be fetched from, in order.
+ *
+ * The *published* site asks the CDN first and its own copy second, and the
+ * reasoning for that is in `engineFacts()` in `vite.demo.config.ts`: the CDN's URL
+ * is pinned to a MuPDF version rather than to a build, so an update to this
+ * viewer does not invalidate the ten megabytes a reader already has.
+ *
+ * A page served from the machine it is running on asks for the copy *on* that
+ * machine first. That is the dev server, `vite preview`, and every test browser:
+ * the package is already on the disk (the dev server reads the wasm out of
+ * `node_modules`, a build has emitted it next to the page), and a browser with
+ * no cache to amortize a download against - every test launch starts with an
+ * empty profile - would otherwise pull ten megabytes from somewhere else on
+ * every run, to prove something this disk can answer without a network at all.
+ * The CDN stays in the list, second: a page whose own copy is missing or wrong
+ * still has somewhere to go.
+ */
+const localEngine: EngineWasmSource = { url: new URL(engine.local, BASE).href, integrity: engine.integrity };
+const cdnEngine: EngineWasmSource[] = engine.cdn ? [{ url: engine.cdn, integrity: engine.integrity }] : [];
+const onThisMachine = import.meta.env.DEV || /^(localhost|127(\.\d+){3}|\[::1\])$/.test(location.hostname);
+const engineSources: EngineWasmSource[] = onThisMachine
+  ? [localEngine, ...cdnEngine]
+  : [...cdnEngine, localEngine];
+
+configureEngineWasm({ sources: engineSources });
+
+/**
+ * The offline half of the page: the service worker, and the documents worth
+ * keeping. A page that is being driven inside a host's frame keeps none of it -
+ * see `demo/offline.ts`.
+ */
+const offline = createOffline({
+  sources: engineSources,
+  hosted: isHosted() && window.parent !== window,
+  onWarn: (message) => notify(message),
+});
 
 /**
  * What to call a document that has no title of its own: the file's name, or the
@@ -868,6 +912,35 @@ function releasePrint(): void {
 }
 
 /**
+ * Fetch a document from a URL, as a blob this page is holding.
+ *
+ * The engine could fetch it for itself - it is handed a URL as happily as bytes
+ * - but then the document would exist only inside the worker that read it, and
+ * the page could neither keep it for an offline visit nor write it back out
+ * untouched when the reader saves it. So the page reads it, once, and hands the
+ * same bytes to both.
+ *
+ * The fragment is dropped because it names a place *in* a document rather than a
+ * document: `#page=7` from a host is not a different document, and the URL the
+ * copy is kept under has to be the URL that was fetched.
+ */
+async function fetchDocument(url: string): Promise<Blob> {
+  const target = new URL(url);
+  target.hash = '';
+  let response: Response;
+  try {
+    response = await fetch(target.href);
+  } catch (error) {
+    // A fetch that fails with no network is the one failure a reader can act on,
+    // and "Failed to fetch" says nothing about why or about what to do.
+    if (!navigator.onLine) throw new Error(`this browser is offline, and ${url} has not been kept for offline reading`);
+    throw error;
+  }
+  if (!response.ok) throw new Error(`${response.status} ${response.statusText} for ${url}`);
+  return await response.blob();
+}
+
+/**
  * Open a document, from wherever it came: a file the reader chose, a URL the
  * page was asked for, or bytes a host handed over.
  *
@@ -896,6 +969,14 @@ async function openSource(source: Source, host?: HostDocument | null): Promise<v
   els.progress.hidden = false;
   try {
     const v = await ensureViewer();
+    // A document that lives at a URL is read *here*, by the page, rather than by
+    // the engine that will draw it. Two things follow from that, and both of them
+    // are the reader's: bytes this page has read are bytes it can keep for the
+    // next visit with no network (`offline.keep`), and they are the document
+    // itself, so saving it writes what the server sent rather than a copy of it
+    // (see `documentBytes`).
+    const fetched = typeof source === 'string' ? await fetchDocument(source) : null;
+    const document_ = fetched ?? source;
     let loaded: DocumentInfo;
     // An encrypted document is the one failure the reader can answer for, so the
     // question is repeated for as long as they are willing to answer it: a wrong
@@ -905,7 +986,7 @@ async function openSource(source: Source, host?: HostDocument | null): Promise<v
     let password: string | undefined;
     for (let tries = 0; ; tries++) {
       try {
-        loaded = await v.load(source, password);
+        loaded = await v.load(document_, password);
         break;
       } catch (error) {
         if ((error as Error)?.name !== 'PasswordRequiredError' || tries >= 20) throw error;
@@ -923,7 +1004,15 @@ async function openSource(source: Source, host?: HostDocument | null): Promise<v
     // Where this document was left, or - if it has never been read here - the
     // settings of the last one, at its first page.
     restoreMemory(key, host);
-    saving = savable(source, label);
+    saving = savable(document_, label);
+    // The engine has now been read for a document, whichever document it was: a
+    // copy of it is what makes the next visit work with no network at all, and it
+    // is asked for once, here, rather than at start-up for a reader who may never
+    // open anything.
+    offline.used();
+    // A document from a URL is worth keeping, whole and unread, so that opening it
+    // again is not a download. A file the reader chose is already theirs.
+    if (fetched && typeof source === 'string') offline.keep(source, fetched);
     // Written now rather than at the end of the window: a document the reader
     // opens and closes without moving is still a document they read.
     commitMemory();
@@ -1229,13 +1318,16 @@ if (topbar) {
 }
 
 // A debug handle is genuinely useful when embedding (and when driving the demo
-// from an automated test); there is no other global state in the library.
+// from an automated test); there is no other global state in the library. `open`
+// is `openSource` itself - the same path a click on an example paper takes, the
+// same URL resolution, the same memory and the same keeping for offline - which
+// is what makes it worth driving from a test rather than reaching into the page.
 declare global {
   interface Window {
-    webpdf?: { viewer(): PdfViewer | null; info(): DocumentInfo | null };
+    webpdf?: { viewer(): PdfViewer | null; info(): DocumentInfo | null; open(url: string): Promise<void> };
   }
 }
-window.webpdf = { viewer: () => viewer, info: () => info };
+window.webpdf = { viewer: () => viewer, info: () => info, open: (url) => openSource(resolve(url)) };
 
 /**
  * The host, when there is one: the extension this page is the viewer for, or any

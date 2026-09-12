@@ -96,6 +96,9 @@ try {
   console.log('\n› the host bridge: a new page, an old host');
   await run([path.join(here, 'bridge.mjs'), url], { stdio: 'inherit' });
 
+  console.log('\n› the viewer with no network: the service worker and the engine');
+  await run([path.join(here, 'pwa.mjs'), url], { stdio: 'inherit' });
+
   console.log('\n› the extension, loaded in a browser');
   await run([path.join(here, 'extension.mjs'), url], { stdio: 'inherit' });
 } catch (err) {

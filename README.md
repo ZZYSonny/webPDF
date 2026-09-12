@@ -171,13 +171,12 @@ MuPDF's copy of it, compressed and with any encryption taken off:
 const bytes = await viewer.save();   // a Blob, a download, a printer
 ```
 
-That is not the file the document was opened from — a reader who chose a file
-gets *that* file back from a save, byte for byte, which is the page's business
-rather than the viewer's — so `save()` is for handing the document on: to a
-download, to another tool, or to a printer. It is what Ctrl+P in the demo is
-built on, and what makes printing work for a document that had to be unlocked:
-the file still carries the password, and whatever is handed a PDF to print does
-not have it.
+That is not the file the document was opened from — whoever handed the viewer its
+bytes gets *those* back from a save, byte for byte, which is their business rather
+than the viewer's — so `save()` is for handing the document on: to a download, to
+another tool, or to a printer. It is what Ctrl+P in the demo is built on, and what
+makes printing work for a document that had to be unlocked: the file still carries
+the password, and whatever is handed a PDF to print does not have it.
 
 Only the pages near the viewport are ever in the DOM. Everyone else is an
 absolutely positioned box whose geometry was computed up front, so zooming
@@ -631,15 +630,76 @@ viewer:
   overridden, because the browser's own answers to them are about the HTML that
   happens to be drawing the document: Ctrl+S would save the page, and Ctrl+P
   would print it — SVG the viewer built, laid out again at the paper's width, with
-  none of the document's own idea of a page in it. Saving writes the bytes the
-  viewer is holding (the reader's file, or the one a host handed over, under the
-  document's own name); a document the page only has the URL of is written out by
-  MuPDF instead, so there is no second request for bytes that have been read once
-  already. Printing hands those same bytes to a frame of their own — a PDF is what
-  a printer wants, and the browser prints one natively and exactly — so the page's
-  SVG, its chrome and its scrolling are not part of the job. What is printed is
-  the document as it is: cropping, bionic reading and the zoom level belong to the
-  screen and are not things a printer can be asked for.
+  none of the document's own idea of a page in it. Saving writes the document's
+  own bytes, under the name it is known by: the reader's file, the one a host
+  handed over, or the one the page fetched because it was given a URL. Printing
+  hands those same bytes to a frame of their own — a PDF is what a printer wants,
+  and the browser prints one natively and exactly — so the page's SVG, its chrome
+  and its scrolling are not part of the job. What is printed is the document as it
+  is: cropping, bionic reading and the zoom level belong to the screen and are not
+  things a printer can be asked for. An *encrypted* document is the one case where
+  the bytes on hand are not what is printed: they still carry the password, and
+  the browser's own PDF viewer — the thing a printer is handed — would ask for it
+  in a frame nobody can see, so what goes to the printer is the copy MuPDF writes
+  out, with the encryption taken off (`viewer.save()`).
+
+### Offline, and where the engine comes from
+
+The published site is a web app in the installable sense: a manifest, an icon at
+two sizes, and a service worker that precaches the page and everything it is made
+of. A reader who has opened it once can open it again with no network at all —
+the page comes up, and so does the document they were reading.
+
+Three things are cached, and they are cached differently on purpose:
+
+* **The shell** — the page, its scripts, its styles, the manifest — is precached
+  when the worker installs, into a cache named after a digest of those files. A
+  redeploy is a new name, so the old copy is dropped whole on activation and
+  nothing from two builds is ever served together. There is deliberately no
+  `skipWaiting`: a new build takes over when the pages of the old one are closed.
+  This page fetches parts of itself lazily — the engine's own chunk, when the
+  first document is opened — and a worker that swapped the shell out from under a
+  page mid-session would be answering those fetches with a build that no longer
+  has them. So an update waits for the next visit, and a reader reading is never
+  interrupted by one.
+* **The engine** — MuPDF's 10 MB wasm — is *not* precached. Ten megabytes
+  downloaded on install, for a reader who may never open a document, is not a
+  promise a site should make. It is kept the first time it is actually fetched —
+  from whichever of the addresses below answered, verified against the digest the
+  build was compiled with — and served from there afterwards.
+* **Documents** are the page's decision rather than the worker's: the page keeps
+  the ones it has opened (the last eight, by URL) in a cache of its own, and the
+  worker only looks there before going to the network. A PDF at a URL is
+  immutable, so a cached one is never revalidated; something that was not kept,
+  opened while offline, says so rather than failing with "Failed to fetch".
+
+The published engine is asked for from `https://cdn.jsdelivr.net/npm/mupdf@<version>/…`
+first and from the site's own copy of the same bytes second. The reason is not
+speed but *time*: the CDN's URL is pinned to the MuPDF version, so it does not
+change when this viewer does. An update ships new JavaScript, new styles and a
+new service worker, and the browser keeps the ten megabytes it already has. (The
+site's own copy is named after the version for the same reason — GitHub Pages
+hands every asset a ten-minute lifetime, so a copy under a content hash would be
+revalidated on every visit and a copy under the version is at least honest about
+being immutable.)
+
+A page served from the machine it is running on asks for the copy on that machine
+first, and keeps the CDN second — the dev server, `vite preview`, and every test
+browser do this (`engineSources` in `demo/main.ts`). The package is already on the
+disk, and a test browser starts with an empty profile every launch: ten megabytes
+fetched per run, to prove what the disk can answer without a network at all, is a
+cost with nothing on the other side of it.
+
+Which of the two is used is checked rather than assumed: the build writes the
+sha384 of the wasm it was compiled against into the page, and bytes that do not
+match are not installed — the next source is tried instead. That is what makes
+the CDN a delivery channel rather than a dependency: with no CDN, or the wrong
+CDN, or no network, the viewer comes up from the copy the site serves itself.
+`$WEBPDF_ENGINE_CDN` replaces the address before a build (an empty value drops
+the CDN entirely).
+
+A reader who never opens a document pays for none of it: the engine is imported
+when the first page is about to be drawn, not when the page boots.
 
 ### Headless rendering
 
@@ -931,15 +991,39 @@ The library was written with content scripts in mind:
   `worker: false` to force inline rendering. The prebuilt library resolves its
   worker relative to `dist/lib/webpdf.js`; if you move `assets/` somewhere else (an
   extension must often vendor it), pass `workerUrl` explicitly.
-* The MuPDF wasm binary is fetched relative to the module URL. If your extension
-  needs to control that (for `web_accessible_resources`), set it explicitly
-  before importing:
+* **The engine is fetched when the first document is opened**, not when the page
+  boots, and `configureEngineWasm` says where from — in order, each with the
+  digest its bytes are expected to have, so a source that answers with something
+  else is skipped instead of installed:
+
+  ```ts
+  configureEngineWasm({
+    sources: [
+      { url: `https://cdn.jsdelivr.net/npm/mupdf@${version}/dist/mupdf-wasm.wasm`, integrity },
+      { url: new URL('engine/mupdf.wasm', import.meta.url).href, integrity },
+    ],
+  });
+  ```
+
+  Call it before the first document is opened; it is repeated to the rendering
+  worker, which has its own realm. The download is reported to nobody: a host that
+  wants a progress bar has its own loading state to show (the demo shows its
+  progress strip while the first document opens).
+* The MuPDF wasm binary is otherwise fetched relative to the module URL. If your
+  extension needs to control that (for `web_accessible_resources`), set it
+  explicitly before importing — a host that has already placed the module keeps
+  its say, and `configureEngineWasm` only fills the gap when nobody has spoken:
 
   ```ts
   globalThis.$libmupdf_wasm_Module = {
     locateFile: (p: string) => chrome.runtime.getURL(`vendor/${p}`),
   };
   ```
+
+`PdfEngine` and the two error classes are exported from the package entry
+(`dist/lib/webpdf.js`, `src/index.ts`), not from `api.ts`, because exporting them
+means importing the module that owns MuPDF — and a page that draws in a worker
+should not build a second engine on the main thread, or fetch the wasm for it.
 
 `PdfEngineLike` is exported, and `WorkerEngine` is the reference implementation
 of it, so a different transport (an extension's offscreen document, a shared
@@ -954,9 +1038,14 @@ bytes of but not one it only knows the URL of.
 
 ```
 src/
-  api.ts                    createViewer, renderDocument, public types
+  index.ts                  the package entry: api.ts, plus PdfEngine (and the
+                            wasm it brings) and configureEngineWasm
+  api.ts                    createViewer, renderDocument, public types - and no
+                            import of the engine, so importing it is free
   core/
     engine.ts               MuPDF document + page rendering (DOM-free)
+    engine-wasm.ts          where the wasm comes from: sources in order, digests
+                            checked, fetched when the engine is first needed
     crop.ts                 PaperCutter's rules, and the box they leave
     debug.ts                opt-in pipeline tracing
     links.ts                link annotations → data, and → SVG hit areas
@@ -1001,6 +1090,14 @@ demo/                       the demo application (the Vite root, and the site)
 demo/                       (continued)
   host.ts                   the host bridge: hand over a document, hear what opened
   host-mode.js              the one thing that must happen before the first paint
+  offline.ts                the page's half of offline: the worker's registration,
+                            and the documents kept for the next visit
+  sw.js                     the service worker: the shell, the engine, the reader's
+                            documents - the two lists it needs are filled in by
+                            `pwa()` in `vite.demo.config.ts`
+  manifest.webmanifest      the installed app: name, colours, the two icons
+  engine-virtual.d.ts       what `virtual:webpdf/engine` hands the page
+  vite-env.d.ts             Vite's own types (`import.meta.env.PROD`)
 ext/
   manifest.json             MV3 manifest; the build adds the version and the key
   src/
@@ -1014,12 +1111,14 @@ tests/
   extension.test.ts         which URLs the extension opens, and the crx, in Node
   memory.test.ts            the viewer's memory, in Node (no browser, no extension)
   engine-save.test.ts       writing a document out, encrypted documents included
+  engine-wasm.test.ts       which wasm source is used, and what a wrong one costs
   pdf-cache.mjs             fetches the corpus, lists it, clears it
   browser/                  headless-Chromium verification over CDP
     demo.mjs                the built demo, driven through its own UI
     frames.mjs              a page as a document: selection, clipboard, keys, wheel
     pinch.mjs               the pinch/zoom contract
     bridge.mjs              the host protocol: a new page, an old host
+    pwa.mjs                 the service worker, and a server killed mid-test
     extension.mjs           the extension itself, loaded into Chrome
     compare.mjs, diff.mjs   text-vs-outlines fidelity, with a difference map
 scripts/
@@ -1049,6 +1148,13 @@ npm run build:lib    # the library, in dist/lib
 npm run build:pages  # the published site, in dist/demo
 npm run build:extension  # the extension, in dist/ext
 ```
+
+The dev server serves the engine's wasm straight out of `node_modules`, and a
+built page has its own copy emitted next to it, so **nothing in development
+fetches the engine from the CDN**. The dev server also serves no service worker —
+a worker that answers a reload out of its cache would make every edit a mystery —
+and the registration is behind `import.meta.env.PROD` for that reason. What the
+built site does with both is `tests/browser/pwa.mjs`.
 
 `npm run build:extension` compiles the worker and the viewer page with Vite and
 then stages, zips and signs the extension, which is small because it carries no
@@ -1115,8 +1221,20 @@ positions — stable from one run to the next.
 Pages has to be set to **Source: GitHub Actions** in the repository settings —
 there is no `gh-pages` branch and nothing to commit back to the repository. The
 site is served from the repository's own path (`…github.io/webPDF/`), which is
-why the demo derives its base from its own module URL and every asset Vite emits
+why the demo derives its base from the page's own URL and every asset Vite emits
 is referenced relatively.
+
+The build also writes the two files that make the site an app rather than a page
+— `manifest.webmanifest` and `sw.js` — and they are written *from* the build:
+the manifest names the icons by the names the bundler gave them, and the service
+worker precaches the exact list of files the page is made of, under a cache named
+after their digest (see `pwa()` in `vite.demo.config.ts`). Nothing has to be kept
+in step by hand, and nothing about the deploy changes: `upload-pages-artifact`
+uploads `dist/demo`, manifest and worker included.
+
+The one address in the published site that is not the site's own is the engine's
+CDN (see “Offline, and where the engine comes from”); set `WEBPDF_ENGINE_CDN` in
+the workflow to point that somewhere else, or to nothing at all.
 
 ---
 
@@ -1145,6 +1263,17 @@ is referenced relatively.
   `tests/browser/frames.mjs`), but dragging a selection across a page boundary
   does not cross frames. `pageFrames: false` draws all pages into one document
   for hosts that need that.
+* **Offline is the site's, and it is bounded.** The first visit has to reach the
+  network for the shell and the engine, and only the documents this browser has
+  actually opened are available without it — the last eight, by URL, with the
+  oldest dropped as new ones are kept. A document the reader chose from their own
+  disk is theirs already and is not copied into storage. Nothing is offered as
+  "available offline" that was not read here, and there is no way to see or clear
+  that list from the page yet (the browser's own storage settings are the way
+  out). The extension's viewer gets no offline copy of its own: a page framed by
+  another application has its storage partitioned by whoever framed it, so the
+  bytes it is handed are the extension's business and the shell it is drawn from
+  is fetched when the extension opens it.
 * **A page can be blank for a moment when scrolling fast into unread
   territory.** A page that has not been rendered yet cannot be shown, and a
   reader who outruns the renderer sees the empty white box until it lands. The

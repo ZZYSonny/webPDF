@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import path from 'node:path';
@@ -160,6 +161,224 @@ function hostMode(): Plugin {
   };
 }
 
+/* ------------------------------------------------------------------- engine */
+
+/** The module the page reads the engine's addresses from. */
+const ENGINE_MODULE = 'virtual:webpdf/engine';
+
+/**
+ * The engine's wasm, as this build knows it: the exact bytes, their digest, the
+ * name this build serves its own copy under, and the CDN it would rather fetch
+ * them from.
+ *
+ * A CDN is worth the extra source because of *when* the engine is downloaded,
+ * not how fast the CDN is. MuPDF's wasm is 10 MB, the largest thing this project
+ * ever fetches, and a copy served from the site's own directory inherits that
+ * site's caching: GitHub Pages hands every asset a ten-minute lifetime, so a
+ * reader who comes back tomorrow revalidates ten megabytes before the viewer can
+ * draw anything. jsDelivr serves a *versioned* npm file with
+ * `max-age=31536000, immutable`, so the URL below never changes while the
+ * version does not - which means an update to this viewer (new JavaScript, new
+ * styles, new everything else) leaves the engine's address alone, and the copy
+ * the browser already has stays where it is. Nothing is asked of the CDN that
+ * the site cannot answer itself: the same bytes are emitted here as the second
+ * source, fetched only if the first one fails or fails to match its digest.
+ *
+ * `$WEBPDF_ENGINE_CDN` replaces the template (`{version}` is substituted); an
+ * empty value ships the site's own copy only, which is what a deployment that
+ * would rather serve no third party at all wants.
+ *
+ * The *order* of those two is the page's, not this build's: `engineSources` in
+ * `demo/main.ts` asks the CDN first on the published site and the local copy
+ * first everywhere else, so that a dev server or a test browser - both of which
+ * start with nothing cached - do not download ten megabytes to prove what is
+ * already on the disk.
+ */
+function engineFacts() {
+  const pkg = JSON.parse(
+    fs.readFileSync(path.join(import.meta.dirname, 'node_modules/mupdf/package.json'), 'utf8'),
+  ) as { version: string };
+  const bytes = fs.readFileSync(path.join(import.meta.dirname, 'node_modules/mupdf/dist/mupdf-wasm.wasm'));
+  const cdn = (
+    process.env.WEBPDF_ENGINE_CDN ?? 'https://cdn.jsdelivr.net/npm/mupdf@{version}/dist/mupdf-wasm.wasm'
+  ).replace('{version}', pkg.version);
+  return {
+    version: pkg.version,
+    /** `sha384-<base64>`, spelled the way an `integrity` attribute is. */
+    integrity: `sha384-${crypto.createHash('sha384').update(bytes).digest('base64')}`,
+    /** Where this build serves its own copy - relative to the page, like every asset. */
+    local: `engine/mupdf-${pkg.version}.wasm`,
+    cdn,
+  };
+}
+
+/**
+ * Place the engine's wasm, and tell the page where to look for it.
+ *
+ * MuPDF's own loader resolves `new URL('mupdf-wasm.wasm', import.meta.url)`, so
+ * the bundler emits the wasm binary as an asset whether or not anything ends up
+ * fetching it from there - which is exactly the second source above. Naming that
+ * asset after the version rather than after its content is what keeps the URL
+ * stable across builds, so a reader's browser is not asked for ten megabytes
+ * again because a button moved; `assetFileNames` is how the name is chosen,
+ * because the emission is the bundler's, not ours.
+ */
+function engine(): Plugin {
+  const facts = engineFacts();
+  let serving = false;
+  // The one name this build chooses for something it did not emit itself: the
+  // wasm, which MuPDF's loader resolves and the bundler therefore emits. The
+  // worker is a build of its own with its own output options, so it has to be
+  // told the same thing, or the same binary lands in the artifact twice.
+  const nameOfAsset = (asset: { names?: string[]; originalFileNames?: string[] }): string => {
+    const names = [...(asset.names ?? []), ...(asset.originalFileNames ?? [])];
+    return names.some((name) => name.endsWith('mupdf-wasm.wasm')) ? facts.local : 'assets/[name]-[hash][extname]';
+  };
+
+  return {
+    name: 'webpdf:engine',
+    configResolved: (config) => {
+      serving = config.command === 'serve';
+    },
+    config: () => ({
+      build: { rollupOptions: { output: { assetFileNames: nameOfAsset } } },
+      worker: { rollupOptions: { output: { assetFileNames: nameOfAsset } } },
+    }),
+    // Read by `demo/main.ts` at start-up: the versions and digests are facts
+    // about the installed package, so they are read from it rather than written
+    // out by hand where they would go stale.
+    resolveId: (id) => (id === ENGINE_MODULE ? `\0${ENGINE_MODULE}` : undefined),
+    load: (id) => (id === `\0${ENGINE_MODULE}` ? `export const engine = ${JSON.stringify(facts)};\n` : undefined),
+    // In dev the same address has to answer, or the fallback source is a 404.
+    // The build's copy is the bundler's; this one is read from `node_modules`.
+    configureServer: (server) => {
+      const wasm = path.join(import.meta.dirname, 'node_modules/mupdf/dist/mupdf-wasm.wasm');
+      server.middlewares.use((req: IncomingMessage, res: ServerResponse, next: (err?: unknown) => void) => {
+        if (!serving || (req.url ?? '').split('?')[0] !== `/${facts.local}`) return next();
+        res.setHeader('Content-Type', 'application/wasm');
+        res.setHeader('Content-Length', String(fs.statSync(wasm).size));
+        fs.createReadStream(wasm).pipe(res);
+      });
+    },
+  };
+}
+
+/* ---------------------------------------------------------------------- pwa */
+
+/**
+ * The manifest and the service worker.
+ *
+ * Both are written here, at the end of the build, because their contents are
+ * facts about the build: the manifest has to name the icons the way the bundler
+ * named them, and the service worker has to list every file the shell is made of
+ * - by name, since those names carry content hashes - before it can promise to
+ * serve them with no network at all. The build id is a digest of what is in that
+ * list, so the same sources produce the same worker and a changed anything
+ * produces a new one, which is what makes the browser replace the shell exactly
+ * when it should.
+ *
+ * The service worker itself, and why it is shaped the way it is, is
+ * `demo/sw.js`; this only fills in the two lists it needs and puts it next to
+ * the page, where its scope covers the whole site.
+ */
+function pwa(): Plugin {
+  /**
+   * The shell: everything the build emits for the page, plus the two files whose
+   * names are not the bundle's to give - the page itself, which Vite's own HTML
+   * plugin emits, and the manifest, which this hook emits after reading this list.
+   *
+   * What is *not* in it is the point of the list: the worker (a cache is not how
+   * a worker is updated, and precaching it would only offer a stale one), source
+   * maps, and the engine's wasm - ten megabytes fetched on install for a reader
+   * who may never open a document is not a promise any site should make. It is
+   * kept the first time it is actually used: see `warmEngine` in `demo/sw.js`.
+   */
+  const readBundle = (bundle: Record<string, OutputFile>) => {
+    const icons: Record<string, string> = {};
+    const shell = new Set(['./index.html', './manifest.webmanifest']);
+    for (const output of Object.values(bundle)) {
+      for (const original of [...(output.originalFileNames ?? []), ...(output.names ?? [])]) {
+        icons[path.basename(original)] = output.fileName;
+      }
+      if (output.fileName === 'sw.js' || output.fileName.endsWith('.map')) continue;
+      if (output.fileName.endsWith('.wasm')) continue;
+      shell.add(`./${output.fileName}`);
+    }
+    return { icons, shell: [...shell].sort() };
+  };
+
+  return {
+    name: 'webpdf:pwa',
+    // Injected after the HTML pass, like `hostMode`: an `href` written in the
+    // shell would be resolved as an asset and hashed, and this one has to be the
+    // manifest's own name - its contents name the hashed icons, so it cannot be
+    // one of them.
+    transformIndexHtml: {
+      order: 'post',
+      handler: () => [
+        {
+          tag: 'link',
+          attrs: { rel: 'manifest', href: './manifest.webmanifest' },
+          injectTo: 'head',
+        },
+      ],
+    },
+    generateBundle(_options, bundle) {
+      const files = bundle as unknown as Record<string, OutputFile>;
+      const { icons, shell } = readBundle(files);
+
+      // `demo/manifest.webmanifest` names the icons the way anyone writing it
+      // would - `./icon.svg`, `./icon.png` - and the build renames them, so the
+      // manifest's own references are rewritten to what was emitted.
+      const manifest = fs.readFileSync(path.resolve(import.meta.dirname, 'demo/manifest.webmanifest'), 'utf8').replace(
+        /"\.\/([^"]+)"/g,
+        (whole, name: string) => (icons[name] ? `"./${icons[name]}"` : whole),
+      );
+      this.emitFile({ type: 'asset', fileName: 'manifest.webmanifest', source: manifest });
+
+      // The build id is what the shell *is*, not when it was built: rebuilding
+      // the same sources produces the same worker, so a browser has nothing to
+      // update to, and any change to any file the page is made of produces a new
+      // one, which is the whole of the update story. The page and the manifest
+      // are read as sources rather than as emitted files, because neither is in
+      // the bundle when this runs - and a change to the page's own text has to
+      // count, or a reader would keep the old one forever.
+      let digest = crypto
+        .createHash('sha256')
+        .update(manifest)
+        .update(fs.readFileSync(path.resolve(import.meta.dirname, 'demo/index.html'), 'utf8'));
+      for (const file of shell) {
+        const output = files[file.replace(/^\.\//, '')];
+        if (!output) continue;
+        const source = output.source ?? output.code ?? '';
+        digest = digest.update(file).update(source);
+      }
+
+      const source = fs
+        .readFileSync(path.resolve(import.meta.dirname, 'demo/sw.js'), 'utf8')
+        .replace('__BUILD__', JSON.stringify(digest.digest('hex').slice(0, 16)))
+        .replace('__PRECACHE__', JSON.stringify(shell, null, 2));
+      // A placeholder that survived means the worker would silently precache
+      // nothing, or share a cache with the build before this one.
+      for (const marker of ['__BUILD__', '__PRECACHE__']) {
+        if (source.includes(marker)) this.error(`demo/sw.js no longer has a ${marker} placeholder to fill in`);
+      }
+      this.emitFile({ type: 'asset', fileName: 'sw.js', source });
+    },
+  };
+}
+
+/** The parts of a built file this config reads: the bundle, without Rollup's types. */
+interface OutputFile {
+  fileName: string;
+  type: string;
+  /** An asset's bytes; a chunk's are `code`. */
+  source?: string | Uint8Array;
+  code?: string;
+  originalFileNames?: string[];
+  names?: string[];
+}
+
 export default defineConfig({
   // Relative asset URLs, because the built site is published under a path of
   // GitHub Pages' choosing rather than at a domain root - `./assets/...` is
@@ -171,7 +390,7 @@ export default defineConfig({
   root: 'demo',
   // Nothing is copied verbatim; the cache is served by `papers()` above.
   publicDir: false,
-  plugins: [papers(), hostMode()],
+  plugins: [papers(), hostMode(), engine(), pwa()],
   build: {
     // Out of the Vite root and into the repository's build directory, which is
     // where every other build output goes - and what the Pages artifact is.
