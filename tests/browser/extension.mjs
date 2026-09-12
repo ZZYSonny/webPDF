@@ -336,7 +336,7 @@ async function openPdf(browser, page, target) {
  * the key - so these presses are also what checks that the frame was given the
  * keyboard.
  */
-async function pressInFrame(browser, key) {
+async function pressInFrame(browser, key, probe = null) {
   const frame = await frameTarget(browser);
   try {
     for (const type of ['keyDown', 'keyUp']) {
@@ -350,7 +350,10 @@ async function pressInFrame(browser, key) {
       });
     }
     await sleep(300);
-    return await frame.evaluate(() => ({ focused: document.activeElement?.id ?? '', hasFocus: document.hasFocus() }));
+    const state = await frame.evaluate(() => ({ focused: document.activeElement?.id ?? '', hasFocus: document.hasFocus() }));
+    // Whatever the key set in motion is read in the same frame, before the
+    // target is closed: an expression string is evaluated as it is.
+    return probe ? { ...state, ...(await frame.evaluate(probe)) } : state;
   } finally {
     await frame.close();
   }
@@ -518,6 +521,41 @@ try {
     'Ctrl+S saves the document the viewer was handed',
     saved?.name === path.basename(file) && saved.size === fs.statSync(file).size,
     JSON.stringify(saved),
+  );
+
+  // Ctrl+P is the same document, handed to the printer rather than to the disk.
+  // What is in the print frame has to be the bytes this page was handed, to the
+  // byte - not the SVG pages the viewer drew from them, which is what the
+  // browser would print if the page let the key through.
+  const printed = await pressInFrame(
+    browser,
+    'p',
+    `(async () => {
+      const deadline = Date.now() + 20000;
+      let frame = null;
+      while (Date.now() < deadline) {
+        frame = document.getElementById('print');
+        if (frame && frame.src.startsWith('blob:')) break;
+        await new Promise((r) => setTimeout(r, 100));
+      }
+      if (!frame || !frame.src.startsWith('blob:')) return { printed: false };
+      const res = await fetch(frame.src);
+      const bytes = new Uint8Array(await res.arrayBuffer());
+      return {
+        printed: true,
+        type: res.headers.get('content-type'),
+        size: bytes.length,
+        magic: String.fromCharCode(...bytes.slice(0, 5)),
+      };
+    })()`,
+  );
+  check(
+    'Ctrl+P hands the printer the document, not the drawing of it',
+    printed?.printed === true &&
+      printed.type === 'application/pdf' &&
+      printed.magic === '%PDF-' &&
+      printed.size === fs.statSync(file).size,
+    JSON.stringify(printed),
   );
 
   /* ------------------------------------------------- a worker that is gone */

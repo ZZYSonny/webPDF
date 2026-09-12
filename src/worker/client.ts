@@ -87,6 +87,11 @@ export class WorkerEngine implements PdfEngineLike {
     return this.call<CropRect | null>('measureCrop', [index, rules]);
   }
 
+  /** The open document, written out again by the engine that is holding it. */
+  async save(): Promise<Uint8Array> {
+    return this.call<Uint8Array>('save', []);
+  }
+
   /**
    * Fonts built since the last call, and never seen before that: the contract
    * `FontRegistry` keeps on the main thread too. A host that inserts these into

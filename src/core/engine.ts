@@ -163,6 +163,16 @@ export interface PdfEngineLike {
    * usable engine, and a viewer that gets no answer simply does not crop.
    */
   measureCrop?(index: number, rules: readonly CropRuleId[]): Promise<CropRect | null>;
+  /**
+   * Write the open document out again, as a fresh PDF.
+   *
+   * Optional, like `measureCrop`: an engine that cannot write a document out is
+   * still a usable engine. What comes back has no encryption on it, because the
+   * caller is the application that has the document open - which is to say one
+   * that has already answered for it - and whatever it is handing the bytes to
+   * has not.
+   */
+  save?(): Promise<Uint8Array>;
   drainNewFonts(): FontAsset[];
   /** Optional: drop everything outside `keep` so memory stays bounded. */
   trimCaches?(keep: readonly number[]): void;
@@ -504,6 +514,32 @@ export class PdfEngine implements PdfEngineLike {
       labels,
       encrypted: doc.needsPassword(),
     };
+  }
+
+  /**
+   * Write the open document out again: MuPDF's own copy of it, compressed and
+   * with no encryption on it.
+   *
+   * Not the bytes the document was opened from. Those are whatever the reader's
+   * file was, and this is a fresh write of the same document, so this is for
+   * handing the document on - to a printer above all, since a PDF is exactly
+   * what a printer wants and a password the printer does not have is exactly
+   * what it must not be handed. Saving a file a reader chose is a different
+   * job, and the page does that with the file itself.
+   */
+  async save(): Promise<Uint8Array> {
+    if (!this.doc) throw new DocumentNotOpenError();
+    // Only a PDF can be written out, and only a PDF is ever opened here: the
+    // document is the one this engine was handed as `application/pdf`.
+    const buffer = (this.doc as mupdf.PDFDocument).saveToBuffer({ encrypt: 'none', compress: true });
+    try {
+      // `asUint8Array` is a *view* into MuPDF's memory rather than a copy of it,
+      // and that memory is freed by `destroy` below. The bytes are the whole
+      // point of the call, so they are copied out of it before it goes.
+      return new Uint8Array(buffer.asUint8Array());
+    } finally {
+      buffer.destroy();
+    }
   }
 
   private loadPage(index: number): mupdf.Page {

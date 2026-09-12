@@ -863,6 +863,21 @@ html.wpdf-host .empty {
   justify-content: flex-end;
 }
 
+/*
+  The frame the printer is handed (see `printDocument` in main.ts). Out of the
+  way, but a box all the same: a frame that is not laid out is not rendered
+  either, and the browser prints a document it has rendered. Zero-sized rather
+  than `display: none` for exactly that reason.
+*/
+.print-frame {
+  position: fixed;
+  right: 0;
+  bottom: 0;
+  width: 0;
+  height: 0;
+  border: 0;
+}
+
 .empty-card {
   max-width: 560px;
   text-align: center;

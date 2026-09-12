@@ -256,6 +256,16 @@
         </div>
 
         <div id="progress" class="progress" hidden><div id="progress-bar"></div></div>
+
+        <!--
+          What Ctrl+P prints. The document itself goes in here, never the pages
+          on screen: those are SVG the viewer built, and a printer would lay them
+          out again at the paper's width. A PDF is what a printer wants, and the
+          browser prints one natively and exactly. Filled and printed by
+          `printDocument` in `main.ts`; zero-sized, so it is out of the way while
+          still being a frame the browser lays out and can print.
+        -->
+        <iframe id="print" class="print-frame" aria-hidden="true"></iframe>
       </section>
     </main>
 

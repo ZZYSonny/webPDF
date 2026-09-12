@@ -90,6 +90,8 @@ const els = {
   passwordText: $('password-text'),
   passwordInput: $<HTMLInputElement>('password-input'),
   passwordCancel: $<HTMLButtonElement>('password-cancel'),
+  /** Where the printer is handed the document: see `printDocument`. */
+  print: $<HTMLIFrameElement>('print'),
 };
 
 let viewer: PdfViewer | null = null;
@@ -725,14 +727,14 @@ function highlightOutline(page: number): void {
 /* ------------------------------------------------------------------ load */
 
 /**
- * What Ctrl+S writes: the bytes of the document on screen, when this page has
- * them.
+ * What this page is holding: the bytes of the document on screen, when it has
+ * them, and the name they are known by.
  *
- * A document handed over as bytes, or opened from the reader's own disk, is here
- * - so saving it is this page's own job, with no second request for a file the
- * reader already has and no URL to go stale. A document this page was only given
- * the URL of is the engine's to fetch and the browser's to save, so Ctrl+S is
- * left to the browser for it, which is what Ctrl+S has always meant there.
+ * A document a host handed over, or one the reader opened from their own disk,
+ * is here - and those bytes are the reader's own file, which is what saving it
+ * has to write back out, byte for byte. A document this page was only given the
+ * URL of is not here, and is written out by the engine that read it instead:
+ * see `documentBytes`.
  */
 let saving: { bytes: BlobPart; name: string } | null = null;
 
@@ -742,6 +744,39 @@ function savable(source: Source, label: string): { bytes: BlobPart; name: string
   if (typeof Blob !== 'undefined' && source instanceof Blob) return { bytes: source, name };
   if (source instanceof ArrayBuffer || ArrayBuffer.isView(source)) return { bytes: source as BlobPart, name };
   return null;
+}
+
+/**
+ * The document's own bytes, for the two things a reader does with a document
+ * besides read it: keep it, and print it.
+ *
+ * What this page is holding comes back untouched, because it *is* the document -
+ * the reader's file, or the one a host fetched for them. A document this page
+ * only has the URL of is written out by the engine that read it: the same
+ * document, in MuPDF's own copy of it, with no second trip over the network for
+ * bytes that have been read once already and no dependence on the server that
+ * served them still being willing to.
+ *
+ * `fresh` asks for that engine copy even when the page is holding bytes, which
+ * is what printing an encrypted document needs: the file still carries the
+ * password, and the browser's own PDF viewer - the thing a printer is handed -
+ * would ask for it in a frame nobody can see. MuPDF writes the document out
+ * without it, because the page has already answered for it.
+ */
+async function documentBytes(fresh = false): Promise<{ bytes: BlobPart; name: string } | null> {
+  if (!fresh && saving) return saving;
+  if (!viewer) return null;
+  // Read before the wait: a document switched mid-write must not name its
+  // predecessor's bytes after it.
+  const name = fileNameFor(sourceName);
+  try {
+    // The cast is the same one `savable` makes: a `Uint8Array` from the engine
+    // is a `BlobPart` at runtime whatever TypeScript makes of a view's buffer.
+    return { bytes: (await viewer.save()) as BlobPart, name };
+  } catch (error) {
+    notify(`Cannot write the document out: ${String((error as Error)?.message ?? error)}`, 'error');
+    return null;
+  }
 }
 
 /** Write the open document out, under the name it is known by. */
@@ -754,6 +789,82 @@ function saveDocument({ bytes, name }: { bytes: BlobPart; name: string }): void 
   // The browser has read the blob the moment the download begins; a minute is
   // long enough for that and short enough not to hold a document all session.
   window.setTimeout(() => URL.revokeObjectURL(url), 60000);
+}
+
+/**
+ * Ctrl+S: the document, which is not the same thing as this page.
+ *
+ * What is on screen is a drawing of the document - SVG the viewer built, one
+ * text run at a time - and what a reader means by saving a PDF is the PDF. The
+ * browser's own answer here would be worse than that: with nothing but a page to
+ * save, it writes the HTML that happens to be drawing the document.
+ */
+async function saveCurrent(): Promise<void> {
+  const doc = await documentBytes();
+  if (doc) saveDocument(doc);
+}
+
+/* ----------------------------------------------------------------- print */
+
+/** How long a print waits for the frame to hold the document, at the most. */
+const PRINT_LOAD_MS = 4000;
+
+/** The blob the print frame is showing, so the copy before it can be let go. */
+let printUrl: string | null = null;
+
+/**
+ * Ctrl+P: the same bytes, given to the printer.
+ *
+ * A printer is not a screen. Handing it the pages on screen would re-lay every
+ * one of them out at the paper's width, and it would be printing the viewer's
+ * drawing of the document rather than the document. A PDF *is* a print format,
+ * and the browser prints one natively and exactly, so the document goes into a
+ * frame of its own (`#print`) and the frame is what is printed: nothing of this
+ * page - its SVG, its chrome, its scrolling - is part of the job.
+ *
+ * What is printed is the document as it is, not as it is being read: cropping,
+ * bionic reading and the zoom level belong to the reader's screen and none of
+ * them is a thing a printer can be asked for.
+ */
+async function printDocument(): Promise<void> {
+  // A document that had to be unlocked is written out by the engine rather than
+  // printed from the file this page is holding: that file still carries the
+  // password, and the browser's viewer would ask for it in a frame nobody can
+  // see. (`encrypted` stays true after MuPDF has been given the password.)
+  const doc = await documentBytes(info?.encrypted === true);
+  if (!doc) return;
+  const url = URL.createObjectURL(new Blob([doc.bytes], { type: 'application/pdf' }));
+  const previous = printUrl;
+  printUrl = url;
+  const frame = els.print;
+  const loaded = new Promise<void>((resolve) => frame.addEventListener('load', () => resolve(), { once: true }));
+  frame.src = url;
+  // The browser has read the blob into the frame the moment it loads it; a
+  // minute is long enough for that and short enough not to hold a copy of a
+  // document that has already been replaced.
+  if (previous) window.setTimeout(() => URL.revokeObjectURL(previous), 60000);
+  // A frame that has loaded the viewer is a print that starts immediately. One
+  // that never says it has is one that is not going to print at all, and waiting
+  // on it forever is worse than printing into it anyway.
+  await Promise.race([loaded, new Promise<void>((resolve) => window.setTimeout(resolve, PRINT_LOAD_MS))]);
+  const win = frame.contentWindow;
+  if (win) win.print();
+  else window.open(url, '_blank');
+}
+
+/**
+ * Let go of the document the printer was given.
+ *
+ * The frame is kept between prints, because a frame that has already loaded the
+ * browser's PDF viewer is a print that starts at once - but the document in it
+ * is a document, held by that viewer as well as by this page, and opening
+ * another one is the moment it is worth nothing.
+ */
+function releasePrint(): void {
+  if (!printUrl) return;
+  URL.revokeObjectURL(printUrl);
+  printUrl = null;
+  els.print.removeAttribute('src');
 }
 
 /**
@@ -774,6 +885,9 @@ async function openSource(source: Source, host?: HostDocument | null): Promise<v
   sourceName = host?.url ? urlName(host.url) : label;
   busy++;
   saving = null;
+  // The document the printer was given is not this one: let it go with the
+  // document it belonged to.
+  releasePrint();
   // Whatever the reader did to the document that is being replaced, write it down
   // now: a settings change within the debounce window would otherwise be lost by
   // the switch.
@@ -1077,13 +1191,16 @@ window.addEventListener('keydown', (event) => {
     event.preventDefault();
     els.search.focus();
     els.search.select();
-  } else if (key === 's' && saving) {
-    // The bytes are here, so writing them is this page's own job: no second
-    // request for a file the reader already has, and it works for a document
-    // with no URL at all. A document this page only knows the URL of is left to
-    // the browser, which is what Ctrl+S has always meant there.
+  } else if (key === 's') {
+    // The document, not this page: a reader with a PDF open means the PDF, and
+    // what the browser would save instead is the HTML drawing it.
     event.preventDefault();
-    saveDocument(saving);
+    void saveCurrent();
+  } else if (key === 'p') {
+    // The document again, and for the same reason - what is on screen is a
+    // drawing of it, and a printer is handed the document itself.
+    event.preventDefault();
+    void printDocument();
   }
 });
 

@@ -1,5 +1,9 @@
 # Build the demo, publish it to GitHub Pages, and pack the extension.
 #
+# One workflow for both halves of the project, and named for what it does rather
+# than for where it publishes: the extension it packs is not a Pages artifact at
+# all.
+#
 # Pages is configured to take its source from Actions (Settings -> Pages ->
 # Source: "GitHub Actions"), so this workflow is the only thing that writes to
 # the site: there is no `gh-pages` branch to keep in sync.
@@ -29,7 +33,7 @@
 # positions with it); without it each run generates a key, prints the id it
 # produced, and produces an extension the browser sees as a new one.
 
-name: Pages
+name: Build
 
 on:
   push:

@@ -253,6 +253,43 @@ try {
     .catch(() => null);
   check('and only then does the host hear what opened', (told?.info?.pages ?? 0) > 1, JSON.stringify(told?.info ?? told));
 
+  // Printing an encrypted document: what goes to the printer is the document as
+  // the page has it, not the file the host handed over. That file still carries
+  // the password, and the browser's own viewer - the thing a printer is given -
+  // would ask for it in a frame nobody can see, so the page prints the copy
+  // MuPDF writes. Opening that copy is the proof: it needs no password, and the
+  // locked bytes would have thrown `PasswordRequiredError` here.
+  await frameState(
+    browser,
+    url,
+    `(() => {
+      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'p', ctrlKey: true, bubbles: true, cancelable: true }));
+      return true;
+    })()`,
+  );
+  const printed = await frameState(browser, url, `(async () => {
+    const deadline = Date.now() + 20000;
+    let frame = null;
+    while (Date.now() < deadline) {
+      frame = document.getElementById('print');
+      if (frame && frame.src.startsWith('blob:')) break;
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    if (!frame || !frame.src.startsWith('blob:')) return { printed: false };
+    const bytes = await (await fetch(frame.src)).arrayBuffer();
+    try {
+      const info = await window.webpdf.viewer().load(new Blob([bytes], { type: 'application/pdf' }));
+      return { printed: true, size: bytes.byteLength, pages: info.pageCount, encrypted: info.encrypted };
+    } catch (error) {
+      return { printed: true, size: bytes.byteLength, error: String(error?.name ?? error) };
+    }
+  })()`);
+  check(
+    'Ctrl+P prints it without the password',
+    printed?.printed === true && printed.pages > 1 && printed.encrypted === false,
+    JSON.stringify(printed),
+  );
+
   /* ---------------------------------- a host the page cannot serve */
 
   // A second load, so the two cases do not share a page: this host says it is

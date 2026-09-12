@@ -284,6 +284,37 @@ const pressEnter = async () => {
   await page.send('Input.dispatchKeyEvent', { type: 'keyUp', ...key });
 };
 
+/** Press Ctrl+<key> through the browser's own input pipeline, as a reader would. */
+const pressCtrl = async (key) => {
+  const virtualKey = key.toUpperCase().charCodeAt(0);
+  for (const type of ['keyDown', 'keyUp']) {
+    await page.send('Input.dispatchKeyEvent', {
+      type,
+      modifiers: 2, // ctrl
+      key,
+      code: `Key${key.toUpperCase()}`,
+      windowsVirtualKeyCode: virtualKey,
+      nativeVirtualKeyCode: virtualKey,
+    });
+  }
+  await new Promise((r) => setTimeout(r, 300));
+};
+
+/** Wait for a download to land, and to stop growing. */
+const waitForFile = async (dir, seconds) => {
+  const deadline = Date.now() + seconds * 1000;
+  while (Date.now() < deadline) {
+    const name = fs.readdirSync(dir).find((each) => !each.endsWith('.crdownload'));
+    if (name) {
+      const size = fs.statSync(path.join(dir, name)).size;
+      await new Promise((r) => setTimeout(r, 200));
+      if (size > 0 && fs.statSync(path.join(dir, name)).size === size) return { name, size };
+    }
+    await new Promise((r) => setTimeout(r, 250));
+  }
+  return null;
+};
+
 /** Wait for an expression *string* to become truthy (the page's number is in it). */
 const waitUntil = async (expression, label, timeout = 30000) => {
   const deadline = Date.now() + timeout;
@@ -1062,7 +1093,7 @@ try {
     input.dispatchEvent(new Event('change'));
   })()`);
   await waitForPage(3);
-  const here = await cropState();
+  const before = await cropState();
 
   console.log('— a rule is checked —');
   await page.evaluate(() => document.getElementById('crop-btn').click());
@@ -1093,7 +1124,7 @@ try {
   );
   const cropped = await cropState();
   console.log('after crop  : ' + JSON.stringify({ status: all, page: cropped.page, viewBox: cropped.viewBox, box: [cropped.pageWidth, cropped.pageHeight], elements: cropped.elements }));
-  console.log('kept in place: ' + JSON.stringify({ was: { page: here.page, top: here.pageTop, scrollY: here.scrollY }, now: { page: cropped.page, top: cropped.pageTop, scrollY: cropped.scrollY } }));
+  console.log('kept in place: ' + JSON.stringify({ was: { page: before.page, top: before.pageTop, scrollY: before.scrollY }, now: { page: cropped.page, top: cropped.pageTop, scrollY: cropped.scrollY } }));
 
   const [px, py, pw, ph] = (cropped.viewBox ?? '').split(/\s+/).map(Number);
   if (!cropped.checked.length) fail('"Enable all" checked nothing');
@@ -1105,11 +1136,11 @@ try {
   if (!(px > 0 && py >= 0 && pw > 0 && ph > 0)) fail(`the cropped viewBox is not a box: ${cropped.viewBox}`);
   if (!(px + pw <= 612.001 && py + ph <= 792.001)) fail(`the crop is not inside the page: ${cropped.viewBox}`);
   if (!(pw < 612 && ph < 792)) fail(`the crop did not trim the page: ${cropped.viewBox}`);
-  if (!(cropped.pageWidth < here.pageWidth && cropped.pageHeight < here.pageHeight)) fail('the page box did not follow the crop');
-  if (!(cropped.docHeight < here.docHeight)) fail('the document is no shorter than before the crop');
+  if (!(cropped.pageWidth < before.pageWidth && cropped.pageHeight < before.pageHeight)) fail('the page box did not follow the crop');
+  if (!(cropped.docHeight < before.docHeight)) fail('the document is no shorter than before the crop');
   // Nothing was removed to achieve it: same elements, same text runs.
-  if (cropped.elements !== here.elements) fail(`cropping changed the page's elements (${here.elements} -> ${cropped.elements})`);
-  if (cropped.texts !== here.texts || !cropped.texts) fail(`cropping changed the page's text (${here.texts} -> ${cropped.texts})`);
+  if (cropped.elements !== before.elements) fail(`cropping changed the page's elements (${before.elements} -> ${cropped.elements})`);
+  if (cropped.texts !== before.texts || !cropped.texts) fail(`cropping changed the page's text (${before.texts} -> ${cropped.texts})`);
   const slicedAll = await cutText();
   console.log('text sliced by the crop: ' + JSON.stringify(slicedAll));
   if (slicedAll?.cutCount) fail(`the crop cut through ${slicedAll.cutCount} piece(s) of text: ${JSON.stringify(slicedAll.cut)}`);
@@ -1143,8 +1174,8 @@ try {
     await waitForPage(3);
   }
   // The reader kept their page, and their place on it.
-  if (cropped.page !== here.page) fail(`the reader moved from page ${here.page} to ${cropped.page}`);
-  if (Math.abs(cropped.pageTop - here.pageTop) > 6) fail(`the page moved on screen by ${Math.abs(cropped.pageTop - here.pageTop)}px`);
+  if (cropped.page !== before.page) fail(`the reader moved from page ${before.page} to ${cropped.page}`);
+  if (Math.abs(cropped.pageTop - before.pageTop) > 6) fail(`the page moved on screen by ${Math.abs(cropped.pageTop - before.pageTop)}px`);
   // The bulk button says what is left to do: with everything on, the only move
   // left is back.
   if (!cropped.allHidden || cropped.noneHidden) fail('once every usable rule is on, "Disable all" should be the only bulk action');
@@ -1237,9 +1268,9 @@ try {
   const restored = await cropState();
   console.log('disable all : ' + JSON.stringify({ viewBox: back, box: [restored.pageWidth, restored.pageHeight], elements: restored.elements }));
   if (restored.checked.length) fail('"Disable all" left rules checked');
-  if (back !== here.viewBox) fail(`disabling every rule should restore the page exactly (${here.viewBox} -> ${back})`);
-  if (restored.pageWidth !== here.pageWidth || restored.pageHeight !== here.pageHeight) fail('the page box did not come back');
-  if (restored.docHeight !== here.docHeight) fail(`the document height did not come back (${here.docHeight} -> ${restored.docHeight})`);
+  if (back !== before.viewBox) fail(`disabling every rule should restore the page exactly (${before.viewBox} -> ${back})`);
+  if (restored.pageWidth !== before.pageWidth || restored.pageHeight !== before.pageHeight) fail('the page box did not come back');
+  if (restored.docHeight !== before.docHeight) fail(`the document height did not come back (${before.docHeight} -> ${restored.docHeight})`);
 
   // The reported failure, exactly as it was reported: the page-number rule on
   // its own, on page 5 of this paper, cut the foot off the text. A rule that
@@ -1801,6 +1832,57 @@ try {
   if (!/^1\/\d+$/.test(remoteHits.count)) fail(`the first example match should be selected, got ${remoteHits.count}`);
   if (remoteHits.bandsOnPage < 1) fail('the example matches are not boxed');
   if (remoteHits.activeHighlights !== 1) fail(`exactly one example match should be active, got ${remoteHits.activeHighlights}`);
+
+  // ------------------------------------------- the document, kept and printed
+  // Two keys that mean the document rather than this page. What is on screen is
+  // a drawing of the document - SVG the viewer built, one text run at a time -
+  // and the browser's own answers would both be about the page instead: Ctrl+S
+  // would write this HTML, and Ctrl+P would print the drawing of it.
+  console.log('— Ctrl+S saves the document, not the page —');
+  const downloads = path.join(here, 'out', 'downloads');
+  fs.rmSync(downloads, { recursive: true, force: true });
+  fs.mkdirSync(downloads, { recursive: true });
+  await browser.send('Browser.setDownloadBehavior', { behavior: 'allow', downloadPath: downloads, eventsEnabled: true });
+  await pressCtrl('s');
+  const saved = await waitForFile(downloads, 20);
+  const magic = saved ? fs.readFileSync(path.join(downloads, saved.name)).subarray(0, 5).toString('latin1') : '';
+  console.log('saved: ' + JSON.stringify(saved) + ' starting ' + JSON.stringify(magic));
+  if (!saved) fail('Ctrl+S wrote nothing');
+  else if (!saved.name.endsWith('.pdf')) fail(`Ctrl+S saved "${saved.name}", which is not a document`);
+  // This page is tens of kilobytes; the paper it is drawing is megabytes. That
+  // gap is the whole difference between the document and the HTML around it.
+  else if (saved.size < 500_000) fail(`Ctrl+S wrote ${saved.size} bytes, which is the page rather than the document`);
+  else if (magic !== '%PDF-') fail(`Ctrl+S wrote bytes starting ${JSON.stringify(magic)}, which is not a PDF`);
+
+  console.log('— Ctrl+P prints the document, not the page —');
+  await pressCtrl('p');
+  const printed = await page.evaluate(`(async () => {
+    const deadline = Date.now() + 20000;
+    let frame = null;
+    while (Date.now() < deadline) {
+      frame = document.getElementById('print');
+      if (frame && frame.src.startsWith('blob:')) break;
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    if (!frame || !frame.src.startsWith('blob:')) return { ok: false };
+    const res = await fetch(frame.src);
+    const bytes = new Uint8Array(await res.arrayBuffer());
+    return {
+      ok: true,
+      type: res.headers.get('content-type'),
+      size: bytes.length,
+      magic: String.fromCharCode(...bytes.slice(0, 5)),
+    };
+  })()`);
+  console.log('printed: ' + JSON.stringify(printed));
+  if (!printed.ok) fail('Ctrl+P put no document in the print frame');
+  else if (printed.type !== 'application/pdf') fail(`the print frame holds ${printed.type}`);
+  else if (printed.magic !== '%PDF-') fail(`the print frame holds ${JSON.stringify(printed.magic)}, which is not a PDF`);
+  // The same document Ctrl+S wrote, written out by the engine a second time: a
+  // printer is handed the document, not the SVG pages on screen.
+  else if (!saved || Math.abs(printed.size - saved.size) > 4096) {
+    fail(`the printed document is ${printed.size} bytes and the saved one ${saved?.size ?? 0}`);
+  }
 
   await shot(out);
 } finally {

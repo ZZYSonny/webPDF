@@ -487,6 +487,24 @@ export class PdfViewer {
     return info;
   }
 
+  /**
+   * Write the open document out: a fresh copy of what this viewer is holding,
+   * compressed, with no encryption on it.
+   *
+   * Not the bytes the document was opened from - those are the reader's own
+   * file, and this is MuPDF writing that document out again - so it is for
+   * handing the document on rather than for keeping a file byte for byte. It is
+   * what printing is built on: a PDF is exactly what a printer wants, and a
+   * password the printer does not have is exactly what it must not be handed.
+   *
+   * Throws `DocumentNotOpenError` when there is nothing open, and when the
+   * engine cannot write a document out at all.
+   */
+  async save(): Promise<Uint8Array> {
+    if (!this.engine.save) throw new Error('This engine cannot write the document out');
+    return await this.engine.save();
+  }
+
   setDocument(info: DocumentInfo): void {
     this.info = info;
     this.docSeq++;

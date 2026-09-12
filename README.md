@@ -164,6 +164,21 @@ viewer.setZoom(2);
 viewer.destroy();
 ```
 
+`viewer.save()` writes the open document out again — the same document, in
+MuPDF's copy of it, compressed and with any encryption taken off:
+
+```ts
+const bytes = await viewer.save();   // a Blob, a download, a printer
+```
+
+That is not the file the document was opened from — a reader who chose a file
+gets *that* file back from a save, byte for byte, which is the page's business
+rather than the viewer's — so `save()` is for handing the document on: to a
+download, to another tool, or to a printer. It is what Ctrl+P in the demo is
+built on, and what makes printing work for a document that had to be unlocked:
+the file still carries the password, and whatever is handed a PDF to print does
+not have it.
+
 Only the pages near the viewport are ever in the DOM. Everyone else is an
 absolutely positioned box whose geometry was computed up front, so zooming
 restyles boxes and never re-renders a page.
@@ -612,6 +627,19 @@ viewer:
   own button, there is no chrome for it - returns to the position a link was
   clicked from. The demo does not take a link over: `onEvent` returning `false`
   is the hook for a host that wants to.
+* **Ctrl+S and Ctrl+P mean the document, not this page.** Both keys are
+  overridden, because the browser's own answers to them are about the HTML that
+  happens to be drawing the document: Ctrl+S would save the page, and Ctrl+P
+  would print it — SVG the viewer built, laid out again at the paper's width, with
+  none of the document's own idea of a page in it. Saving writes the bytes the
+  viewer is holding (the reader's file, or the one a host handed over, under the
+  document's own name); a document the page only has the URL of is written out by
+  MuPDF instead, so there is no second request for bytes that have been read once
+  already. Printing hands those same bytes to a frame of their own — a PDF is what
+  a printer wants, and the browser prints one natively and exactly — so the page's
+  SVG, its chrome and its scrolling are not part of the job. What is printed is
+  the document as it is: cropping, bionic reading and the zoom level belong to the
+  screen and are not things a printer can be asked for.
 
 ### Headless rendering
 
@@ -623,6 +651,7 @@ const engine = new PdfEngine();
 await engine.open(bytes);
 const page = await engine.renderPage(0, { embedFonts: true, responsive: false });
 console.log(page.svg, page.stats);
+await engine.save();          // the document written out again, unencrypted
 
 // or stream a whole document to standalone SVG files
 for await (const page of renderDocument(bytes, { embedFonts: true })) {
@@ -712,9 +741,10 @@ Three mechanisms, in order of how early they act:
 The gaps, honestly: a PDF opened in the second between installing the extension
 and the worker's first start (the rule is written then) lands in Chrome's viewer,
 and reloading it works; a link with a `download` attribute is opened rather than
-saved, so Ctrl+S in the viewer — which writes the bytes it is holding, under the
-document's own name — is the way to save one; and a PDF inside another extension's
-sandboxed viewer is not a navigation this extension can see.
+saved, so Ctrl+S in the viewer — which writes the document it is holding, under
+its own name, and prints the same bytes on Ctrl+P — is the way to save one; and a
+PDF inside another extension's sandboxed viewer is not a navigation this extension
+can see.
 
 ### The memory
 
@@ -781,8 +811,10 @@ again from its toolbar button. Everything else is the page's own:
 
 * the position, the settings and the hundred-document memory (`demo/memory.ts`);
 * the keyboard — the extension focuses the frame and then has no keys of its own,
-  so Ctrl+F, Ctrl+O, Ctrl+0/± and Ctrl+S are the viewer's own handlers;
-* saving — a write of the bytes the page is already holding;
+  so Ctrl+F, Ctrl+O, Ctrl+0/±, Ctrl+S and Ctrl+P are the viewer's own handlers;
+* saving and printing — a write of the bytes the page is already holding, and the
+  same bytes handed to the browser's own PDF viewer to print, which is why
+  neither key writes or prints the page the document is drawn on;
 * the password — a card in the page's own document. A cross-origin frame may not
   raise a `window.prompt`, but it can draw a field, and the page drawing the
   document is the right place to ask for the key to it.
@@ -912,7 +944,9 @@ The library was written with content scripts in mind:
 `PdfEngineLike` is exported, and `WorkerEngine` is the reference implementation
 of it, so a different transport (an extension's offscreen document, a shared
 worker, a remote renderer) only needs `open` / `renderPage` / `drainNewFonts` /
-`close` - plus `measureCrop`, without which a viewer simply does not crop.
+`close` - plus `measureCrop`, without which a viewer simply does not crop, and
+`save`, without which a page can still write out a document it was handed the
+bytes of but not one it only knows the URL of.
 
 ---
 
@@ -950,7 +984,8 @@ src/
                             page, pages installed at a quiet moment, pages
                             prepared and installed ahead while the reader rests
 demo/                       the demo application (the Vite root, and the site)
-  index.html                the page: the bar, the panels, one viewer container
+  index.html                the page: the bar, the panels, one viewer container,
+                            and the frame a print goes into
   main.ts                   the bar, the card, and everything wired to them
   memory.ts                 where the reader was: the hundred most recent documents
   papers.mjs                the corpus: public URLs, and where they are cached
@@ -969,8 +1004,8 @@ demo/                       (continued)
 ext/
   manifest.json             MV3 manifest; the build adds the version and the key
   src/
-    background.ts           the worker: interception, the handover, the memory
-    viewer.ts               the extension page: fetch, hand over, remember, keys
+    background.ts           the worker: interception, the handover token, the rule
+    viewer.ts               the extension page: fetch the bytes, hand them over
     viewer.html, viewer.css the shell: one frame, a progress line, one error card
     lib/url.ts              the one question the worker asks about an address
     chrome.d.ts             the two dozen API members this extension uses, typed
@@ -978,6 +1013,7 @@ tests/
   *.test.ts                 Node tests (real PDFs through the real wasm)
   extension.test.ts         which URLs the extension opens, and the crx, in Node
   memory.test.ts            the viewer's memory, in Node (no browser, no extension)
+  engine-save.test.ts       writing a document out, encrypted documents included
   pdf-cache.mjs             fetches the corpus, lists it, clears it
   browser/                  headless-Chromium verification over CDP
     demo.mjs                the built demo, driven through its own UI
@@ -1059,12 +1095,13 @@ overlapping ink is yellow, so any systematic offset or missing glyph is obvious.
 
 ### Publishing
 
-`.github/workflows/pages.yml` typechecks, builds `dist/demo` and deploys it with
+`.github/workflows/build.yml` typechecks, builds `dist/demo` and deploys it with
 `actions/deploy-pages` on every push to `main` (and on demand from the Actions
-tab). It deliberately does **not** run the test suites: rendering a paper and
-rasterising pages is a fine thing to do on a developer's machine and a poor gate
-between a commit and the published site. It does not fetch the corpus either -
-the published build has no use for it.
+tab) — and it is named for what it does rather than for where it publishes,
+because publishing the site is only half of it. It deliberately does **not** run
+the test suites: rendering a paper and rasterising pages is a fine thing to do on
+a developer's machine and a poor gate between a commit and the published site. It
+does not fetch the corpus either - the published build has no use for it.
 
 The same job builds the extension and uploads the signed `.crx` as an artifact —
 one job, because the extension frames the site that job publishes and a run that
@@ -1161,9 +1198,10 @@ is referenced relatively.
   (or a `Content-Disposition: attachment` response for a URL that ends in `.pdf`)
   is opened rather than saved. That is the price of intercepting before the
   request: whether a navigation is a download is not something a redirect rule can
-  see. Ctrl+S in the viewer writes the bytes it was handed, under the document's
-  own name — which means no second request and works for a document with no URL at
-  all, but the name comes from the URL rather than from `Content-Disposition`.
+  see. Ctrl+S in the viewer writes the document it is holding, under the
+  document's own name — which means no second request and works for a document
+  with no URL at all, but the name comes from the URL rather than from
+  `Content-Disposition`.
 * **The extension's viewer comes over the network.** The extension carries the
   interception and the handover, not the viewer: it frames the published page, so
   the first document after the browser's cache goes cold needs
@@ -1181,10 +1219,17 @@ is referenced relatively.
   empty, and a reader who reaches the same document through two different viewer
   origins (a local `vite preview`, say, and the published site) has two memories.
 * **The keyboard belongs to the viewer, so the keys are the viewer's.** Ctrl+F,
-  Ctrl+O, Ctrl+0/± and Ctrl+S are the viewer's own handlers, which is why they
-  behave the same whether the page is framed by the extension or opened directly.
-  A shortcut the viewer has no handler for is the browser's, as it always was —
-  the extension does not add any of its own.
+  Ctrl+O, Ctrl+0/±, Ctrl+S and Ctrl+P are the viewer's own handlers, which is why
+  they behave the same whether the page is framed by the extension or opened
+  directly. A shortcut the viewer has no handler for is the browser's, as it
+  always was — the extension does not add any of its own.
+* **Printing is the browser's print of the document, not of the view.** Ctrl+P
+  hands the browser's own PDF viewer a copy of the document and prints that, so
+  the paper gets the pages as the PDF has them: bionic reading, a crop, the zoom
+  level and the reader's scroll position are all screen-only and none of them
+  reaches the printer. There is no print stylesheet and no per-page control — a
+  page range or a paper size belongs in the browser's print dialog, which is the
+  only place that knows what the printer can do.
 * **The worker path is verified in Chromium only.** It relies on module workers
   and `CompressionStream`, both of which are widely available, but the fallback
   exists precisely because worker startup can be blocked by a host's CSP.

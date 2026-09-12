@@ -24,7 +24,7 @@ import type { CropRuleId } from '../core/crop.ts';
 
 interface Request {
   id: number;
-  method: 'probe' | 'open' | 'renderPage' | 'measureCrop' | 'drainNewFonts' | 'trimCaches' | 'close';
+  method: 'probe' | 'open' | 'renderPage' | 'measureCrop' | 'save' | 'drainNewFonts' | 'trimCaches' | 'close';
   args: unknown[];
 }
 
@@ -42,6 +42,7 @@ const handlers = {
     e.renderPage(args[0] as number, args[1] as RenderOptions | undefined),
   measureCrop: (e: PdfEngineLike, args: unknown[]) =>
     e.measureCrop?.(args[0] as number, args[1] as CropRuleId[]) ?? null,
+  save: (e: PdfEngineLike) => e.save?.() ?? null,
   drainNewFonts: (e: PdfEngineLike) => e.drainNewFonts(),
   trimCaches: (e: PdfEngineLike, args: unknown[]) => e.trimCaches?.(args[0] as number[]),
   close: (e: PdfEngineLike) => e.close(),
