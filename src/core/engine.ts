@@ -12,6 +12,7 @@ import * as mupdf from 'mupdf';
 import { scanGlyphOutlines, scanGlyphPlacements } from './svg/glyphs.ts';
 import { upgradeGlyphsToText } from './svg/text-upgrade.ts';
 import { FontRegistry, type FontAsset } from './font/registry.ts';
+import { DocumentFontPlan } from './font/plan.ts';
 import { debug } from './debug.ts';
 import { inlineFontCss, namespaceSvgIds, readSvgDimensions, rewriteSvgRoot, stripXmlProlog } from './svg/package.ts';
 import { injectSvgLinks, type PageLink } from './links.ts';
@@ -142,6 +143,19 @@ export interface EngineOptions {
   /** Embed raw TrueType instead of WOFF (bigger, but no zlib needed). */
   disableCompression?: boolean;
   onWarn?: (message: string) => void;
+  /**
+   * Plan the document's fonts up front, down to this many pages. **Off unless
+   * given**: a document with no `preplanPages` keeps the per-page fonts.
+   *
+   * A page's own font is a new `@font-face` for that page, and registering a
+   * face re-lays-out the document it lands in. A document the font plan can
+   * cover whole gets one face per *font*, all of them built before any page is
+   * laid out, so nothing registers while the reader is scrolling. The plan costs
+   * a text-only walk of the document (a few milliseconds a page) plus building
+   * each face, so a document past this many pages is planned as it goes instead,
+   * a window ahead of the reader. See `core/font/plan.ts`.
+   */
+  preplanPages?: number;
 }
 
 /**
@@ -442,10 +456,17 @@ export class PdfEngine implements PdfEngineLike {
   private measured = 0;
   private info: DocumentInfo | null = null;
   private readonly opts: EngineOptions;
+  /** One face per font for the whole document, when it can be had. */
+  private plan: DocumentFontPlan | null = null;
 
   constructor(opts: EngineOptions = {}) {
     this.opts = opts;
     this.registry = new FontRegistry({ disableCompression: opts.disableCompression, onWarn: opts.onWarn });
+  }
+
+  /** The faces the document font plan has built, for a host that wants them all. */
+  plannedFonts(): FontAsset[] {
+    return this.plan?.families() ?? [];
   }
 
   /** Every `@font-face` rule discovered so far, newest last. */
@@ -484,6 +505,21 @@ export class PdfEngine implements PdfEngineLike {
     }
     this.doc = doc;
     this.info = this.readInfo(doc);
+    // Off unless a host asks for it. The plan works - every face of a planned
+    // document is registered before the first page is drawn, and none after -
+    // but it changes the two things a rebuilt font's metrics are made of: a
+    // document-wide font's ascent comes from every glyph in the document rather
+    // than from one page's, and its advances are the program's instead of the
+    // distance to the next glyph on the page. Both are more accurate and both
+    // move a `<text>` element's box a fraction of a point, which is enough to
+    // trip the crop suite's guard against a crop slicing a line of text. That is
+    // being settled before this becomes the default; until then the per-page
+    // fonts are what a document gets.
+    this.plan =
+      this.opts.preplanPages === undefined
+        ? null
+        : new DocumentFontPlan({ preplanPages: this.opts.preplanPages, onWarn: this.opts.onWarn });
+    if (this.plan) await this.plan.cover(doc, 0, this.registry);
     return this.info;
   }
 
@@ -607,6 +643,10 @@ export class PdfEngine implements PdfEngineLike {
     const textMode = opts.textMode ?? 'auto';
     const doc = this.doc;
     if (!doc) throw new DocumentNotOpenError();
+    // Keep the plan level with the page being rendered: a planned font is one
+    // face for the whole document, so the sooner it is planned the fewer faces
+    // the document ever registers.
+    if (this.plan) await this.plan.cover(doc, index, this.registry);
     const page = this.loadPage(index);
     const links = opts.links === false ? [] : readLinks(doc, page);
     const content = await this.measureCrop(index, opts.crop ?? []);
@@ -652,9 +692,14 @@ export class PdfEngine implements PdfEngineLike {
       if (placements.length > 0) {
         debug('renderPage: plan fonts', placements.length, 'placements', outlines.size, 'outlines');
         const text = readText(page);
-        const plan = await this.registry.planPage(outlines, placements, {
-          letters: glyphLetters(text.chars, placements),
-        });
+        const letters = glyphLetters(text.chars, placements);
+        // The document plan first: a font it knows is one face shared by every
+        // page, and the page never registers anything of its own. A page it
+        // cannot place - a font it never saw, or a glyph it never drew - falls
+        // back to building the page's own font, which is always correct.
+        const plan =
+          (await this.plan?.planPage(outlines, placements, { letters })) ??
+          (await this.registry.planPage(outlines, placements, { letters }));
         debug('renderPage: planned', plan.fonts.size, 'fonts');
         stats.fontsBuilt = plan.built;
         stats.fontsReused = plan.reused;
@@ -746,6 +791,7 @@ export class PdfEngine implements PdfEngineLike {
     }
     this.info = null;
     this.drained = 0;
+    this.plan = null;
     this.registry = new FontRegistry({ disableCompression: this.opts.disableCompression, onWarn: this.opts.onWarn });
   }
 }

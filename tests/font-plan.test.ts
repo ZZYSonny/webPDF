@@ -24,6 +24,7 @@ import * as mupdf from 'mupdf';
 
 import { FontRegistry } from '../src/core/font/registry.ts';
 import { DocumentFontPlan } from '../src/core/font/plan.ts';
+import { PdfEngine } from '../src/core/engine.ts';
 import { scanGlyphOutlines, scanGlyphPlacements } from '../src/core/svg/glyphs.ts';
 import { glyphLetters, ligatureCode } from '../src/core/svg/ligatures.ts';
 import { upgradeGlyphsToText } from '../src/core/svg/text-upgrade.ts';
@@ -226,5 +227,56 @@ test('a ligature keeps the character that stands for both letters', async () => 
     assert.ok(checked > 0, 'no ligature was found to check');
   } finally {
     doc.destroy();
+  }
+});
+
+/**
+ * The point of the whole plan: a document whose fonts it covers registers every
+ * face it will ever need *before* the first page is laid out, so nothing is
+ * registered while the reader is scrolling - which is the cost the viewer's
+ * per-page frames exist to hide.
+ */
+test('a planned engine hands every face over at the first page, and none after', async () => {
+  const document = documents[0];
+  assert.ok(document, 'no corpus document could be read');
+
+  const engine = new PdfEngine({ preplanPages: 64 });
+  try {
+    await engine.open(new Uint8Array(fs.readFileSync(document.file)));
+    assert.ok(engine.plannedFonts().length > 0, 'the engine planned nothing');
+
+    const first = await engine.renderPage(0);
+    const upFront = engine.drainNewFonts();
+    assert.ok(upFront.length > 0, 'no face was handed over for the first page');
+    assert.equal(upFront.length, engine.plannedFonts().length, 'the first page should bring every planned face');
+
+    let later = 0;
+    for (let index = 1; index < 4; index++) {
+      await engine.renderPage(index);
+      later += engine.drainNewFonts().length;
+    }
+    assert.equal(later, 0, `${later} faces were still being registered after the first page`);
+    assert.ok(first.stats.glyphsAsText > 100, `only ${first.stats.glyphsAsText} glyphs became text`);
+    console.log(
+      `      ${upFront.length} faces handed over at page 1, ${later} on pages 2-4, ` +
+        `${first.stats.glyphsAsText} glyphs as text with ${first.stats.glyphsAsOutlines} left as outlines`,
+    );
+  } finally {
+    engine.close();
+  }
+});
+
+test('a document is left to its own fonts unless the plan is asked for', async () => {
+  const document = documents[0];
+  assert.ok(document, 'no corpus document could be read');
+
+  const engine = new PdfEngine();
+  try {
+    await engine.open(new Uint8Array(fs.readFileSync(document.file)));
+    assert.equal(engine.plannedFonts().length, 0, 'nothing should be planned without `preplanPages`');
+    const page = await engine.renderPage(0);
+    assert.ok(page.fonts.length > 0, 'the page still needs its own fonts');
+  } finally {
+    engine.close();
   }
 });

@@ -70,31 +70,44 @@ const EXTRACT_BOX: [number, number, number, number] = [-4, -4, 4, 4];
 export function programsOnPage(page: mupdf.Page): Map<string, FontProgram> {
   const out = new Map<string, FontProgram>();
   if (!(page instanceof mupdf.PDFPage)) return out;
-  const fonts = page.getObject().getInheritable('Resources')?.get('Font');
+  // A page of a document that is not really a PDF can have no object at all, and
+  // asking a null object for its resources is an error rather than an empty
+  // answer. There is nothing to read either way.
+  let fonts: mupdf.PDFObject | null = null;
+  try {
+    const object = page.getObject();
+    fonts = object ? (object.getInheritable('Resources')?.get('Font') ?? null) : null;
+  } catch {
+    return out;
+  }
   if (!fonts || fonts.isNull()) return out;
 
-  fonts.forEach((font) => {
-    const subtype = String(font.get('Subtype') ?? '');
-    const descriptors: mupdf.PDFObject[] = [];
-    if (subtype.includes('Type0') || subtype.includes('CIDFont')) {
-      const descendants = font.get('DescendantFonts');
-      for (let i = 0; i < descendants.length; i++) descriptors.push(descendants.get(i).get('FontDescriptor'));
-    } else {
-      descriptors.push(font.get('FontDescriptor'));
-    }
-    for (const descriptor of descriptors) {
-      if (descriptor.isNull()) continue;
-      const name = String(descriptor.get('FontName') ?? '').replace(/^\//, '');
-      if (!name || out.has(name)) continue;
-      for (const key of PROGRAM_KEYS) {
-        const ref = descriptor.get(key);
-        if (ref.isNull()) continue;
-        const bytes = readStream(ref);
-        if (bytes) out.set(name, { name, key, bytes });
-        break;
+  try {
+    fonts.forEach((font) => {
+      const subtype = String(font.get('Subtype') ?? '');
+      const descriptors: mupdf.PDFObject[] = [];
+      if (subtype.includes('Type0') || subtype.includes('CIDFont')) {
+        const descendants = font.get('DescendantFonts');
+        for (let i = 0; i < descendants.length; i++) descriptors.push(descendants.get(i).get('FontDescriptor'));
+      } else {
+        descriptors.push(font.get('FontDescriptor'));
       }
-    }
-  });
+      for (const descriptor of descriptors) {
+        if (descriptor.isNull()) continue;
+        const name = String(descriptor.get('FontName') ?? '').replace(/^\//, '');
+        if (!name || out.has(name)) continue;
+        for (const key of PROGRAM_KEYS) {
+          const ref = descriptor.get(key);
+          if (ref.isNull()) continue;
+          const bytes = readStream(ref);
+          if (bytes) out.set(name, { name, key, bytes });
+          break;
+        }
+      }
+    });
+  } catch {
+    // A malformed font dictionary costs this page its programs, not the render.
+  }
   return out;
 }
 
