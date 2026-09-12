@@ -88,43 +88,57 @@ export function glyphLetters(
 
   // The characters at a point, found on a grid the size of the tolerance: a
   // page has thousands of each, and comparing every pair would be the only slow
-  // part of a render.
-  const cell = (v: number): number => Math.round(v / ANCHOR_EPSILON);
-  const grid = new Map<string, number[]>();
-  chars.forEach((c, index) => {
-    const key = `${cell(c.x)},${cell(c.y)}`;
+  // part of a render. A cell is the two rounded coordinates packed into one
+  // number rather than a string - the walk probes this map nine times a glyph,
+  // eighteen million times on a 756-page specification, and a template literal
+  // per probe was most of what that cost. Packing is safe: the map is only ever
+  // probed at the cell itself and its eight neighbours, and two cells that land
+  // on the same number are thousands of points apart, so the coordinate check
+  // below still decides what is at a point.
+  const grid = new Map<number, number[]>();
+  for (let index = 0; index < chars.length; index++) {
+    const c = chars[index];
+    const key = Math.round(c.y / ANCHOR_EPSILON) * 0x40000 + Math.round(c.x / ANCHOR_EPSILON);
     const bucket = grid.get(key);
     if (bucket) bucket.push(index);
     else grid.set(key, [index]);
-  });
-  const charsAt = (x: number, y: number): number[] => {
-    const cx = cell(x);
-    const cy = cell(y);
-    const found: number[] = [];
+  }
+
+  /**
+   * The last character standing at a point, or -1.
+   *
+   * Only that character is ever wanted, so the candidates are not collected and
+   * sorted: the largest index that is in the cell *and* within the tolerance is
+   * the one the sort would have put last.
+   */
+  const lastAt = (x: number, y: number): number => {
+    const cx = Math.round(x / ANCHOR_EPSILON);
+    const cy = Math.round(y / ANCHOR_EPSILON);
+    let best = -1;
     for (let dx = -1; dx <= 1; dx++) {
       for (let dy = -1; dy <= 1; dy++) {
-        const bucket = grid.get(`${cx + dx},${cy + dy}`);
+        const bucket = grid.get((cy + dy) * 0x40000 + (cx + dx));
         if (!bucket) continue;
-        for (const index of bucket) {
+        for (let i = 0; i < bucket.length; i++) {
+          const index = bucket[i];
+          if (index <= best) continue;
           const c = chars[index];
-          if (Math.abs(c.x - x) <= ANCHOR_EPSILON && Math.abs(c.y - y) <= ANCHOR_EPSILON) found.push(index);
+          if (Math.abs(c.x - x) <= ANCHOR_EPSILON && Math.abs(c.y - y) <= ANCHOR_EPSILON) best = index;
         }
       }
     }
-    return found.sort((a, b) => a - b);
+    return best;
   };
 
   // The character that starts each glyph: the last one standing at its origin.
-  const starts = placements.map((p) => {
-    const at = charsAt(p.matrix.e, p.matrix.f);
-    return at.length ? at[at.length - 1] : -1;
-  });
+  const starts = placements.map((p) => lastAt(p.matrix.e, p.matrix.f));
 
   const seen = new Map<string, string>();
   const disagreed = new Set<string>();
-  placements.forEach((p, index) => {
+  for (let index = 0; index < placements.length; index++) {
+    const p = placements[index];
     const start = starts[index];
-    if (start < 0) return;
+    if (start < 0) continue;
     const first = chars[start];
     // MuPDF names a glyph by the text it was shown with. For a ligature that is
     // usually only the first letter - the display list has no room for the
@@ -135,7 +149,7 @@ export function glyphLetters(
     // has them.
     const named = LIGATURE_LETTERS.get(p.code);
     const head = named?.slice(0, 1) ?? (p.code > 0 ? String.fromCodePoint(p.code) : first.text);
-    if (p.code > 0 && first.text !== head) return;
+    if (p.code > 0 && first.text !== head) continue;
 
     let letters = first.text;
     const next = starts[index + 1];
@@ -147,13 +161,13 @@ export function glyphLetters(
     // A glyph named after a ligature whose letters the text device does not
     // spell that way is one the two devices read differently, and nothing about
     // it is certain: `fi` and `fx` are not the same claim.
-    if (named !== undefined && letters !== named) return;
+    if (named !== undefined && letters !== named) continue;
 
     const key = glyphKey(p.fontId, p.gid);
     const known = seen.get(key);
     if (known === undefined) seen.set(key, letters);
     else if (known !== letters) disagreed.add(key);
-  });
+  }
 
   for (const [key, letters] of seen) {
     if (!disagreed.has(key)) out.set(key, letters);

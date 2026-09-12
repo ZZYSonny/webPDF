@@ -313,14 +313,14 @@ drawn a frame at a time, and the document becomes one document when it is ready:
 
 | document | pages | open | plan ready after | faces | bytes |
 |---|---|---|---|---|---|
-| *Attention* | 15 | 0.20 s | 0.73 s | 33 | 94 kB |
-| *ResNet* | 12 | 0.13 s | 0.54 s | 28 | 83 kB |
-| *GPT-4* | 100 | 0.05 s | 2.32 s | 77 | 249 kB |
-| specification | 756 | 0.11 s | 18.30 s | 48 | 216 kB |
+| *Attention* | 15 | 0.13 s | 0.79 s | 33 | 94 kB |
+| *ResNet* | 12 | 0.05 s | 0.49 s | 28 | 82 kB |
+| *GPT-4* | 100 | 0.02 s | 1.29 s | 77 | 249 kB |
+| specification | 756 | 0.10 s | 7.93 s | 48 | 216 kB |
 
 (`node tests/font-plan-cost.mjs`; `tests/font-plan.test.ts` prints the first row
 from inside the engine, where the document has been read once already: *Attention*
-opens in **58 ms with the plan not ready**, and its plan is ready 428 ms later.) Planning the document *whole* is what keeps
+opens in **30 ms with the plan not ready**, and its plan is ready 383 ms later.) Planning the document *whole* is what keeps
 the face count small, and the background is what keeps it out of the way. The
 alternative — a face per page's glyph set, which is what
 `EngineOptions.planFonts: false` does and what the demo's `IFrame + Per Page
@@ -329,6 +329,33 @@ plan's 26, and 88 over *ResNet*'s 12 against 27, because a page's font is a
 subset of the glyphs that page happened to draw (`tests/font-plan.test.ts`), and
 every one of those extra families is registered into the document while the
 reader is reading it.
+
+Almost all of those eight seconds is the walk. `tests/font-no-walk.mjs`
+splits the plan's three passes over every page — the display list, the structured
+text, and the letters that pair the two — and measures the shortcut the programs
+themselves offer: read the page tree's font dictionaries for the programs
+(metadata only; no content stream is run), sweep `mupdf.Font.encodeCharacter` for
+the characters each program gives *itself*, and build one face per font from
+*every* glyph the program has. Over the corpus that is **9.8 s of walking and
+building against 1.3 s** — the specification's 7.9 s plan becomes **0.71 s**, and
+its 7.4 s of walk becomes 0.35 s of page-tree metadata, 0.10 s of naming and
+0.27 s of building — and the faces come out the same size, because the outlines
+are the program's either way. What it does not reproduce is the document's
+*text*: a program's charmaps are the font's claim about a glyph and a PDF's
+`/Encoding` and `/ToUnicode` are the document's, and they disagree for 2 of *Attention*'s 375 drawn glyphs, 2 of *ResNet*'s 313, 36 of
+*GPT-4*'s 488 (pdfTeX's FalseType faces) and 190 of the specification's 1586 (its
+Symbol subset carries no `cmap` at all) — so the shortcut still has to read the
+dictionaries to write the right characters. Reading the page tree's font
+dictionaries is the next thing to do; not reading the pages, the programs do
+already allow.
+
+The letters pass used to be the biggest single piece of the walk — 11.1 s of the
+specification's 17.4 s — and it was the grid: a template literal per character
+and per cell probe, twenty million of them, and an array sorted per glyph to
+keep one entry of it. It keeps the largest index directly now, and keys the grid
+with one packed number instead of a string: **4.7× on the function, and
+the specification's plan from 15.6 s to 7.9 s**. The output is unchanged, which
+the engine's own corpus tests hold it to.
 
 #### Cropping pages to their content
 
@@ -1200,7 +1227,13 @@ tests/
                             and a planned page draws what the per-page fonts drew
   font-plan-cost.mjs        what planning costs and saves, per corpus paper: the
                             table the viewer section quotes
+  font-no-walk.mjs          what one face per font costs when no page is read:
+                            the walk against the programs' own charmaps, and
+                            where the two disagree
   font-programs.mjs         what the corpus embeds, and what a browser takes
+  type1-program.mjs         a PFA/PFB read directly - charstrings, subrs, the
+                            encoding - for the conversion `font-no-walk.mjs`
+                            measures and does not take
   first-page-latency.mjs    what page 1 costs in each render mode, on the paper
                             whose plan is longest: the numbers quoted above
   pdf-cache.mjs             fetches the corpus, lists it, clears it
@@ -1384,7 +1417,12 @@ the workflow to point that somewhere else, or to nothing at all.
   instead does not work — measured with `tests/font-programs.mjs`, this Chromium
   refuses a Type 1 program (49 of the corpus's 52, and CSS Fonts has no format
   for one), a bare CFF table until it is wrapped in an sfnt, and a TrueType subset
-  until the `cmap` and `post` its producer left out are written in.
+  until the `cmap` and `post` its producer left out are written in. What a
+  program *can* answer on its own is what its glyphs are called: sweeping
+  `encodeCharacter` names them in about 7 ms a font, and `tests/font-no-walk.mjs`
+  measures how far that goes — 371 of *Attention*'s 375 drawn glyphs and 1281 of
+  the specification's 1586 — which is why the document's own encoding, and not
+  the font's, is still where the text has to come from.
   Reading the glyphs out of the program is what makes one face per *font* for the
   whole document possible: `src/core/font/plan.ts` walks the document once, text
   only, keeps the glyphs, the codes and the ligature letters of every font it
