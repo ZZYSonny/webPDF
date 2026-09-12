@@ -9,16 +9,21 @@
  *
  *   frames       a frame and its own fonts per page, nothing shared, and no
  *                plan at all - the mode a reader starts in;
- *   progressive  frames until the plan is ready, then one document;
+ *   progressive  frames until the plan is ready, then one document, each page
+ *                drawn again under the document's faces and its frame let go
+ *                once the new page has painted;
  *   global       one document, and nothing drawn until the plan is ready.
  *
- * Two things are on trial, and they are the reason the mode exists:
+ * Three things are on trial, and they are the reason the mode exists:
  *
  *   1. every mode shows a page without waiting for the plan, and none of them
  *      ever waits on a network or a timer to do it;
  *   2. in `frames`, the faces a page brings are registered in that page's own
  *      document - a page arriving cannot make the browser lay out any other
- *      page, which is the property the whole design is for.
+ *      page, which is the property the whole design is for;
+ *   3. in `progressive`, the handover to the document's faces is not something
+ *      the reader can see: a page that was on screen when the plan arrived
+ *      stays on screen through it, in one document or the other.
  *
  *   node tests/browser/modes.mjs [url]
  */
@@ -98,9 +103,35 @@ await page.send('Page.addScriptToEvaluateOnNewDocument', {
       return card;
     };
     window.__frameSeen = false;
+    /**
+     * Whether a slot is holding a page at all: the frame's own document while
+     * the pages are drawn one to a frame, the slot's child once they are one
+     * document. A slot that holds neither is a page the reader can only see as
+     * blank, which is what the switch must never produce.
+     */
+    const holds = (el) => {
+      const frame = el.querySelector('iframe');
+      if (frame?.contentDocument?.querySelector('svg.wpdf-page-svg')) return true;
+      return el.querySelector('svg.wpdf-page-svg') !== null;
+    };
+    // The pages that were on screen when the switch began, and the ones that
+    // stopped holding a page while it happened. The second list is the flash.
+    window.__paintedAtSwitch = null;
+    window.__lostPaint = [];
     const tick = () => {
       const sr = document.getElementById('viewer')?.shadowRoot;
       if (sr) {
+        const framed = window.webpdf?.pagesInFrames?.() ?? null;
+        if (framed === false && window.__paintedAtSwitch === null && window.__firstDraw) {
+          window.__paintedAtSwitch = [...sr.querySelectorAll('.wpdf-page')].filter(holds).map((el) => Number(el.dataset.page));
+        }
+        if (window.__paintedAtSwitch) {
+          for (const el of sr.querySelectorAll('.wpdf-page')) {
+            const page = Number(el.dataset.page);
+            if (!window.__paintedAtSwitch.includes(page) || holds(el)) continue;
+            if (!window.__lostPaint.includes(page)) window.__lostPaint.push(page);
+          }
+        }
         if (sr.querySelector('iframe')) window.__frameSeen = true;
         if (!window.__firstDraw) {
           const drawn = [...sr.querySelectorAll('.wpdf-page')].find((el) =>
@@ -139,6 +170,8 @@ async function openExample(mode) {
   await page.evaluate(() => {
     window.__firstDraw = null;
     window.__frameSeen = false;
+    window.__paintedAtSwitch = null;
+    window.__lostPaint = [];
     document.getElementById('example-btn').click();
   });
   const options = await page.evaluate(() =>
@@ -237,13 +270,19 @@ try {
     timeout: 120000,
   });
   const switchMs = Date.now() - switching;
-  // The pages are drawn again, under the document's faces, so the slot is not
-  // finished until its text is back.
+  /**
+   * The pages are drawn again under the document's faces, one at a time, and
+   * each frame is let go only once the page under it has painted - so the end of
+   * the switch is the last frame going, not the flag that says it started. And
+   * while that happens every page that was on screen at the start of it has to
+   * keep holding a page: the frame covers the redraw, and it is the repaint that
+   * must be waited for, not a blank the reader would see.
+   */
   const switched = await page.waitFor(
     () => {
       const state = window.__state();
       const one = state?.rows.find((row) => row.page === 1);
-      return one && !one.framed && one.chars > 0 && one.family !== null ? state : false;
+      return state && state.frames === 0 && one && !one.framed && one.chars > 0 && one.family !== null ? state : false;
     },
     { label: 'page 1 drawn again as one document', timeout: 60000 },
   ).catch(async (error) => {
@@ -251,6 +290,8 @@ try {
     throw error;
   });
   const one = switched.rows.find((row) => row.page === 1);
+  const lost = await page.evaluate('window.__lostPaint');
+  const painted = await page.evaluate('window.__paintedAtSwitch');
   console.log(
     '  ' +
       JSON.stringify({
@@ -258,12 +299,16 @@ try {
         frames: switched.frames,
         viewerDocumentFaces: switched.topFonts,
         page1: { framed: one.framed, chars: one.chars, family: one.family },
+        paintedAtSwitch: painted,
+        wentBlank: lost,
       }),
   );
   if (switched.frames !== 0) fail(`${switched.frames} page frame(s) survived the switch`);
   if (one.framed) fail('page 1 is still in a frame after the switch');
   if (switched.topFonts < 1) fail('the document was told about no faces at the switch');
   if (!one.chars) fail('the page came back from the switch with no text');
+  if (lost.length) fail(`page(s) ${lost.join(', ')} went blank while the frames were let go`);
+  else ok(`${painted.length} page(s) on screen at the switch stayed drawn throughout it`);
   if (one.family === framedFamily) {
     fail(`page 1 still uses the family it had before the switch (${one.family}), so it was not drawn again`);
   } else {

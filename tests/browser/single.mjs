@@ -5,7 +5,8 @@
  * document's fonts, because a `@font-face` belongs to a document and
  * registering one re-lays-out every text run in it. The plan builds one face
  * per *font*, in the background, and the moment it is ready the viewer writes
- * every face into its own document and replaces the frames with it. What that
+ * every face into its own document, draws the pages again under them, and lets
+ * each frame go once the page beneath it has painted. What that
  * buys, beyond a smooth boundary, is a page behaving like text: selection, the
  * clipboard, find-in-page and a caret are the browser's own over the whole
  * document, and a selection can cross a page boundary, which it could not

@@ -210,18 +210,38 @@ const open = async (value) => {
     console.log('  console: ' + JSON.stringify(page.consoleMessages.slice(-6)));
     throw error;
   }
-  await page.waitFor(() => window.webpdf.pagesInFrames() === false, {
-    label: `one document for ${value}`,
-    timeout: 120000,
-  });
+  await page.waitFor(
+    () => {
+      if (window.webpdf.pagesInFrames() !== false) return false;
+      // The pages are drawn again one at a time, and each frame is let go only
+      // once the page under it has painted, so "one document" is the last frame
+      // going and not the flag that says the handover has started.
+      const sr = document.getElementById('viewer')?.shadowRoot;
+      return (sr?.querySelectorAll('iframe').length ?? -1) === 0;
+    },
+    {
+      label: `one document for ${value}`,
+      timeout: 120000,
+    },
+  );
 };
 
 /**
  * The screenshot is a deliverable: `docs/demo.png` is the README's picture of
  * the app, so it is taken on the public example with a match boxed - the same
  * view a reader gets when they open the published demo.
+ *
+ * The toast is waited out first: it lives 3.5 s, and whether it is still up when
+ * the picture is taken depends on how long the save and the print before it
+ * took, which is not something the README's picture should be a race about.
  */
 const shot = async (file) => {
+  await page
+    .waitFor(() => document.getElementById('toast')?.hidden !== false, {
+      label: 'the toast to go',
+      timeout: 15000,
+    })
+    .catch(() => undefined);
   await page.screenshot(file);
   fs.copyFileSync(file, path.join(here, '..', '..', 'docs', 'demo.png'));
   console.log('screenshot: ' + file + ' (+ docs/demo.png)');
@@ -1727,16 +1747,24 @@ try {
    * document again, so a page arriving with a face of its own used to re-lay-out
    * the whole viewport. The engine plans the document's fonts - one face per
    * *font*, not per page - in the background, and the viewer writes all of them
-   * into its own document in one go the moment the plan is ready, replacing the
-   * frames the pages were drawn in until then. After that there is one document,
+   * into its own document in one go the moment the plan is ready, draws the
+   * pages again under them, and lets each frame go once the page beneath it has
+   * painted. After that there is one document,
    * no page is a document of its own, and a redraw (a fade on and off, which
    * re-renders every page) registers nothing at all.
    */
   console.log('— every face goes in once, when the plan is ready —');
-  await page.waitFor(() => window.webpdf.pagesInFrames() === false, {
-    label: 'the pages to become one document',
-    timeout: 90000,
-  });
+  await page.waitFor(
+    () => {
+      if (window.webpdf.pagesInFrames() !== false) return false;
+      const sr = document.getElementById('viewer')?.shadowRoot;
+      return (sr?.querySelectorAll('iframe').length ?? -1) === 0;
+    },
+    {
+      label: 'the pages to become one document',
+      timeout: 90000,
+    },
+  );
   const facesBefore = await page.evaluate('window.__allFaces()');
   const framesBefore = await page.evaluate(
     "document.getElementById('viewer').shadowRoot.querySelectorAll('iframe').length",

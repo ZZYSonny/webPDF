@@ -10,7 +10,7 @@ const viewer = await createViewer({ container: '#viewer', source: file });
 viewer.setZoom('fit-width');
 ```
 
-![the demo: a paper downloaded from arXiv, rendered as SVG with its real fonts, one line of chrome above it, every match of a search boxed, and a toast saying the document's fonts are planned and the pages are one document now](docs/demo.png)
+![the demo: a paper downloaded from arXiv, rendered as SVG with its real fonts, one line of chrome above it, and every match of a search boxed](docs/demo.png)
 
 ---
 
@@ -224,9 +224,10 @@ createViewer({
   per page (`EngineOptions.planFonts`). Nothing waits for that walk: until it is
   done each page is drawn with the faces *that page* drew, in a frame of its own,
   where registering them cannot touch another page; the moment it is done, the
-  viewer writes every planned face into its own document in one go and replaces
-  the frames with it. `renderMode` is exactly that story (`'progressive'`), a
-  frame per page for good (`'frames'`), or one document with nothing drawn until
+  viewer writes every planned face into its own document in one go, draws the
+  pages again under them, and lets each frame go only once the page under it has
+  painted. `renderMode` is exactly that story (`'progressive'`), a frame per page
+  for good (`'frames'`), or one document with nothing drawn until
   the plan is ready (`'global'`). The demo starts in `'frames'` and offers all
   three on the card; the library's own default is `'progressive'`.
 * A finished page is installed at a **quiet moment** — 150 ms after the view has
@@ -262,20 +263,28 @@ viewer now uses both: a **frame per page**, with that page's own faces, while th
 document's plan is being walked; then **one planned document**, where every face
 is registered in one write and none after it, so the pages are one document and
 the browser's own text behaviour - selection across a page boundary,
-find-in-page, a caret - is the reader's. The frames are not free (a document, an
-iframe, 675 nodes and ~0.18 MB per page, measured), which is why they are the
-interim rather than the destination, and why a host that wants one document from
-the first pixel asks for `renderMode: 'global'` and sees nothing until the plan
-is ready.
+find-in-page, a caret - is the reader's. The handover between the two is a page
+drawn again, not a page that went blank: the redrawn page is inserted *under* the
+frame that is already showing it, and the frame is let go once the page beneath
+it has painted (`font-display:block` makes that wait explicit - the families the
+markup names are loaded first). Measured with a screenshot taken every protocol
+round trip through the switch, on one page and across a page boundary: every
+frame of it is byte-identical to the one before. The frames are not free (a
+document, an iframe, 675 nodes and ~0.18 MB per page, measured), which is why
+they are the interim rather than the destination, and why a host that wants one
+document from the first pixel asks for `renderMode: 'global'` and sees nothing
+until the plan is ready.
 
 That is measured, not asserted. `tests/browser/modes.mjs` holds all three modes
 to it: in the frame mode the viewer's own document is told about **no face at
 all** while pages arrive, and the faces a page brings leave every page already on
 screen exactly as it was - the same face count in every frame, before and after;
-in the progressive mode the first page is on screen *before* the plan is ready
-and the switch then draws it again under the document's faces; in the global mode
-no frame ever exists. `tests/browser/single.mjs` counts the faces after the
-switch and finds **33, and 33 again after reading the document from end to end**,
+in the progressive mode the first page is on screen *before* the plan is ready,
+the switch draws it again under the document's faces, and every page that was on
+screen when the switch began keeps holding a page until the last frame is gone;
+in the global mode no frame ever exists. `tests/browser/single.mjs` counts the
+faces after the switch and finds **33, and 33 again after reading the document
+from end to end**,
 with no iframe anywhere in the viewer. The same count on the demo, page by page
 to the end of the paper, is 33 → 33 planned and 48 → 89 with `planFonts: false`;
 every one of those 41 later registrations is a whole-document re-layout while the
@@ -589,9 +598,11 @@ viewer:
   the session rather than of a document: the engine and the viewer are built once,
   for the mode in force when the first document is opened. *IFrame + Per Page
   Font* draws every page in its own frame with its own fonts and plans nothing;
-  *IFrame → Global Font* does that until the document's fonts are planned and then
-  replaces the frames with one document; *Global Font Only* shows nothing until
-  they are planned. The first is starred - a star is a recommendation and not a
+  *IFrame → Global Font* does that until the document's fonts are planned, then
+  draws the pages again under those faces and lets each frame go once the page
+  beneath it has painted, so the handover is one document without a blank page in
+  between; *Global Font Only* shows nothing until they are planned. The first is
+  starred - a star is a recommendation and not a
   state, the same as the crop menu's - and the row in force is the one the menu
   opens on and colours. The choice is written down with the document it was made
   for, like every other setting, so the next visit starts the way this one was set
@@ -1014,9 +1025,10 @@ The library was written with content scripts in mind:
   lay out every text run in that document again, so the faces have to be in place
   before the pages are: the engine plans the document's fonts in the background,
   one face per font, while the viewer draws a frame per page with the faces that
-  page brought. When the plan is ready the viewer writes every face in once and
-  replaces the frames with its own document. Nothing registers while the reader
-  scrolls, which is what makes one document possible — and with it selection
+  page brought. When the plan is ready the viewer writes every face in once,
+  draws the pages again under them, and lets each frame go once the page under it
+  has painted. Nothing registers while the reader scrolls, which is what makes
+  one document possible — and with it selection
   across a page boundary, find-in-page over the whole paper, and a caret that
   behaves; a host that needs those from the first pixel asks for
   `renderMode: 'global'`. A host page's CSP
@@ -1182,7 +1194,8 @@ tests/
     demo.mjs                the built demo, driven through its own UI
     single.mjs              one document: selection, clipboard, keys, wheel, faces
     modes.mjs               frames until the plan is ready, then one document: the
-                            three rendering modes, and the mode a reader keeps
+                            three rendering modes, the handover that is not a
+                            flash, and the mode a reader keeps
     ligature.mjs            the letters and the ligature glyph are the same pixels
     pinch.mjs               the pinch/zoom contract
     bridge.mjs              the host protocol: a new page, an old host
