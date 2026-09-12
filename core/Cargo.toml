@@ -1,0 +1,22 @@
+[package]
+name = "webpdf-core"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+description = "The PDF core of webPDF: MuPDF in Rust, emitting the page's final SVG itself"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "webpdf-core"
+path = "src/main.rs"
+
+[dependencies]
+mupdf = "0.8"
+# WOFF is a zlib stream per table. A pure-Rust deflate keeps the build free of C
+# beyond MuPDF's own, which is what lets the same crate compile to wasm.
+miniz_oxide = "0.8"
+
+[profile.release]
+opt-level = 3

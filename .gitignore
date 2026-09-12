@@ -10,3 +10,9 @@ tests/browser/out/
 # URLs, downloaded into .scratch/pdfs. A stray download here is a mistake.
 *.pdf
 ext/key.pem
+
+# Rust toolchain, cargo cache and emscripten SDK live in the workspace, not $HOME.
+.rustup/
+.cargo/
+.emsdk/
+core/target
