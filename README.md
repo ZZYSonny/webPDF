@@ -294,6 +294,18 @@ What the document says is the page's own text and not a rendering of it: a word
 set with a ligature copies as its letters, and `tests/browser/single.mjs` copies
 a selection that spans two pages and refuses any character the page never wrote.
 
+The interim is worth having because it is *fast*. `tests/first-page-latency.mjs`
+times page 1 from the open, on the GPT-4 report's 100 pages: **0.40 s** with a
+frame per page, **0.48 s** in the progressive mode, and **2.53 s** in the global
+one — the plan is **2.9 s** of work that costs the reader **86 ms**, and asking
+for one document from the first pixel costs them the whole of it. For that to be
+true the walk has to hand the thread back between its slices, and it is a
+*macrotask* it has to hand it back to: the slices are continuations of one
+another in the microtask queue, so a slice boundary that awaited an already
+resolved promise would hold the worker's whole message queue — an `open` still
+being rounded out, and the page the reader has just asked for — until the last
+page had been walked. `tests/font-plan.test.ts` holds the walk to that.
+
 Planning is not free, and it is not free of the reader either — which is the
 whole reason it runs behind the frames. `open` costs the document read and
 nothing else; the plan is then walked and built in the background while pages are
@@ -1189,6 +1201,8 @@ tests/
   font-plan-cost.mjs        what planning costs and saves, per corpus paper: the
                             table the viewer section quotes
   font-programs.mjs         what the corpus embeds, and what a browser takes
+  first-page-latency.mjs    what page 1 costs in each render mode, on the paper
+                            whose plan is longest: the numbers quoted above
   pdf-cache.mjs             fetches the corpus, lists it, clears it
   browser/                  headless-Chromium verification over CDP
     demo.mjs                the built demo, driven through its own UI

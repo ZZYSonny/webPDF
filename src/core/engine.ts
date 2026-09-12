@@ -248,6 +248,34 @@ export class DocumentNotOpenError extends Error {
   }
 }
 
+/**
+ * One turn of the event loop, as a *macrotask*.
+ *
+ * The plan walks in slices, and a slice boundary has to be a real turn: the
+ * walk's slices are continuations of one another in the microtask queue, so a
+ * boundary that awaited an already-resolved promise would go straight on to the
+ * next page and nothing else would run until the walk was over - not the
+ * worker's message queue, so an `open` still being answered and a page the
+ * reader has asked for would both wait for the whole walk, and not the page
+ * itself when the engine is inline.
+ *
+ * A message channel rather than `setTimeout(0)`: the same turn of the event
+ * loop, without the clamp a nested timer picks up - a corpus paper is a few
+ * hundred slices, so the clamp would be a tax on the plan for nothing.
+ */
+function turn(): Promise<void> {
+  if (typeof MessageChannel !== 'function') return new Promise((resolve) => setTimeout(resolve, 0));
+  const channel = new MessageChannel();
+  return new Promise((resolve) => {
+    channel.port1.onmessage = () => {
+      channel.port1.close();
+      channel.port2.close();
+      resolve();
+    };
+    channel.port2.postMessage(0);
+  });
+}
+
 async function readSource(source: PdfSource): Promise<Uint8Array> {
   if (typeof source === 'string') {
     const res = await fetch(source);
@@ -536,15 +564,26 @@ export class PdfEngine implements PdfEngineLike {
   }
 
   /**
-   * Wait until nothing more urgent is in flight.
+   * Hand the thread back for a turn, and wait until nothing more urgent is in
+   * flight.
    *
    * The plan walks on the same thread the pages are rendered on, so a page the
    * reader asked for is only not queued behind it because the plan checks. One
    * turn of the event loop at a time, because a render is several of them (it
    * has awaits of its own) and the plan must not hold the thread while it waits.
+   *
+   * The turn comes first, and it happens whether or not anything has arrived:
+   * `busy` counts what is already in flight, and the request this is meant to
+   * give way to may still be sitting in the message queue where `busy` cannot
+   * see it. A boundary that skipped the turn because nothing had arrived would
+   * be no boundary at all - the plan walks in slices of its own, each one the
+   * microtask continuation of the last, so it would walk the whole document
+   * without the thread ever being handed back.
    */
   private async idle(): Promise<void> {
-    while (this.busy > 0) await new Promise((resolve) => setTimeout(resolve, 0));
+    do {
+      await turn();
+    } while (this.busy > 0);
   }
 
   /** Every `@font-face` rule discovered so far, newest last. */

@@ -14,7 +14,10 @@
  *      on);
  *   3. the text upgrade, driven by the plan, still turns the page's outlines
  *      into text - and a ligature still names the character a typesetter drew
- *      for two letters, which is the one thing a program cannot say.
+ *      for two letters, which is the one thing a program cannot say;
+ *   4. the walk hands the thread back between slices, so what is queued on that
+ *      thread - a worker's `open` still being answered, a page the reader asked
+ *      for - is not waiting for the whole document.
  */
 
 import test from 'node:test';
@@ -618,6 +621,51 @@ test('a long document is planned in the background while its pages are drawn', a
       `      ${count} pages: 20 read during the plan (${during} glyphs as text), ` +
         `${engine.plannedFonts().length} document faces after it, same text either way`,
     );
+  } finally {
+    engine.close();
+  }
+});
+
+/**
+ * The walk hands the thread back between its slices.
+ *
+ * The plan runs on the thread the pages are rendered on - and, in the demo,
+ * inside the worker every request is answered from. Its slices are continuations
+ * of one another in the *microtask* queue, so a slice boundary that awaited an
+ * already-resolved promise would run the whole document without the thread ever
+ * reaching its task queue: an `open` still being rounded out, a page the reader
+ * asked for, and any caller queued behind the walk would all wait for the plan
+ * to finish. A macrotask is that caller, and it has to get a turn while the walk
+ * is still walking.
+ */
+test('the plan hands the thread back while it is walking', async () => {
+  const document = documents[0];
+  assert.ok(document, 'no corpus document could be read');
+  const bytes = new Uint8Array(fs.readFileSync(document.file));
+
+  const engine = new PdfEngine();
+  try {
+    await engine.open(bytes);
+    const total = engine.documentInfo.pageCount;
+    // The walk is the half of the plan with no awaits of its own beyond the
+    // slice boundaries, so a macrotask turn taken while `covered < total` is a
+    // turn the walk gave up. Building the faces afterwards awaits real work, so
+    // a turn taken there says nothing about the walk - which is exactly why the
+    // count stops at the end of it. Queued after `open`, because a turn taken
+    // before the plan starts would prove nothing either.
+    let walking = true;
+    let walkTurns = 0;
+    const spin = () => {
+      if (!walking) return;
+      const progress = engine.planProgress();
+      if (progress && progress.covered < progress.total) walkTurns++;
+      setTimeout(spin, 0);
+    };
+    setTimeout(spin, 0);
+    await engine.planDone();
+    walking = false;
+    assert.ok(walkTurns > 0, `a ${total}-page walk never let the thread reach its task queue`);
+    console.log(`      ${total} pages: ${walkTurns} turn(s) of the thread while the plan was walking`);
   } finally {
     engine.close();
   }
