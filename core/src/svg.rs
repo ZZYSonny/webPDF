@@ -63,6 +63,13 @@ pub struct RenderOptions {
     /// Embed every face the document uses inside the SVG. Needed for a standalone
     /// SVG; pointless when the host page already carries the stylesheet.
     pub embed_fonts: bool,
+    /// Bionic reading: hold every word's first letters at full strength and fade
+    /// the rest, so the eye has a fixation point to land on (`bionic.rs`). Off by
+    /// default, and off for a page whose text the two devices disagree about.
+    pub bionic: bool,
+    /// How much of its strength the faded part of a word keeps, 0..1.
+    /// `BIONIC_DIM` (a half) when unset; only meaningful while `bionic` is on.
+    pub bionic_dim: Option<f32>,
 }
 
 /// What one page's render cost, and what it became.
@@ -83,6 +90,8 @@ pub struct PageStats {
     pub images: usize,
     /// Shadings written into this page, as gradients or as rasterised meshes.
     pub shades: usize,
+    /// Glyphs written at bionic reading's reduced strength.
+    pub faded: usize,
 }
 
 /// A number as MuPDF's own writer prints it.
@@ -341,6 +350,9 @@ pub struct SvgDevice {
     page: (f32, f32),
     /// Prefix for every id, so two pages inlined into one host page stay apart.
     prefix: String,
+    /// The strength the faded part of a word is drawn at, or None when bionic
+    /// reading is off. `bionic.rs` says why it is a fade rather than a bold.
+    bionic: Option<f32>,
     /// How many definitions are open. While this is not zero the markup belongs
     /// to the innermost one rather than to the page.
     in_defs: usize,
@@ -390,7 +402,7 @@ impl SvgDevice {
         chars: Rc<CharGrid>,
         marks: &[SpaceMark],
         page: (f32, f32),
-        prefix: &str,
+        opts: &RenderOptions,
     ) -> Self {
         let mut mark_cells: HashMap<(i64, i64), Vec<usize>> = HashMap::new();
         for (i, mark) in marks.iter().enumerate() {
@@ -418,7 +430,10 @@ impl SvgDevice {
             run_gap: false,
             used: Vec::new(),
             page,
-            prefix: prefix.to_string(),
+            prefix: opts.id_prefix.clone(),
+            bionic: opts
+                .bionic
+                .then(|| crate::bionic::bionic_dim(opts.bionic_dim)),
             in_defs: 0,
             masks: Vec::new(),
             tiles: Vec::new(),
@@ -888,29 +903,46 @@ impl SvgDevice {
         if det.abs() < 1e-12 {
             return;
         }
+        // The strength a faded stretch is written at; only ever read while
+        // bionic reading is on, which is exactly when `self.bionic` is set.
+        let dim = self.bionic.unwrap_or(crate::bionic::BIONIC_DIM);
 
         let mut xs = Vec::with_capacity(run.items.len());
         let mut ys = Vec::with_capacity(run.items.len());
-        let mut groups: Vec<Vec<usize>> = Vec::new();
+        // What bionic reading fades, one answer per item; None when it is off,
+        // and also when the segments do not account for every character of the
+        // run, which writes it plainly rather than faded in the wrong places.
+        let fade: Option<Vec<Option<bool>>> = match self.bionic {
+            Some(_) => Self::fades(&run.items),
+            None => None,
+        };
+        // A glyph that stands for several characters gets a `<tspan>` of its own:
+        // a shaper only joins letters it lays out together, and with a position
+        // per character the browser would draw `fi` as an `f` and an `i`, which
+        // is not what the page drew. A change of fade does the same, so that the
+        // fixation points stay the text as the document set it.
+        let mut groups: Vec<(Option<bool>, Vec<usize>)> = Vec::new();
         let mut group: Vec<usize> = Vec::new();
+        let mut group_fade = Some(false);
         for (i, item) in run.items.iter().enumerate() {
             xs.push(num((kd * item.x - kc * item.y) / det));
             ys.push(num((-kb * item.x + ka * item.y) / det));
-            // A glyph that stands for several characters gets a `<tspan>` of its
-            // own: a shaper only joins letters it lays out together, and with a
-            // position per character the browser would draw `fi` as an `f` and an
-            // `i`, which is not what the page drew.
+            let this = fade.as_ref().map_or(Some(false), |fade| fade[i]);
             if item.len > 1 {
                 if !group.is_empty() {
-                    groups.push(std::mem::take(&mut group));
+                    groups.push((group_fade, std::mem::take(&mut group)));
                 }
-                groups.push(vec![i]);
-            } else {
-                group.push(i);
+                groups.push((this, vec![i]));
+                continue;
             }
+            if !group.is_empty() && group_fade != this {
+                groups.push((group_fade, std::mem::take(&mut group)));
+            }
+            group_fade = this;
+            group.push(i);
         }
         if !group.is_empty() {
-            groups.push(group);
+            groups.push((group_fade, group));
         }
 
         // Into the page, or into the definition being written: text inside a
@@ -934,10 +966,14 @@ impl SvgDevice {
             num(k),
             run.family
         );
-        for indices in &groups {
+        for (group_fade, indices) in &groups {
             let x: Vec<&str> = indices.iter().map(|i| xs[*i].as_str()).collect();
             let y: Vec<&str> = indices.iter().map(|i| ys[*i].as_str()).collect();
-            let _ = write!(sink, "<tspan x=\"{}\" y=\"{}\">", x.join(" "), y.join(" "));
+            let _ = write!(sink, "<tspan");
+            if *group_fade == Some(true) {
+                let _ = write!(sink, " fill-opacity=\"{}\"", num(dim));
+            }
+            let _ = write!(sink, " x=\"{}\" y=\"{}\">", x.join(" "), y.join(" "));
             for i in indices {
                 push_escaped(sink, &run.items[*i].text);
             }
@@ -945,6 +981,51 @@ impl SvgDevice {
         }
         sink.push_str("</text>");
         self.stats.runs += 1;
+        self.stats.faded += groups
+            .iter()
+            .filter(|(fade, _)| *fade == Some(true))
+            .map(|(_, indices)| indices.len())
+            .sum::<usize>();
+    }
+
+    /// Whether bionic reading fades each item of a run.
+    ///
+    /// `bionic::segments` marks *letters*, and an item can stand for several of
+    /// them: a ligature is one outline and cannot be drawn half dark, so it takes
+    /// the answer of the stretch its *first* letter is in. `None` when the
+    /// segments do not account for every character of the run, which writes it
+    /// unfaded - the caller's concern, and `bionic.rs` says why it is the right
+    /// fallback.
+    ///
+    /// A stretch of nothing but whitespace answers `None` rather than a fade: it
+    /// is between two words rather than in one, and fading it would be an
+    /// attribute that draws no pixel. It still gets its own `<tspan>`, which is
+    /// what keeps a space out of the fixation point next to it.
+    fn fades(items: &[RunItem]) -> Option<Vec<Option<bool>>> {
+        let text: String = items.iter().map(|item| item.text.as_str()).collect();
+        let segments = crate::bionic::segments(&text);
+        let total: usize = items.iter().map(|item| item.len).sum();
+        if segments.iter().map(|segment| segment.chars).sum::<usize>() != total {
+            return None;
+        }
+
+        let mut out = Vec::with_capacity(items.len());
+        let mut at = 0usize;
+        let mut seg = 0usize;
+        let mut start = 0usize;
+        for item in items {
+            while seg < segments.len() && at >= start + segments[seg].chars {
+                start += segments[seg].chars;
+                seg += 1;
+            }
+            out.push(match segments.get(seg) {
+                None => Some(false),
+                Some(segment) if crate::bionic::blank(&segment.text) => None,
+                Some(segment) => Some(!segment.fixation),
+            });
+            at += item.len;
+        }
+        Some(out)
     }
 
     /// What the page has so far, wrapped in a root the host can put in a frame.
@@ -1868,7 +1949,7 @@ pub fn render_page_svg(
         Rc::new(CharGrid::new(&chars)),
         &marks,
         (width, height),
-        &opts.id_prefix,
+        opts,
     )));
     {
         let target = mupdf::Device::from_native(device.clone())?;
@@ -1901,6 +1982,7 @@ impl SvgDevice {
             used: std::mem::take(&mut self.used),
             page: self.page,
             prefix: std::mem::take(&mut self.prefix),
+            bionic: self.bionic,
             in_defs: self.in_defs,
             masks: std::mem::take(&mut self.masks),
             tiles: std::mem::take(&mut self.tiles),
@@ -1919,14 +2001,113 @@ mod tests {
 
     /// A device with nothing in it, for the parts that do not need a page.
     fn device(prefix: &str) -> SvgDevice {
+        device_with(prefix, false)
+    }
+
+    /// The same, with bionic reading on at the default strength.
+    fn device_with(prefix: &str, bionic: bool) -> SvgDevice {
+        let opts = RenderOptions {
+            id_prefix: prefix.to_string(),
+            bionic,
+            ..Default::default()
+        };
         SvgDevice::new(
             Rc::new(Plan::new()),
             Rc::new(HashMap::new()),
             Rc::new(CharGrid::new(&[])),
             &[],
             (400.0, 300.0),
-            prefix,
+            &opts,
         )
+    }
+
+    /// A run of one character per item, each at its own offset, for the parts of
+    /// the writer that only need positions and text.
+    fn run_of(text: &str) -> Run {
+        run_with(
+            text.chars()
+                .enumerate()
+                .map(|(i, c)| RunItem {
+                    x: i as f32,
+                    y: 0.0,
+                    text: c.to_string(),
+                    len: 1,
+                })
+                .collect(),
+        )
+    }
+
+    /// The same, with the items spelled out: a glyph can stand for several
+    /// letters - a ligature - and then it is one outline with one position.
+    fn run_with(items: Vec<RunItem>) -> Run {
+        Run {
+            entry: 0,
+            family: "test".into(),
+            paint: " fill=\"#000000\"".into(),
+            linear: (1.0, 0.0, 0.0, 1.0),
+            items,
+        }
+    }
+
+    /// Bionic reading cuts a run into the stretches `text-vide` marked: the
+    /// fixation points at full strength, everything between them faded, and one
+    /// position per character either way.
+    #[test]
+    fn bionic_fades_between_the_fixation_points() {
+        let mut plain = device("");
+        plain.write_run(&run_of("Hello, world!"));
+        assert!(!plain.body.contains("fill-opacity"), "{}", plain.body);
+        assert_eq!(plain.stats().faded, 0);
+
+        let mut faded = device_with("", true);
+        faded.write_run(&run_of("Hello, world!"));
+        assert!(faded.body.contains(
+            "<tspan x=\"0 1 2\" y=\"0 0 0\">Hel</tspan>\
+             <tspan fill-opacity=\"0.5\" x=\"3 4 5 6\" y=\"0 0 0 0\">lo, </tspan>\
+             <tspan x=\"7 8 9\" y=\"0 0 0\">wor</tspan>\
+             <tspan fill-opacity=\"0.5\" x=\"10 11 12\" y=\"0 0 0\">ld!</tspan>"
+        ), "{}", faded.body);
+        assert_eq!(faded.stats().faded, 7);
+    }
+
+    /// A glyph that stands for several letters keeps its own `<tspan>` when the
+    /// page is faded too, and takes the answer of the stretch its first letter is
+    /// in: here `ffi` is inside `offi`, so it stays at full strength.
+    #[test]
+    fn bionic_leaves_a_ligature_its_own_tspan() {
+        let mut device = device_with("", true);
+        device.write_run(&run_with(vec![
+            RunItem { x: 0.0, y: 0.0, text: "o".into(), len: 1 },
+            RunItem { x: 1.0, y: 0.0, text: "ffi".into(), len: 3 },
+            RunItem { x: 2.0, y: 0.0, text: "ce".into(), len: 2 },
+        ]));
+        assert!(device.body.contains(
+            "<tspan x=\"0\" y=\"0\">o</tspan>\
+             <tspan x=\"1\" y=\"0\">ffi</tspan>\
+             <tspan fill-opacity=\"0.5\" x=\"2\" y=\"0\">ce</tspan>"
+        ), "{}", device.body);
+        assert_eq!(device.stats().faded, 1);
+    }
+
+    /// The strength is the caller's, not a constant: the same page can be drawn
+    /// at any fade the reader asked for.
+    #[test]
+    fn bionic_draws_at_the_strength_it_is_given() {
+        let opts = RenderOptions {
+            bionic: true,
+            bionic_dim: Some(0.2),
+            ..Default::default()
+        };
+        let mut device = SvgDevice::new(
+            Rc::new(Plan::new()),
+            Rc::new(HashMap::new()),
+            Rc::new(CharGrid::new(&[])),
+            &[],
+            (400.0, 300.0),
+            &opts,
+        );
+        device.write_run(&run_of("Hello"));
+        assert!(device.body.contains("fill-opacity=\"0.2\""), "{}", device.body);
     }
 
     /// An id from one page inlined into a host page must not collide with the

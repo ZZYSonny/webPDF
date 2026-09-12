@@ -40,6 +40,13 @@ fn main() {
     let opts = RenderOptions {
         responsive: false,
         embed_fonts: true,
+        // Bionic reading is a reader's setting rather than a document's, so the
+        // probe asks for it the way a host would: `WPDF_BIONIC=1`, and
+        // optionally `WPDF_BIONIC_DIM` for how faint the rest of a word goes.
+        bionic: env::var("WPDF_BIONIC").is_ok_and(|v| v != "0"),
+        bionic_dim: env::var("WPDF_BIONIC_DIM")
+            .ok()
+            .and_then(|v| v.parse().ok()),
         ..Default::default()
     };
     for p in pages {
@@ -65,7 +72,7 @@ fn main() {
         .expect("write text");
         println!(
             "  page {p}: {} bytes in {:?} - {} glyphs, {} text, {} outlines, {} runs, {} spaces, \
-             {} images, {} shadings",
+             {} faded, {} images, {} shadings",
             svg.len(),
             started.elapsed(),
             stats.glyphs,
@@ -73,6 +80,7 @@ fn main() {
             stats.as_outlines,
             stats.runs,
             stats.spaces,
+            stats.faded,
             stats.images,
             stats.shades
         );

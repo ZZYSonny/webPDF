@@ -21,6 +21,9 @@ mupdf-sys = "0.8"
 # WOFF is a zlib stream per table. A pure-Rust deflate keeps the build free of C
 # beyond MuPDF's own, which is what lets the same crate compile to wasm.
 miniz_oxide = "0.8"
+# Bionic reading: where a word's fixation points are, the way `text-vide` found
+# them for the TypeScript pipeline this replaces. See `src/bionic.rs`.
+bioneer = "0.1.1"
 
 [profile.release]
 opt-level = 3

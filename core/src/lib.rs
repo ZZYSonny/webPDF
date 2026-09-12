@@ -12,6 +12,7 @@
 //! elements instead of carrying every glyph as an outline. A glyph the plan
 //! cannot promise a face for stays an outline, which always renders correctly.
 
+pub mod bionic;
 pub mod ffi;
 pub mod font;
 pub mod svg;
