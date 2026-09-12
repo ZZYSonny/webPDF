@@ -975,13 +975,14 @@ rasterising pages is a fine thing to do on a developer's machine and a poor gate
 between a commit and the published site. It does not fetch the corpus either -
 the published build has no use for it.
 
-The same workflow builds the extension in a **separate job** and uploads the two
-signed `.crx` files as artifacts. It does not create a release and does not
-publish to the Chrome Web Store: the artifact is the deliverable. That job does
-typecheck, because the worker and the viewer page are TypeScript and a type error
-means the artifact would be built from source that does not compile as written.
-Set the `WEBPDF_EXT_KEY` secret to a PEM private key to keep the extension id — and
-with it every reader's remembered positions — stable from one run to the next.
+The same job builds the extension and uploads the signed `.crx` as an artifact —
+one job, because the extension frames the site that job publishes and a run that
+ships a viewer with an extension that cannot draw with it is worse than a run that
+ships neither. It does not create a release and does not publish to the Chrome Web
+Store: the artifact is the deliverable. The typecheck above covers it too, because
+the worker and the viewer page are TypeScript. Set the `WEBPDF_EXT_KEY` secret to
+a PEM private key to keep the extension id — and with it every reader's remembered
+positions — stable from one run to the next.
 
 Pages has to be set to **Source: GitHub Actions** in the repository settings —
 there is no `gh-pages` branch and nothing to commit back to the repository. The

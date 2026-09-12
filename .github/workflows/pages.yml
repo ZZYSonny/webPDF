@@ -1,4 +1,4 @@
-# Build the demo and publish it to GitHub Pages.
+# Build the demo, publish it to GitHub Pages, and pack the extension.
 #
 # Pages is configured to take its source from Actions (Settings -> Pages ->
 # Source: "GitHub Actions"), so this workflow is the only thing that writes to
@@ -15,17 +15,19 @@
 # public URL. Nothing in this repository is a PDF, so there is no corpus for the
 # build to ship, and the PDF cache the tests use is not consulted here at all.
 #
-# The extension is the second job, and it is a *build*: it produces the signed
-# `.crx` and uploads it as an artifact. Nothing is released and nothing is
+# The extension is built here too, and it is a *build*: the job produces the
+# signed `.crx` and uploads it as an artifact. Nothing is released and nothing is
 # published to the Chrome Web Store - the artifact is the deliverable, and anyone
 # who wants the extension takes it from the run.
 #
-# The extension is a shell around the published site: it frames the viewer at
-# github.io, which is why this job does not need the Pages artifact, or anything
-# else built locally. Set the `WEBPDF_EXT_KEY` secret to a PEM private key to keep
-# the extension id stable from one run to the next (and therefore the reader's
-# remembered positions with it); without it each run generates a key, prints the
-# id it produced, and produces an extension the browser sees as a new one.
+# One job for both, because they are two halves of the same thing: the extension
+# frames the site this job publishes, so a run that ships a viewer and an
+# extension that cannot draw with it is worse than a run that ships neither, and
+# a failure in either build stops the deploy rather than publishing half of it.
+# Set the `WEBPDF_EXT_KEY` secret to a PEM private key to keep the extension id
+# stable from one run to the next (and therefore the reader's remembered
+# positions with it); without it each run generates a key, prints the id it
+# produced, and produces an extension the browser sees as a new one.
 
 name: Pages
 
@@ -49,7 +51,7 @@ concurrency:
 
 jobs:
   deploy:
-    name: Build and deploy
+    name: Build, pack and deploy
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -63,34 +65,9 @@ jobs:
       # would be built from source that does not compile as written.
       - run: npm run typecheck
       - run: npm run build:pages
-      - uses: actions/upload-pages-artifact@v5
-        with:
-          path: dist/demo
-          retention-days: 1
-      # The deployment environment, and its URL, come from this step: it is the
-      # only thing that knows where the site ended up.
-      - id: deployment
-        uses: actions/deploy-pages@v5
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-
-  extension:
-    name: Build the extension
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-node@v5
-        with:
-          node-version: 22
-          cache: npm
-      - run: npm ci
-      # A type error means the extension would be built from source that does not
-      # compile as written, and the worker and the viewer page are TypeScript.
-      - run: npm run typecheck
-      # Compiles the worker and the viewer page, then stages and signs the
-      # extension: dist/ext/webpdf, with a .zip and a .crx beside it. The viewer
-      # it frames is the published site, so nothing here depends on the deploy job.
+      # The extension, from the same commit as the site it frames: compile the
+      # worker and the viewer page, then stage and sign the package - a staged
+      # dist/ext/webpdf, a .zip beside it, and the .crx that is uploaded.
       - run: npm run build:extension
         env:
           # Empty when the secret is not set, which the build reads as "make one
@@ -105,3 +82,14 @@ jobs:
           path: dist/ext/*.crx
           if-no-files-found: error
           retention-days: 14
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: dist/demo
+          retention-days: 1
+      # The deployment environment, and its URL, come from this step: it is the
+      # only thing that knows where the site ended up.
+      - id: deployment
+        uses: actions/deploy-pages@v5
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
