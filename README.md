@@ -182,41 +182,77 @@ createViewer({
 
 * A page is rendered about a viewport before it can be read, so arriving at it is
   not the moment its render starts.
-* A finished page goes into the document at a **quiet moment** - 150 ms after the
-  view has stopped moving - unless the reader is looking at it or is one page
-  away from it, in which case it goes in straight away.
-* While the pipeline is idle, the pages just past the window are rendered too.
-  Their SVG is kept (`viewer.preparedPages`) and their fonts are registered, so
-  reaching one costs a DOM insert and nothing else. None of this is extra work:
-  those pages would have been rendered on the way to them.
+* Every page is drawn in its own same-origin frame (`pageFrames`, on by default).
+  This is not a style choice: a `@font-face` belongs to a *document*, and adding
+  one to a document makes Chromium lay out **every text run in that document**
+  again — a single unused face costs a whole-document re-layout (measured: 112.9 ms
+  with a paper's pages inline, 0.9 ms when they are in frames). In its own
+  document, a page pays that for itself and for nothing else. The viewer's own
+  document is never told about a font at all.
+* A finished page is installed at a **quiet moment** — 150 ms after the view has
+  stopped moving — unless the reader is looking at it or is one page away from
+  it, in which case it goes in straight away.
+* While the reader is at rest, the pages just past the window are rendered *and*
+  installed: their documents exist, their fonts are compiled into them, and they
+  are drawn. Reaching one then costs a scroll and nothing else. Faces go in a few
+  at a time (a 6 ms budget per frame), because a page of a paper can bring a dozen
+  subsets and compiling them all in one frame is a dropped frame.
 
 That ordering is not a micro-optimisation: it is the difference between a smooth
-scroll and a hitch at every page boundary. Two costs land on a page insertion:
+scroll and a hitch at every page boundary. Three costs land on a page:
 
 | what | why it costs | measured |
 |---|---|---|
 | parsing 100-300 kB of SVG | the page is text-heavy and every element is a positioned `<tspan>` | 4-7 ms |
-| `@font-face` registration | adding *any* face makes the browser lay out every text run in the document again - all pages currently rendered, not just the new one | **60-110 ms** |
+| compiling the page's fonts into its document | a page brings every face it needs — a dozen or so subsets — and each is a font program the browser parses and lays out for | 25-40 ms |
+| registering a face in a document that already has text | every text run in that document is laid out again, whether or not any of it uses the face | 60-110 ms, or 112.9 ms on a paper |
 
-The second one is the expensive one, and it used to be paid at every boundary,
-because a page carries the faces it needs every time it is rendered and each
-family was handed to the document again each time. Now a family is registered
-once for the life of the document - the demo test asserts that a full re-render
-of every rendered page registers zero faces - and what is left of the cost is
-paid while the reader is stationary.
+The third one is what used to flash at every boundary, and the reason is
+structural rather than a bug to fix: Blink's font-update invalidation walks the
+whole document (`MarkSubtreeNeedsStyleRecalcForFontUpdates` from the document
+element down, with no display-lock or containment check), so nothing short of a
+separate document contains it. Shadow roots do not help — Chromium *drops*
+`@font-face` declared inside a shadow tree instead of scoping it — and
+`content-visibility` only defers the work to the moment the page is revealed.
+Chromium's own paint-invalidation tracking over one boundary-crossing gesture:
+
+| | "Fonts changed" nodes in the viewer's document | in the pages' own documents |
+|---|---|---|
+| all pages in one document, face registered there | 3347 | — |
+| a document per page, face registered there | **0** | 450 |
 
 Measured three times on each build, same gesture (40 wheel notches at 60 px,
-crossing one page boundary in a 15-page paper, 1280x900):
+crossing page boundaries in a 15-page paper, 1280x900, software rendering):
 
-| | slow frames while scrolling | worst frame while scrolling | faces registered |
+| | slow frames while scrolling | worst frame while scrolling | worst frame after the scroll stops |
 |---|---|---|---|
-| pages rendered as they arrive, faces re-registered per page | 1, at the boundary | 70-89 ms | 18 |
-| this design | **0** | **≤19 ms** | 7 |
+| all pages in one document | 0 | 19.7 ms | 115-194 ms |
+| a document per page | **0** | **18.2 ms** | 50-61 ms |
 
-The work did not disappear: it moved to the first frames after the scroll stops
-(67-127 ms in the same runs, in software rendering, with the reader looking at a
-page that is not moving). A page the reader *is* looking at never waits for that
-moment - it goes in as soon as it is ready.
+The work did not disappear, it moved: into the pages' own documents, where it is
+paid while the reader is stationary or still several pages away, and never on the
+page the reader is looking at. A page that arrives with fonts nobody had (the
+first page of a new font, say) still compiles them — off-screen, in a frame that
+is empty at the time, so there is no text to invalidate.
+
+**A page frame is meant to be as native as a page can be.** It is same-origin,
+never sandboxed and never navigated (`about:blank`, written into directly), so
+selection, the clipboard, find-in-page, the caret and the context menu are the
+browser's own. The viewer forwards the gestures it owns — clicks and Enter on
+link hit areas, viewer keyboard shortcuts, drag-and-drop — and repeats a
+page-level `pointerdown` on the page's container so host chrome that closes on a
+click still does. `tests/browser/frames.mjs` is the bill for that claim: it
+selects text inside a page and copies it with Ctrl+C, checks the system clipboard
+holds exactly that text, and drives ArrowDown/End/Home/Ctrl+0 and the wheel from
+inside a page. What a frame does *not* give you is a selection that spans a page
+boundary — `pageFrames: false` is there for hosts that would rather have one
+document.
+
+A frame is not free: +1 document, +1 frame, +675 nodes and ~0.18 MB per page,
+measured, and all of it back to baseline when the page is removed (which is the
+resource management a per-page document buys: a page's fonts die with the page).
+The alternative — one document — is only ~7 ms faster to first paint and 2.7x
+worse on the insert frame, before the whole-document re-layout above.
 
 Preparing *every* font when the document loads is not possible: a glyph's outline
 only exists once that page has been through MuPDF's SVG device, so preparing the
@@ -614,17 +650,27 @@ The library was written with content scripts in mind:
 * **No globals.** The only optional one is a debug flag (`globalThis.__wpdfDebug`)
   and the `window.webpdf` handle the demo installs for itself.
 * **Shadow DOM** (`shadowDom: true`) keeps a host page's CSS from touching the
-  viewer, and vice versa. The pages themselves are ordinary blocks in the host
-  document (there is no content iframe: a frame cannot own the pinch, and a
-  frame's own scroller would not receive a zoomed pan), so the shadow root is
-  what keeps host CSS away from them.
+  viewer, and vice versa.
+* **Each page is a same-origin frame.** Not for isolation from the host — for
+  isolation from the *other pages*: a `@font-face` belongs to a document, and
+  registering one makes Chromium lay out every text run in that document again,
+  so a page's fonts are registered in the page's own document and nowhere else.
+  The frame is left at `about:blank` and written into directly: same-origin,
+  never sandboxed, never navigated, which is what keeps selection, the clipboard,
+  find-in-page and the context menu the browser's own. A host page's CSP applies
+  to it exactly as it does to the viewer's own document: faces arrive as `data:`
+  URLs, so a page with `default-src 'self'` needs `font-src data:` for text to be
+  drawn with the document's fonts. `pageFrames: false` draws every page into one
+  document instead, which is what you want if a selection has to span pages.
 * **Give it the root scroller.** The viewer sets the container's height to the
   full layout height and expects the document to scroll; do not put it inside an
   `overflow:auto` wrapper, or a zoomed page cannot be panned past one viewport.
-* **Fonts are registered on the document**, through a *constructed stylesheet*
-  where available. Two reasons: Chromium does not load `@font-face` rules
-  declared inside a shadow root, and a constructed stylesheet is not subject to
-  a page's `style-src` policy.
+  A wheel over a page chains out of the page's frame into that scroller, which is
+  why the frame never scrolls itself.
+* **Stylesheets are constructed** where available, for the viewer and for each
+  page's frame. Two reasons: Chromium does not load `@font-face` rules declared
+  inside a shadow root, and a constructed stylesheet is not subject to a page's
+  `style-src` policy.
 * **Sanitised sources.** `File`, `Blob`, `ArrayBuffer`, `Uint8Array`, a URL
   string or `{ url, headers }` all work.
 * **Nothing is assumed about the DOM.** The viewer mounts into whatever element
@@ -682,8 +728,9 @@ src/
   viewer/
     layout.ts               page geometry + visible-range maths
     viewer.ts               virtualised scrolling viewer (browser-owned pinch):
-                            a window wider than the viewport, pages inserted at
-                            a quiet moment, pages prepared ahead
+                            a window wider than the viewport, a document per
+                            page, pages installed at a quiet moment, pages
+                            prepared and installed ahead while the reader rests
 demo/                       the demo application
   main.ts                   the bar, the card, and everything wired to them
   papers.mjs                the corpus: public URLs, and where they are cached
@@ -700,6 +747,10 @@ tests/
   *.test.ts                 Node tests (real PDFs through the real wasm)
   pdf-cache.mjs             fetches the corpus, lists it, clears it
   browser/                  headless-Chromium verification over CDP
+    demo.mjs                the built demo, driven through its own UI
+    frames.mjs              a page as a document: selection, clipboard, keys, wheel
+    pinch.mjs               the pinch/zoom contract
+    compare.mjs, diff.mjs   text-vs-outlines fidelity, with a difference map
 scripts/
   no-jekyll.mjs             marks the Pages artifact as pre-built
 ```
@@ -776,20 +827,23 @@ is referenced relatively.
   MuPDF's already-resolved per-glyph positioning. Latin, Greek, Cyrillic, CJK
   and punctuation are all emitted as text.
 * **Fonts are subset per page.** Each page builds its own subsets, roughly
-  10–25 KB of WOFF per page. Correct and lazy (a page you never open costs
-  nothing), and what a face costs is not how many of them there are: registering
-  *any* face makes the browser lay out every text run in the document again, so
-  one rule costs what twenty cost, and re-registering a face the document
-  already has costs just as much as a new one. Sharing a face between the pages
-  that use the same font is possible - glyph outlines are in em units, so the
-  same glyph is byte-identical on every page, and a page's font can be matched
-  to a document-level face by the glyphs they have in common (measured on a
+  10–25 KB of WOFF per page, and with a document per page each page compiles its
+  own copies — measured, a page of a paper brings a dozen faces and 25–40 ms of
+  font work with it, paid while the reader is still pages away. Correct and lazy
+  (a page you never open costs nothing). Sharing a face between the pages that
+  use the same font is possible — glyph outlines are in em units, so the same
+  glyph is byte-identical on every page, and a page's font can be matched to a
+  document-level face by the glyphs they have in common (measured on a
   figure-heavy paper: 70 per-page subsets become 28 shared faces over eight
-  pages). It does not remove the cost, though, because a face cannot grow: every
-  page that brings a glyph the face does not have yet needs another rule. So the
-  count is not what hurts - *when* the rule arrives is, and that is what the
-  viewer's quiet-moment registration and preparation ahead are for. Sharing
-  remains worth doing for memory, not for smoothness.
+  pages) — and it would cut that per-page work, since two pages that share a font
+  would still need a copy each but a smaller one. It is not what makes a boundary
+  smooth, though: *when* the work happens is, which is what the quiet-moment
+  install and the preparation ahead are for.
+* **A page is a document, so a selection stops at its edge.** Text can be
+  selected and copied within a page (the browser's own clipboard path — see
+  `tests/browser/frames.mjs`), but dragging a selection across a page boundary
+  does not cross frames. `pageFrames: false` draws all pages into one document
+  for hosts that need that.
 * **A page can be blank for a moment when scrolling fast into unread
   territory.** A page that has not been rendered yet cannot be shown, and a
   reader who outruns the renderer sees the empty white box until it lands. The

@@ -55,6 +55,87 @@ await page.send('Page.addScriptToEvaluateOnNewDocument', {
       if (m) window.__faces.push(m[1]);
       return insertRule.call(this, rule, index);
     };
+
+    /**
+     * A page is drawn in its own frame, so "the pages on screen" and "the fonts
+     * the document was told about" are questions about a tree of documents, not
+     * one. Both helpers are installed in every document and answer for the whole
+     * tree from the top.
+     */
+    window.__pages = () => {
+      const sr = document.getElementById('viewer')?.shadowRoot;
+      if (!sr) return [];
+      return [...sr.querySelectorAll('.wpdf-page')];
+    };
+    window.__pageSvg = (el) =>
+      el.querySelector('svg.wpdf-page-svg') ?? el.querySelector('iframe')?.contentDocument?.querySelector('svg.wpdf-page-svg') ?? null;
+    window.__pageSvgs = () => window.__pages().map(window.__pageSvg).filter(Boolean);
+    window.__svgOfPage = (n) => {
+      const sr = document.getElementById('viewer')?.shadowRoot;
+      const el = sr?.querySelector('.wpdf-page[data-page="' + n + '"]');
+      return el ? window.__pageSvg(el) : null;
+    };
+    window.__pageLinks = (kind) =>
+      window.__pageSvgs().flatMap((svg) => [...svg.querySelectorAll('a[data-wpdf-link="' + kind + '"]')]);
+    /** A rect in this page's coordinates, even for an element in a page frame. */
+    window.__pageRect = (el) => {
+      const r = el.getBoundingClientRect();
+      const win = el.ownerDocument.defaultView;
+      const frame = win === window ? null : win.frameElement;
+      if (!frame) return { left: r.left, top: r.top, right: r.right, bottom: r.bottom, width: r.width, height: r.height };
+      const f = frame.getBoundingClientRect();
+      return { left: f.left + r.left, top: f.top + r.top, right: f.left + r.right, bottom: f.top + r.bottom, width: r.width, height: r.height };
+    };
+    /** What is really under a point: through the shadow root, and through a page frame. */
+    window.__elementAt = (x, y) => {
+      const sr = document.getElementById('viewer')?.shadowRoot;
+      let el = sr ? sr.elementFromPoint(x, y) : document.elementFromPoint(x, y);
+      for (let i = 0; i < 4 && el && el.tagName === 'IFRAME'; i++) {
+        const inner = el.contentDocument;
+        if (!inner) break;
+        const r = el.getBoundingClientRect();
+        el = inner.elementFromPoint(x - r.left, y - r.top);
+      }
+      return el;
+    };
+    window.__pageTexts = () => window.__pageSvgs().flatMap((svg) => [...svg.querySelectorAll('text')]);
+    window.__pageCss = () =>
+      window.__pageSvgs()
+        .map((svg) => {
+          const doc = svg.ownerDocument;
+          const sheets = [...doc.adoptedStyleSheets].map((s) => [...s.cssRules].map((r) => r.cssText).join('\\n'));
+          return [...sheets, ...[...doc.querySelectorAll('style')].map((s) => s.textContent ?? '')].join('\\n');
+        })
+        .join('\\n');
+    window.__allFaces = () => {
+      const out = [{ id: 'top', faces: [...(window.__faces ?? [])] }];
+      const seen = new Set([document]);
+      // A page frame lives inside the viewer's shadow root, where window.frames
+      // does not look: the iframes are found in the DOM instead.
+      const visit = (doc) => {
+        const frames = [];
+        const scan = (root) => {
+          for (const el of root.querySelectorAll('*')) {
+            if (el.tagName === 'IFRAME') frames.push(el);
+            if (el.shadowRoot) scan(el.shadowRoot);
+          }
+        };
+        scan(doc);
+        for (const frame of frames) {
+          const inner = frame.contentDocument;
+          if (!inner || seen.has(inner)) continue;
+          seen.add(inner);
+          try {
+            out.push({ id: inner.title || inner.URL, faces: [...(inner.defaultView?.__faces ?? [])] });
+          } catch {
+            /* cross-origin: not ours */
+          }
+          visit(inner);
+        }
+      };
+      visit(document);
+      return out;
+    };
   })();`,
 });
 
@@ -90,13 +171,19 @@ const searchState = () =>
     const sr = document.getElementById('viewer').shadowRoot;
     const page = document.getElementById('pageno').value;
     const box = sr.querySelector(`.wpdf-page[data-page="${page}"]`);
+    const bands = (root) => root.querySelectorAll('rect[data-wpdf-search]').length;
+    // A page's bands are drawn in the page's own document, so both the total and
+    // the page's own count are read there.
+    const perPage = window.__pageSvgs().map((svg) => bands(svg.ownerDocument));
     return {
       count: document.getElementById('search-count')?.textContent ?? '',
       pageno: page,
-      highlights: sr.querySelectorAll('rect[data-wpdf-search]').length,
-      activeHighlights: sr.querySelectorAll('rect[data-wpdf-search="active"]').length,
+      highlights: perPage.reduce((a, b) => a + b, 0),
+      activeHighlights: window
+        .__pageSvgs()
+        .reduce((n, svg) => n + svg.ownerDocument.querySelectorAll('rect[data-wpdf-search="active"]').length, 0),
       // Boxes on the page we are looking at, active and inactive together.
-      bandsOnPage: box ? box.querySelectorAll('rect[data-wpdf-search]').length : 0,
+      bandsOnPage: box && window.__pageSvg(box) ? bands(window.__pageSvg(box).ownerDocument) : 0,
     };
   });
 
@@ -112,13 +199,14 @@ const linkCandidates = (kind) =>
     const sr = document.getElementById('viewer').shadowRoot;
     const chrome = document.querySelector('.topbar')?.offsetHeight ?? 0;
     const out = [];
-    for (const svg of sr.querySelectorAll('svg.wpdf-page-svg')) {
+    for (const svg of window.__pageSvgs()) {
       for (const a of svg.querySelectorAll('a[data-wpdf-link="${kind}"]')) {
-        const r = a.getBoundingClientRect();
+        // In this page's coordinates: a link in a page frame is offset by its frame.
+        const r = window.__pageRect(a);
         if (r.width < 2 || r.height < 2) continue;
         if (r.top < chrome + 8 || r.bottom > innerHeight - 8) continue;
         out.push({
-          slot: a.closest('.wpdf-page')?.dataset.page ?? null,
+          slot: a.ownerDocument.defaultView?.frameElement?.closest('.wpdf-page')?.dataset.page ?? null,
           page: a.getAttribute('data-wpdf-page'),
           dest: a.getAttribute('data-wpdf-y'),
           uri: a.getAttribute('data-wpdf-uri'),
@@ -135,8 +223,7 @@ const linkCandidates = (kind) =>
 /** What the browser actually hits at a point - the transparent rect, hopefully. */
 const whatIsAt = (cx, cy) =>
   page.evaluate(`(() => {
-    const sr = document.getElementById('viewer').shadowRoot;
-    const el = sr.elementFromPoint(${cx}, ${cy});
+    const el = window.__elementAt(${cx}, ${cy});
     const a = el && el.closest ? el.closest('a[data-wpdf-link]') : null;
     return {
       tag: el ? el.tagName : null,
@@ -198,7 +285,8 @@ const waitForPage = async (n, timeout = 30000) => {
   await waitUntil(
     `(() => {
       const sr = document.getElementById('viewer')?.shadowRoot;
-      return !!sr?.querySelector('.wpdf-page[data-page="${n}"] svg.wpdf-page-svg');
+      const box = sr?.querySelector('.wpdf-page[data-page="${n}"]');
+      return !!box && !!window.__pageSvg(box);
     })()`,
     `page ${n} render`,
     timeout,
@@ -242,7 +330,7 @@ try {
     () => {
       const host = document.getElementById('viewer');
       const sr = host && host.shadowRoot;
-      return !!sr && sr.querySelectorAll('svg.wpdf-page-svg').length > 0;
+      return !!sr && window.__pageSvgs().length > 0;
     },
     { label: 'first page render', timeout: 90000 },
   );
@@ -253,15 +341,12 @@ try {
   const report = await page.evaluate(() => {
     const host = document.getElementById('viewer');
     const sr = host.shadowRoot;
-    const svgs = [...sr.querySelectorAll('svg.wpdf-page-svg')];
-    // Font faces live on the document (shadow-scoped @font-face is not loaded
-    // by Chromium), either in adopted stylesheets or in a <style> element.
-    const css = [
-      ...[...sr.querySelectorAll('style')].map((s) => s.textContent),
-      ...[...document.querySelectorAll('style[data-wpdf="fonts"]')].map((s) => s.textContent),
-      ...[...document.adoptedStyleSheets].map((s) => [...s.cssRules].map((r) => r.cssText).join('\n')),
-    ].join('\n');
-    const families = [...new Set([...sr.querySelectorAll('svg text')].map((e) => e.getAttribute('font-family')))];
+    const svgs = window.__pageSvgs();
+    // A page's faces live in the page's own document, either in an adopted
+    // stylesheet or in a <style> element; the viewer's own document is not told
+    // about a font at all.
+    const css = window.__pageCss();
+    const families = [...new Set(window.__pageTexts().map((e) => e.getAttribute('font-family')))];
     const first = svgs[0];
     const firstText = first?.querySelector('text');
     const box = first?.getBoundingClientRect();
@@ -297,8 +382,8 @@ try {
       rendersInWorker: window.webpdf.viewer()?.rendersInWorker ?? null,
       slots: sr.querySelectorAll('.wpdf-page').length,
       renderedPages: svgs.length,
-      textElements: sr.querySelectorAll('svg text').length,
-      outlineUses: sr.querySelectorAll('svg use').length,
+      textElements: window.__pageTexts().length,
+      outlineUses: svgs.reduce((n, svg) => n + svg.querySelectorAll('use').length, 0),
       fontFaces: (css.match(/@font-face/g) || []).length,
       fontBytes: (css.match(/base64,([A-Za-z0-9+/=]+)/g) || []).reduce((a, m) => a + m.length, 0),
       familiesUsed: families.length,
@@ -307,24 +392,26 @@ try {
       sampleFont: firstText?.getAttribute('font-family') ?? '',
       selectable: (() => {
         if (!firstText) return false;
-        const range = document.createRange();
+        const range = firstText.ownerDocument.createRange();
         range.selectNodeContents(firstText);
         return range.toString().length;
       })(),
     };
   });
 
-  // Shadow-scoped @font-face rules do not appear in document.fonts, and a probe
-  // measured during the `font-display: block` window still reports fallback
-  // metrics - so measure asynchronously, after the face has had time to load.
+  // A face belongs to the document it was registered in, and a page is drawn in
+  // its own document - so the probe has to measure *there*, not in the viewer's.
+  // It also has to wait: a probe taken during the `font-display: block` window
+  // still reports fallback metrics.
   const applied = await page.evaluate(async () => {
-    const sr = document.getElementById('viewer').shadowRoot;
-    const family = sr.querySelector('svg text')?.getAttribute('font-family');
-    if (!family) return null;
-    const box = document.createElement('div');
+    const svg = window.__pageSvgs()[0];
+    const family = window.__pageTexts()[0]?.getAttribute('font-family');
+    if (!svg || !family) return null;
+    const doc = svg.ownerDocument;
+    const box = doc.createElement('div');
     box.style.cssText = 'position:absolute;left:-9999px;top:0;font-size:100px;white-space:nowrap';
     const make = (f) => {
-      const span = document.createElement('span');
+      const span = doc.createElement('span');
       span.textContent = 'Hamburgefonstiv 0123';
       span.style.fontFamily = `'${f}'`;
       box.appendChild(span);
@@ -332,7 +419,7 @@ try {
     };
     const a = make(family);
     const b = make('definitely-not-a-real-font-xyz');
-    sr.appendChild(box);
+    doc.body.appendChild(box);
     await new Promise((r) => setTimeout(r, 1200));
     const out = {
       family,
@@ -465,7 +552,7 @@ try {
       const r = el.getBoundingClientRect();
       return {
         page: Number(el.dataset.page),
-        rendered: !!el.querySelector('svg'),
+        rendered: !!window.__pageSvg(el),
         // How far outside the viewport this page is, in viewport heights.
         away: r.bottom < chrome ? (chrome - r.bottom) / innerHeight : r.top > innerHeight ? (r.top - innerHeight) / innerHeight : 0,
       };
@@ -490,10 +577,17 @@ try {
   // bounded, so a long document does not accumulate pages.
   if (after.slots > 8) fail(`virtualisation is keeping too many slots: ${after.slots}`);
   if (after.pages.includes(10)) fail(`a page nowhere near the reader is still in the DOM: ${JSON.stringify(after.pages)}`);
-  // And while the reader sits still, the pages just past the window are
-  // rendered too - the work that would have been done on the way to them.
-  const ahead = after.prepared.filter((p) => p > Math.max(...after.pages));
-  if (ahead.length === 0) fail(`nothing beyond the window was prepared while the reader was at rest: ${JSON.stringify(after.prepared)}`);
+  // And while the reader sits still, the pages just past the viewport are not
+  // merely rendered but *installed*: they have their documents, their fonts are
+  // compiled into those documents, and they are drawn. Reaching one is then a
+  // scroll and nothing else - which is the promise the preparation exists to
+  // keep, and the one a frame's own document makes expensive to keep late.
+  const strays = after.pages.filter((p) => !after.prepared.includes(p));
+  if (strays.length) fail(`a page in the DOM is not one the viewer is holding: ${JSON.stringify(strays)}`);
+  const beyond = after.outside.filter((s) => s.away > 0.5);
+  if (beyond.length === 0) fail(`nothing past the viewport was prepared while the reader was at rest: ${JSON.stringify(after)}`);
+  const unrendered = beyond.filter((s) => !s.rendered);
+  if (unrendered.length) fail(`a page prepared past the viewport was left unrendered: ${JSON.stringify(unrendered)}`);
 
   /**
    * A scroll defers what the reader is not looking at.
@@ -531,7 +625,7 @@ try {
         const prepared = new Set(window.webpdf.viewer().preparedPages);
         const waiting = [];
         for (const el of sr.querySelectorAll('.wpdf-page')) {
-          if (el.querySelector('svg')) continue;
+          if (window.__pageSvg(el)) continue;
           const page = Number(el.dataset.page);
           const r = el.getBoundingClientRect();
           // Looking at it, or one page away from it, which is where the haste
@@ -564,7 +658,7 @@ try {
   await new Promise((r) => setTimeout(r, 1500));
   const blank = await page.evaluate(`(() => {
     const sr = document.getElementById('viewer').shadowRoot;
-    return [...sr.querySelectorAll('.wpdf-page')].filter((el) => !el.querySelector('svg')).map((el) => Number(el.dataset.page));
+    return [...sr.querySelectorAll('.wpdf-page')].filter((el) => !window.__pageSvg(el)).map((el) => Number(el.dataset.page));
   })()`);
   console.log('after the scroll settles, blank pages in the window: ' + JSON.stringify(blank));
   if (blank.length) fail(`pages were left blank after the scroll stopped: ${JSON.stringify(blank)}`);
@@ -634,7 +728,7 @@ try {
     await new Promise((r) => setTimeout(r, 400));
     const cleared = await page.evaluate(() => ({
       count: document.getElementById('search-count').textContent,
-      highlights: document.getElementById('viewer').shadowRoot.querySelectorAll('rect[data-wpdf-search]').length,
+      highlights: window.__pageSvgs().reduce((n, svg) => n + svg.ownerDocument.querySelectorAll('rect[data-wpdf-search]').length, 0),
     }));
     if (cleared.highlights !== 0 || cleared.count !== '') fail(`clearing should remove the boxes, got ${JSON.stringify(cleared)}`);
   }
@@ -711,11 +805,12 @@ try {
     await waitForPage(2);
     const focused = await page.evaluate(`(() => {
       const sr = document.getElementById('viewer').shadowRoot;
-      const a = [...sr.querySelectorAll('a[data-wpdf-link="internal"]')]
+      const a = [...window.__pageLinks('internal')]
         .find((el) => el.getAttribute('data-wpdf-page') !== '2');
       if (!a) return null;
       a.focus();
-      return { page: a.getAttribute('data-wpdf-page'), active: sr.activeElement === a || document.activeElement === a };
+      // Focus on a page frame's element lands in that frame's document.
+      return { page: a.getAttribute('data-wpdf-page'), active: a.ownerDocument.activeElement === a };
     })()`);
     if (!focused) fail('no internal link to focus on page 2');
     else if (!focused.active) fail('an <a tabindex="0"> hit area did not take focus');
@@ -780,7 +875,7 @@ try {
       await page.waitFor(
         () => {
           const sr = document.getElementById('viewer')?.shadowRoot;
-          return !!sr && sr.querySelectorAll('svg.wpdf-page-svg').length > 0;
+          return !!sr && window.__pageSvgs().length > 0;
         },
         { label: 'GPT-4 report render', timeout: 120000 },
       );
@@ -796,7 +891,7 @@ try {
       // zoom: bring the bottom-most external link into view before clicking it.
       await page.evaluate(`(() => {
         const sr = document.getElementById('viewer').shadowRoot;
-        const links = [...sr.querySelectorAll('a[data-wpdf-link="external"]')];
+        const links = [...window.__pageLinks('external')];
         const last = links[links.length - 1];
         if (last) last.scrollIntoView({ block: 'center' });
         return links.length;
@@ -842,7 +937,7 @@ try {
       const host = document.getElementById('viewer');
       const shown = document.getElementById('pageno').value;
       const box = sr.querySelector('.wpdf-page[data-page="' + shown + '"]');
-      const svg = box?.querySelector('svg');
+      const svg = box ? window.__pageSvg(box) : null;
       const items = [...document.querySelectorAll('#crop-list .crop-option')];
       const search = document.getElementById('search-box');
       const button = document.getElementById('crop-btn');
@@ -887,7 +982,7 @@ try {
     page.evaluate(`(() => {
       const sr = document.getElementById('viewer').shadowRoot;
       const shown = document.getElementById('pageno').value;
-      const svg = sr.querySelector('.wpdf-page[data-page="' + shown + '"] svg');
+      const svg = window.__svgOfPage(shown);
       if (!svg) return null;
       const [x, y, w, h] = svg.getAttribute('viewBox').split(/\\s+/).map(Number);
       const toPage = (el, dx, dy) =>
@@ -967,7 +1062,7 @@ try {
   await waitUntil(
     `(() => {
       const shown = document.getElementById('pageno').value;
-      const svg = document.getElementById('viewer').shadowRoot.querySelector('.wpdf-page[data-page="' + shown + '"] svg');
+      const svg = window.__svgOfPage(shown);
       const viewBox = svg?.getAttribute('viewBox') ?? '';
       return viewBox && !viewBox.startsWith('0 0 ') ? viewBox : false;
     })()`,
@@ -1049,7 +1144,7 @@ try {
         const want = ${JSON.stringify(value)} > 0 ? ', +${value} pt' : 'minus';
         if (status.startsWith('Cropping') || !status.includes(want)) return false;
         const shown = document.getElementById('pageno').value;
-        const svg = document.getElementById('viewer').shadowRoot.querySelector('.wpdf-page[data-page="' + shown + '"] svg');
+        const svg = window.__svgOfPage(shown);
         return svg ? svg.getAttribute('viewBox') : false;
       })()`,
       `the ${value}pt margin to be applied`,
@@ -1094,7 +1189,7 @@ try {
   const one = await waitUntil(
     `(() => {
       const status = document.getElementById('crop-status').textContent;
-      const svg = document.getElementById('viewer').shadowRoot.querySelector('svg.wpdf-page-svg');
+      const svg = window.__pageSvgs()[0];
       return status.startsWith('Cropping') ? false : svg?.getAttribute('viewBox') ?? false;
     })()`,
     'the second measurement to finish',
@@ -1110,7 +1205,7 @@ try {
   const back = await waitUntil(
     `(() => {
       const shown = document.getElementById('pageno').value;
-      const svg = document.getElementById('viewer').shadowRoot.querySelector('.wpdf-page[data-page="' + shown + '"] svg');
+      const svg = window.__svgOfPage(shown);
       const viewBox = svg?.getAttribute('viewBox') ?? '';
       return viewBox.startsWith('0 0 ') && svg.querySelectorAll('text').length > 0 ? viewBox : false;
     })()`,
@@ -1138,7 +1233,7 @@ try {
   await waitUntil(
     `(() => {
       const shown = document.getElementById('pageno').value;
-      const svg = document.getElementById('viewer').shadowRoot.querySelector('.wpdf-page[data-page="' + shown + '"] svg');
+      const svg = window.__svgOfPage(shown);
       return document.getElementById('crop-status').textContent.startsWith('Cropping')
         ? false
         : !!svg && svg.getAttribute('viewBox').startsWith('0 0 ') === false;
@@ -1156,7 +1251,7 @@ try {
   await waitUntil(
     `(() => {
       const shown = document.getElementById('pageno').value;
-      const svg = document.getElementById('viewer').shadowRoot.querySelector('.wpdf-page[data-page="' + shown + '"] svg');
+      const svg = window.__svgOfPage(shown);
       return !!svg && (svg.getAttribute('viewBox') ?? '').startsWith('0 0 ');
     })()`,
     'the page to come back',
@@ -1226,7 +1321,7 @@ try {
     page.evaluate(`(() => {
       const sr = document.getElementById('viewer').shadowRoot;
       const shown = document.getElementById('pageno').value;
-      const svg = sr.querySelector('.wpdf-page[data-page="' + shown + '"] svg');
+      const svg = window.__svgOfPage(shown);
       const button = document.getElementById('bionic-btn');
       const rect = button.getBoundingClientRect();
       const crop = document.getElementById('crop-btn').getBoundingClientRect();
@@ -1311,7 +1406,7 @@ try {
   await waitUntil(
     `(() => {
       const shown = document.getElementById('pageno').value;
-      const svg = document.getElementById('viewer').shadowRoot.querySelector('.wpdf-page[data-page="' + shown + '"] svg');
+      const svg = window.__svgOfPage(shown);
       return !!svg && svg.querySelectorAll('tspan[fill-opacity]').length > 0;
     })()`,
     'the bionic render',
@@ -1332,7 +1427,7 @@ try {
   await waitUntil(
     `(() => {
       const shown = document.getElementById('pageno').value;
-      const svg = document.getElementById('viewer').shadowRoot.querySelector('.wpdf-page[data-page="' + shown + '"] svg');
+      const svg = window.__svgOfPage(shown);
       const faded = svg?.querySelector('tspan[fill-opacity]');
       return !!faded && Number(getComputedStyle(faded).fillOpacity) < 0.4;
     })()`,
@@ -1354,7 +1449,7 @@ try {
   await waitUntil(
     `(() => {
       const shown = document.getElementById('pageno').value;
-      const svg = document.getElementById('viewer').shadowRoot.querySelector('.wpdf-page[data-page="' + shown + '"] svg');
+      const svg = window.__svgOfPage(shown);
       const faded = svg?.querySelector('tspan[fill-opacity]');
       return !!faded && Math.abs(Number(getComputedStyle(faded).fillOpacity) - 0.5) < 0.02;
     })()`,
@@ -1438,7 +1533,7 @@ try {
   await waitUntil(
     `(() => {
       const shown = document.getElementById('pageno').value;
-      const svg = document.getElementById('viewer').shadowRoot.querySelector('.wpdf-page[data-page="' + shown + '"] svg');
+      const svg = window.__svgOfPage(shown);
       return !!svg && svg.querySelectorAll('tspan[fill-opacity]').length === 0;
     })()`,
     'the plain render to come back',
@@ -1467,7 +1562,7 @@ try {
   const croppedBox = await waitUntil(
     `(() => {
       const shown = document.getElementById('pageno').value;
-      const svg = document.getElementById('viewer').shadowRoot.querySelector('.wpdf-page[data-page="' + shown + '"] svg');
+      const svg = window.__svgOfPage(shown);
       const viewBox = svg?.getAttribute('viewBox') ?? '';
       return viewBox && !viewBox.startsWith('0 0 ') ? viewBox : false;
     })()`,
@@ -1478,7 +1573,7 @@ try {
   await waitUntil(
     `(() => {
       const shown = document.getElementById('pageno').value;
-      const svg = document.getElementById('viewer').shadowRoot.querySelector('.wpdf-page[data-page="' + shown + '"] svg');
+      const svg = window.__svgOfPage(shown);
       return !!svg && svg.querySelectorAll('tspan[fill-opacity]').length > 0;
     })()`,
     'the bionic render of a cropped page',
@@ -1493,7 +1588,7 @@ try {
   await waitUntil(
     `(() => {
       const shown = document.getElementById('pageno').value;
-      const svg = document.getElementById('viewer').shadowRoot.querySelector('.wpdf-page[data-page="' + shown + '"] svg');
+      const svg = window.__svgOfPage(shown);
       return !!svg && (svg.getAttribute('viewBox') ?? '').startsWith('0 0 ') && svg.querySelectorAll('tspan[fill-opacity]').length === 0;
     })()`,
     'the page and the text to come back',
@@ -1502,36 +1597,49 @@ try {
 
   // ------------------------------------------------------------- the fonts
   /**
-   * A face is registered once and never again.
+   * A face is registered once, in the page it belongs to.
    *
    * This is the cost that used to land on a page boundary: a page brings its
-   * `@font-face` rules with it every time it is rendered, and handing the same
-   * family to the document a second time makes the browser lay out every text
-   * run on every page already rendered - a whole-viewport re-layout in the frame
-   * where a new page arrives. Whatever the reader has done by now - jumped,
-   * cropped, faded, scrolled - not one family may appear twice.
+   * `@font-face` rules with it, and telling a document about one makes the
+   * browser lay out every text run in that document again - a whole-viewport
+   * re-layout in the frame where a new page arrives. A page therefore gets its
+   * own document and keeps its own faces in it: the viewer's document is never
+   * told about a font at all, and no document is told about one twice. The
+   * redraw below (a fade on and off) re-renders every page and registers nothing
+   * anywhere, because those documents already have what those pages need.
    */
-  console.log('— fonts are registered once —');
-  const facesBefore = await page.evaluate('window.__faces.slice()');
+  console.log('— fonts belong to the page that needs them —');
+  const facesBefore = await page.evaluate('window.__allFaces()');
   await page.evaluate(() => window.webpdf.viewer().setBionic(true, 0.4));
   await new Promise((r) => setTimeout(r, 1500));
   await page.evaluate(() => window.webpdf.viewer().setBionic(false));
   await new Promise((r) => setTimeout(r, 1500));
-  const facesAfter = await page.evaluate('window.__faces.slice()');
-  const count = (list) => {
-    const byFamily = new Map();
-    for (const family of list) byFamily.set(family, (byFamily.get(family) ?? 0) + 1);
-    return byFamily;
-  };
-  const byFamily = count(facesAfter);
-  const repeated = [...byFamily].filter(([, n]) => n > 1);
+  const facesAfter = await page.evaluate('window.__allFaces()');
+  const total = (docs) => docs.reduce((n, d) => n + d.faces.length, 0);
+  const repeated = facesAfter.flatMap((d) => {
+    const seen = new Set();
+    return d.faces.filter((f) => (seen.has(f) ? true : (seen.add(f), false))).map((f) => `${d.id}:${f}`);
+  });
+  const top = facesAfter.find((d) => d.id === 'top');
+  const perPage = facesAfter.filter((d) => d.id !== 'top');
   console.log(
-    'fonts: ' + JSON.stringify({ registered: facesAfter.length, distinct: byFamily.size, repeated: repeated.length, afterRedraw: facesAfter.length - facesBefore.length }),
+    'fonts: ' +
+      JSON.stringify({
+        documents: facesAfter.length,
+        registered: total(facesAfter),
+        inTheViewerDocument: top?.faces.length ?? 0,
+        perPage: perPage.map((d) => d.faces.length),
+        repeated: repeated.length,
+        afterRedraw: total(facesAfter) - total(facesBefore),
+      }),
   );
-  if (facesAfter.length === 0) fail('no font face was registered at all, so the pages are not drawn with the fonts they were built with');
-  if (repeated.length) fail(`the same font face was registered more than once: ${JSON.stringify(repeated.slice(0, 4))}`);
-  if (facesAfter.length !== facesBefore.length) {
-    fail(`re-rendering the pages registered ${facesAfter.length - facesBefore.length} more font faces (they were already known)`);
+  if (total(facesAfter) === 0) fail('no font face was registered at all, so the pages are not drawn with the fonts they were built with');
+  if (top && top.faces.length > 0) {
+    fail(`the viewer's own document was told about ${top.faces.length} font faces; a page's fonts belong to the page's document`);
+  }
+  if (repeated.length) fail(`the same font face was registered twice in one document: ${JSON.stringify(repeated.slice(0, 4))}`);
+  if (total(facesAfter) !== total(facesBefore)) {
+    fail(`re-rendering the pages registered ${total(facesAfter) - total(facesBefore)} more font faces (those documents already had them)`);
   }
 
   // ------------------------------------------------------------- the bar
@@ -1630,17 +1738,17 @@ try {
   await page.waitFor(
     () => {
       const sr = document.getElementById('viewer')?.shadowRoot;
-      return !!sr && sr.querySelectorAll('svg.wpdf-page-svg').length > 0;
+      return !!sr && window.__pageSvgs().length > 0;
     },
     { label: 'example render', timeout: 120000 },
   );
   await new Promise((r) => setTimeout(r, 1500));
   const remote = await page.evaluate(() => {
     const sr = document.getElementById('viewer').shadowRoot;
-    const text = [...sr.querySelectorAll('svg text')].map((t) => t.textContent).join(' ');
+    const text = window.__pageTexts().map((t) => t.textContent).join(' ');
     return {
       pages: document.getElementById('pagecount')?.textContent,
-      textElements: sr.querySelectorAll('svg text').length,
+      textElements: window.__pageTexts().length,
       outline: document.querySelectorAll('#toc-body .toc-item').length,
       title: document.title,
       rendersInWorker: window.webpdf.viewer()?.rendersInWorker ?? null,

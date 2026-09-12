@@ -195,7 +195,9 @@ export function createSearch({ viewer, onChange }: SearchOptions): SearchControl
 
   /** A DOM range over `[start, end)` of the run's own text, across its nodes. */
   function rangeOf(el: Element, start: number, end: number): Range | null {
-    const range = document.createRange();
+    // The page's document, not this one: a page is drawn in its own frame, and a
+    // range belongs to the document its nodes live in.
+    const range = (el.ownerDocument ?? document).createRange();
     let at = 0;
     let opened = false;
     for (const node of textNodesOf(el)) {
@@ -228,13 +230,17 @@ export function createSearch({ viewer, onChange }: SearchOptions): SearchControl
     const matrix = svg.getScreenCTM?.();
     if (!range || !matrix) return false;
     const inverse = matrix.inverse();
+    // Points and bands are made by the page's own document: a node cannot be put
+    // into a tree that belongs to another one.
+    const doc = svg.ownerDocument;
+    const win = doc.defaultView ?? window;
 
     // Chromium hands back one rect per glyph; merge them per line.
     const boxes: { x: number; y: number; w: number; h: number }[] = [];
     for (const client of range.getClientRects()) {
       if (!client.width || !client.height) continue;
-      const a = new DOMPoint(client.left, client.top).matrixTransform(inverse);
-      const b = new DOMPoint(client.right, client.bottom).matrixTransform(inverse);
+      const a = new win.DOMPoint(client.left, client.top).matrixTransform(inverse);
+      const b = new win.DOMPoint(client.right, client.bottom).matrixTransform(inverse);
       boxes.push({
         x: Math.min(a.x, b.x),
         y: Math.min(a.y, b.y),
@@ -260,7 +266,7 @@ export function createSearch({ viewer, onChange }: SearchOptions): SearchControl
 
     for (const line of lines) {
       const pad = line.h * 0.12;
-      const band = document.createElementNS(SVG_NS, 'rect');
+      const band = doc.createElementNS(SVG_NS, 'rect');
       band.setAttribute('x', String(line.x - pad * 0.5));
       band.setAttribute('y', String(line.y - pad));
       band.setAttribute('width', String(line.w + pad));

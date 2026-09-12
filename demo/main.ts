@@ -223,6 +223,10 @@ async function ensureViewer(): Promise<PdfViewer> {
     // neither a render nor a font registration - see the README.
     keepPages: 1,
     shadowDom: true,
+    // A page is drawn in its own frame, so the fonts it brings cannot lay out the
+    // pages already on screen. `?frames=0` puts them back in one document, which
+    // is what the A/B in `tests/browser` measures against.
+    pageFrames: new URLSearchParams(location.search).get('frames') !== '0',
     // Read at each scroll rather than captured, so chrome that changes height
     // (the outline's own header, a bar that grows a pixel) is accounted for.
     scrollMargin: () => topbarHeight,

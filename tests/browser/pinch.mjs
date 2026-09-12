@@ -195,7 +195,9 @@ try {
   await page.waitFor(
     () => {
       const sr = document.getElementById('viewer')?.shadowRoot;
-      return !!sr && sr.querySelectorAll('svg.wpdf-page-svg').length > 0;
+      const pages = [...(sr?.querySelectorAll('.wpdf-page') ?? [])];
+      // A page is drawn in its own frame; the SVG is in that document.
+      return pages.some((el) => el.querySelector('iframe')?.contentDocument?.querySelector('svg.wpdf-page-svg'));
     },
     { label: 'first page render', timeout: 90000 },
   );
