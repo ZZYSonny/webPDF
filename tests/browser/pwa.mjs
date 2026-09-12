@@ -87,18 +87,17 @@ const check = (label, ok, detail = '') => {
 
 /**
  * The probes the demo test installs, in miniature: a page is drawn inside the
- * viewer's shadow root and, by default, inside a frame of its own, so "is it
- * drawn" is a question about a tree of documents rather than one.
+ * viewer's shadow root, as a node of the one document the pages share.
  */
 const PROBE = `(() => {
   window.__svgs = () => {
     const sr = document.getElementById('viewer')?.shadowRoot;
     if (!sr) return [];
     return [...sr.querySelectorAll('.wpdf-page')]
-      // A page is drawn in a frame of its own until the document's fonts are
-      // planned, and in the slot itself after that (see RenderMode), so the
-      // question "is this page drawn" is asked of whichever document holds it.
-      .map((el) => (el.querySelector('iframe')?.contentDocument ?? el).querySelector('svg.wpdf-page-svg'))
+      // A page drawn again under the document's faces holds two pictures for the
+      // length of the handover (see RenderMode), so the last one is the page as
+      // it now is.
+      .map((el) => [...el.querySelectorAll('svg.wpdf-page-svg')].pop())
       .filter(Boolean);
   };
   window.__kept = async () => {

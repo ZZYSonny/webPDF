@@ -228,12 +228,12 @@
                 <div id="example-menu" class="menu example-menu" role="listbox" aria-label="Example papers" hidden></div>
               </div>
               <!--
-                How the pages are drawn, chosen before the first document is
-                opened because it is a property of the engine and the viewer,
-                and both are made for the session: a frame and a face per page,
-                frames that give way to one document once the document's fonts
-                are planned, or one document and nothing on screen until they
-                are.
+                What is drawn while the document's fonts are being planned,
+                chosen before the first document is opened because it is a
+                property of the engine and the viewer, and both are made for the
+                session: either nothing until the pages can carry text, or the
+                page at once as outlines and the text handed over when it
+                arrives.
               -->
               <div class="field" id="mode-field">
                 <button
@@ -243,9 +243,9 @@
                   aria-haspopup="listbox"
                   aria-expanded="false"
                   aria-controls="mode-menu"
-                  title="How the pages are drawn while the document's fonts are being planned"
+                  title="What is drawn while the document's fonts are being planned"
                 >
-                  <span id="mode-label">IFrame + Per Page Font</span><span class="caret" aria-hidden="true">▾</span>
+                  <span id="mode-label">Global Font Only</span><span class="caret" aria-hidden="true">▾</span>
                 </button>
                 <div id="mode-menu" class="menu mode-menu" role="listbox" aria-label="Rendering mode" hidden></div>
               </div>

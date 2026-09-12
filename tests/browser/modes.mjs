@@ -9,24 +9,20 @@
  * looks at in the meantime is the viewer's choice (`RenderMode`, and the dropdown
  * on the demo's card):
  *
- *   progressive  a frame per page at once, drawn as outlines, and each page
- *                handed over to the one document as its faces are ready - the
- *                mode a reader starts in;
- *   frames       a frame per page for good, each carrying the faces *that page*
- *                needs, so nothing about a page is shared with any other;
- *   global       one document, and nothing drawn until the plan is ready.
+ *   global       nothing drawn until the plan is ready, and then every page once,
+ *                as text - the mode a reader starts in;
+ *   progressive  the page at once, as outlines, and drawn again under the
+ *                document's faces when the plan is ready.
  *
  * Three things are on trial, and they are the reason the mode exists:
  *
- *   1. a page is drawn before the plan is ready in the two frame modes, and none
- *      of them ever waits on a network or a timer to do it;
- *   2. in `frames`, what a page draws with belongs to that page's own document -
- *      a page arriving cannot make the browser lay out any other page, which is
- *      the property the whole design is for - and the viewer's own document is
- *      never told about a face at all;
+ *   1. a page is a node of the one document in both modes, and no frame is ever
+ *      made for one;
+ *   2. in `global`, the first page drawn is only drawn once the plan is ready, so
+ *      it is text the first time it is on screen and is never drawn twice;
  *   3. in `progressive`, the handover to the document's faces is not something
- *      the reader can see: a page that was on screen when the plan arrived
- *      stays on screen through it, in one document or the other.
+ *      the reader can see: a page that was on screen when the plan arrived stays
+ *      on screen through it.
  *
  *   node tests/browser/modes.mjs [url]
  */
@@ -52,26 +48,28 @@ await page.setViewport(1440, 900);
 /**
  * What the viewer is drawing, from outside it.
  *
- * A page is a frame's document while the pages are drawn one to a frame, and
- * the slot's own child after the switch, so every question here is asked of
- * whichever document holds the page - and the viewer's own document is asked
- * about separately, because *that* is the one whose layout a page's fonts must
- * never invalidate.
+ * Every page is a node of the viewer's own document now, so this is one
+ * `querySelectorAll` on the shadow root - and a page drawn again under the
+ * document's faces is a *second* `<svg>` in the same slot for as long as the
+ * handover takes, which is what `pictures` counts.
  */
 await page.send('Page.addScriptToEvaluateOnNewDocument', {
   source: `(() => {
+    const pages = () => {
+      const sr = document.getElementById('viewer')?.shadowRoot;
+      return sr ? [...sr.querySelectorAll('.wpdf-page')] : [];
+    };
+    const pictures = (el) => [...el.querySelectorAll('svg.wpdf-page-svg')];
     window.__state = () => {
       const sr = document.getElementById('viewer')?.shadowRoot;
       if (!sr) return null;
-      const rows = [...sr.querySelectorAll('.wpdf-page')].map((el) => {
-        const frame = el.querySelector('iframe');
-        const doc = frame?.contentDocument ?? el;
-        const svg = doc.querySelector('svg.wpdf-page-svg');
-        const text = svg?.querySelector('text');
+      const rows = pages().map((el) => {
+        const svgs = pictures(el);
+        const withText = svgs.find((svg) => svg.querySelector('text')) ?? svgs[0] ?? null;
+        const text = withText?.querySelector('text') ?? null;
         return {
           page: Number(el.dataset.page),
-          framed: !!frame,
-          fonts: frame ? (doc.fonts?.size ?? -1) : -1,
+          pictures: svgs.length,
           family: text?.getAttribute('font-family') ?? null,
           chars: text?.textContent?.length ?? 0,
         };
@@ -79,7 +77,7 @@ await page.send('Page.addScriptToEvaluateOnNewDocument', {
       return {
         frames: sr.querySelectorAll('iframe').length,
         topFonts: document.fonts.size,
-        framed: window.webpdf?.pagesInFrames?.() ?? null,
+        ready: window.webpdf?.plan?.()?.ready ?? null,
         mode: window.webpdf?.mode?.() ?? null,
         rows: rows.sort((a, b) => a.page - b.page),
       };
@@ -89,7 +87,7 @@ await page.send('Page.addScriptToEvaluateOnNewDocument', {
     // before the plan" is exactly what a test cannot ask for once it has
     // finished arriving.
     window.__firstDraw = null;
-    // The card's own answer: the three modes it offers, the one it stars (a
+    // The card's own answer: the modes it offers (in order), the one it stars (a
     // recommendation, not a state), the one in force (aria-selected), and what
     // the button calls it.
     window.__card = () => {
@@ -107,46 +105,40 @@ await page.send('Page.addScriptToEvaluateOnNewDocument', {
     };
     window.__frameSeen = false;
     /**
-     * Whether a slot is holding a page at all: the frame's own document while
-     * the pages are drawn one to a frame, the slot's child once they are one
-     * document. A slot that holds neither is a page the reader can only see as
-     * blank, which is what the switch must never produce.
+     * Whether a slot is holding a page at all. A slot that holds none is a page
+     * the reader can only see as blank, which is what the handover must never
+     * produce.
      */
-    const holds = (el) => {
-      const frame = el.querySelector('iframe');
-      if (frame?.contentDocument?.querySelector('svg.wpdf-page-svg')) return true;
-      return el.querySelector('svg.wpdf-page-svg') !== null;
-    };
-    // The pages that were on screen when the switch began, and the ones that
-    // stopped holding a page while it happened. The second list is the flash.
-    window.__paintedAtSwitch = null;
+    const holds = (el) => el.querySelector('svg.wpdf-page-svg') !== null;
+    // The pages that were on screen when the plan became ready, and the ones that
+    // stopped holding a page while the redraw happened. The second list is the
+    // flash the handover exists to avoid.
+    window.__paintedAtReady = null;
     window.__lostPaint = [];
     const tick = () => {
       const sr = document.getElementById('viewer')?.shadowRoot;
       if (sr) {
-        const framed = window.webpdf?.pagesInFrames?.() ?? null;
-        if (framed === false && window.__paintedAtSwitch === null && window.__firstDraw) {
-          window.__paintedAtSwitch = [...sr.querySelectorAll('.wpdf-page')].filter(holds).map((el) => Number(el.dataset.page));
+        const ready = window.webpdf?.plan?.()?.ready === true;
+        if (ready && window.__paintedAtReady === null && window.__firstDraw) {
+          window.__paintedAtReady = pages().filter(holds).map((el) => Number(el.dataset.page));
         }
-        if (window.__paintedAtSwitch) {
-          for (const el of sr.querySelectorAll('.wpdf-page')) {
+        if (window.__paintedAtReady) {
+          for (const el of pages()) {
             const page = Number(el.dataset.page);
-            if (!window.__paintedAtSwitch.includes(page) || holds(el)) continue;
+            if (!window.__paintedAtReady.includes(page) || holds(el)) continue;
             if (!window.__lostPaint.includes(page)) window.__lostPaint.push(page);
           }
         }
         if (sr.querySelector('iframe')) window.__frameSeen = true;
         if (!window.__firstDraw) {
-          const drawn = [...sr.querySelectorAll('.wpdf-page')].find((el) =>
-            (el.querySelector('iframe')?.contentDocument ?? el).querySelector('svg.wpdf-page-svg'),
-          );
+          const drawn = pages().find(holds);
           if (drawn) {
-            const doc = drawn.querySelector('iframe')?.contentDocument ?? drawn;
             window.__firstDraw = {
-              framed: window.webpdf?.pagesInFrames?.() ?? null,
-              frames: sr.querySelectorAll('iframe').length,
+              pictures: pictures(drawn).length,
               topFonts: document.fonts.size,
-              family: doc.querySelector('text')?.getAttribute('font-family') ?? null,
+              ready: window.webpdf?.plan?.()?.ready ?? null,
+              family: drawn.querySelector('text')?.getAttribute('font-family') ?? null,
+              chars: drawn.querySelector('text')?.textContent?.length ?? 0,
             };
           }
         }
@@ -179,7 +171,7 @@ async function openExample(mode, prefer = null) {
   await page.evaluate(() => {
     window.__firstDraw = null;
     window.__frameSeen = false;
-    window.__paintedAtSwitch = null;
+    window.__paintedAtReady = null;
     window.__lostPaint = [];
     document.getElementById('example-btn').click();
   });
@@ -200,159 +192,67 @@ async function openExample(mode, prefer = null) {
 }
 
 try {
-  /* ------------------------------------------------------- a frame a page */
-  console.log('\n— frames: a page is a document of its own —');
-  const frames = await openExample('frames');
-  console.log('  ' + JSON.stringify({ firstPageMs: frames.firstMs, ...frames.first }));
-  if (frames.first.framed !== true) fail('the first page was not drawn in a frame in the frame mode');
-  if (frames.first.frames < 1) fail('no page frame is open in the frame mode');
-  if (frames.first.topFonts !== 0) fail(`the viewer's document was told about ${frames.first.topFonts} faces`);
-  else ok(`a page was drawn ${frames.firstMs} ms after the click, in a frame of its own, viewer document untouched`);
-
-  // Drawn at once means drawn as outlines: the plan has not built the faces yet,
-  // and an outline is what a glyph is until it has. The text arrives when the
-  // plan does, and it arrives *inside the frames* - a page redrawn under its own
-  // faces, with nothing shared and nothing registered in the viewer's document.
-  await page.waitFor(
-    () => {
-      const state = window.__state();
-      return state && state.rows.some((row) => row.chars > 0) ? state : false;
-    },
-    { label: 'text in the frame mode', timeout: 60000 },
-  );
-  const framed = await page.evaluate('window.__state()');
-  const withText = framed.rows.filter((row) => row.chars > 0);
-  if (!withText.length) fail('no page in a frame has a text run, so nothing is proven about where its faces are');
-  else if (!withText.every((row) => row.family))
-    fail(`a page in the frame mode has text with no family: ${JSON.stringify(withText)}`);
-  if (!framed.rows.some((row) => row.fonts > 0)) fail('a page frame registered no fonts of its own');
-  if (framed.topFonts !== 0) fail(`${framed.topFonts} faces reached the viewer's document in the frame mode`);
-  else
-    ok(
-      `${framed.rows.length} page frame(s), each with its own faces (${framed.rows.map((r) => r.fonts).join(', ')}), viewer document clean`,
-    );
-
-  /**
-   * And a page arriving touches nothing else.
-   *
-   * This is the property frames exist for. The pages on screen have their own
-   * documents with their own faces; a page that arrives with a face nobody has
-   * seen registers it in *its* document, and every document that was already
-   * there is left exactly as it was.
-   */
-  const before = await page.waitFor(
-    () => {
-      const state = window.__state();
-      // Two pages, both drawn: a page whose slot is still empty has no frame
-      // yet, and "unchanged" would be true of it for the wrong reason.
-      return state && state.rows.filter((row) => row.fonts > 0).length >= 2 ? state : false;
-    },
-    { label: 'two pages drawn one to a frame', timeout: 60000 },
-  );
-  const scrollBy = await page.evaluate('Math.round(innerHeight * 0.5)');
-  for (let i = 0; i < 3; i++) {
-    await page.send('Input.dispatchMouseEvent', {
-      type: 'mouseWheel',
-      x: 700,
-      y: 500,
-      deltaX: 0,
-      deltaY: scrollBy,
-      pointerType: 'mouse',
-    });
-    await sleep(180);
-  }
-  await sleep(2500);
-  const after = await page.evaluate('window.__state()');
-  const survived = before.rows.filter(
-    (row) => row.fonts > 0 && after.rows.some((now) => now.page === row.page),
-  );
-  const disturbed = survived.filter((row) => after.rows.find((now) => now.page === row.page).fonts !== row.fonts);
-  console.log(
-    '  ' +
-      JSON.stringify({
-        pagesBefore: before.rows.map((r) => `${r.page}:${r.fonts}`),
-        pagesAfter: after.rows.map((r) => `${r.page}:${r.fonts}`),
-        viewerDocumentFaces: after.topFonts,
-      }),
-  );
-  if (!survived.length) fail('every page on screen was replaced by the scroll, so nothing could be compared');
-  else if (disturbed.length) {
-    fail(`a page arriving changed the fonts of ${disturbed.length} other page(s): ${JSON.stringify(disturbed.map((r) => r.page))}`);
-  } else if (after.topFonts !== 0) fail(`${after.topFonts} faces reached the viewer's document while scrolling`);
-  else ok(`${survived.length} page document(s) unchanged by the pages arriving after them`);
-  if (!after.rows.some((row) => row.fonts > 0)) fail('no page frame has fonts after scrolling');
-
-  /* ------------------------------------------------- frames into one document */
-  console.log('\n— progressive: frames first, one document once the plan is ready —');
+  /* ------------------------------------------------- outlines, then text */
+  console.log('\n— progressive: outlines at once, the document’s text once the plan is ready —');
   // A hundred-page report rather than the paper the card lists first: the plan
   // for a paper is over before the first page is drawn, and a mode whose whole
   // point is what happens *while* it is not ready can only be watched on a
   // document where it is not ready yet.
   const progressive = await openExample('progressive', '2303.08774');
   console.log('  ' + JSON.stringify({ firstPageMs: progressive.firstMs, ...progressive.first }));
-  if (progressive.first.framed !== true) {
+  if (progressive.first.family !== null) {
     // Not a failure: `open` never waits for the plan, and when the plan wins the
-    // race there is nothing to hand over. It is worth saying which happened.
+    // race the first page is already text. It is worth saying which happened.
     console.log('  (the plan was ready before the first page: nothing to hand over)');
+  } else if (progressive.first.chars !== 0) {
+    fail('page 1 was drawn before the plan with text in it, so it was not outlines');
   } else {
-    ok(`page 1 drawn ${progressive.firstMs} ms after the click, before the plan was ready`);
+    ok(`page 1 drawn ${progressive.firstMs} ms after the click, as outlines, before the plan was ready`);
   }
-  const framedFamily = progressive.first.family;
-  const switching = Date.now();
-  await page.waitFor(() => window.webpdf.pagesInFrames() === false, {
-    label: 'the switch to one document',
-    timeout: 120000,
-  });
-  const switchMs = Date.now() - switching;
+  if (progressive.first.pictures !== 1) fail(`the first page arrived as ${progressive.first.pictures} picture(s)`);
+  if (progressive.first.topFonts !== 0) fail(`the document had ${progressive.first.topFonts} faces before the plan`);
+
   /**
-   * The pages are drawn again under the document's faces, one at a time, and
-   * each frame is let go only once the page under it has painted - so the end of
-   * the switch is the last frame going, not the flag that says it started. And
-   * while that happens every page that was on screen at the start of it has to
-   * keep holding a page: the frame covers the redraw, and it is the repaint that
-   * must be waited for, not a blank the reader would see.
+   * The pages are drawn again under the document's faces, and each old picture
+   * stays until the new one has painted - so the end of the handover is the
+   * outlines going, not the flag that says it started. And while that happens
+   * every page that was on screen at the start of it has to keep holding a page:
+   * the outlines cover the redraw, and it is the repaint that must be waited for,
+   * not a blank the reader would see.
    */
-  const switched = await page.waitFor(
+  await page.waitFor(
     () => {
       const state = window.__state();
       const one = state?.rows.find((row) => row.page === 1);
-      return state && state.frames === 0 && one && !one.framed && one.chars > 0 && one.family !== null ? state : false;
+      // Text in the page, and the outline picture it was drawn over now gone:
+      // two pictures is the handover in progress, not the end of it.
+      return state && one && one.chars > 0 && one.family !== null && one.pictures === 1 ? state : false;
     },
-    { label: 'page 1 drawn again as one document', timeout: 60000 },
+    { label: 'page 1 drawn again as text', timeout: 120000 },
   ).catch(async (error) => {
     console.log('  diagnostics: ' + JSON.stringify(await page.evaluate('window.__state()')));
     throw error;
   });
-  const one = switched.rows.find((row) => row.page === 1);
+  const redrawn = await page.evaluate('window.__state()');
   const lost = await page.evaluate('window.__lostPaint');
-  const painted = await page.evaluate('window.__paintedAtSwitch');
+  const painted = await page.evaluate('window.__paintedAtReady');
+  const one = redrawn.rows.find((row) => row.page === 1);
   console.log(
     '  ' +
       JSON.stringify({
-        switchMs,
-        frames: switched.frames,
-        viewerDocumentFaces: switched.topFonts,
-        page1: { framed: one.framed, chars: one.chars, family: one.family },
-        paintedAtSwitch: painted,
+        frames: redrawn.frames,
+        viewerDocumentFaces: redrawn.topFonts,
+        page1: { pictures: one.pictures, chars: one.chars, family: one.family },
+        paintedAtReady: painted,
         wentBlank: lost,
       }),
   );
-  if (switched.frames !== 0) fail(`${switched.frames} page frame(s) survived the switch`);
-  if (one.framed) fail('page 1 is still in a frame after the switch');
-  if (switched.topFonts < 1) fail('the document was told about no faces at the switch');
-  if (!one.chars) fail('the page came back from the switch with no text');
-  if (lost.length) fail(`page(s) ${lost.join(', ')} went blank while the frames were let go`);
-  else if (painted) ok(`${painted.length} page(s) on screen at the switch stayed drawn throughout it`);
-  // Before the plan a page is outlines: the same shapes, no text, no family. A
-  // page that had one *before* the switch and has the other after it is a page
-  // that was drawn twice, which is what the handover is.
-  if (framedFamily !== null) {
-    fail(`page 1 named a family (${framedFamily}) before the plan was ready, so it was not drawn as outlines`);
-  } else if (one.family === null) {
-    fail('page 1 came out of the switch with no family, so the document faces did not reach it');
-  } else {
-    ok(`switched ${switchMs} ms after the first page: ${switched.topFonts} document faces, page 1 redrawn under ${one.family}`);
-  }
+  if (redrawn.frames !== 0) fail(`${redrawn.frames} page frame(s) were made, so the pages are not one document`);
+  if (redrawn.topFonts < 1) fail('the document was told about no faces when the plan became ready');
+  if (one.family === null) fail('page 1 came out of the handover with no family, so the document faces did not reach it');
+  if (one.pictures !== 1) fail(`page 1 ended the handover with ${one.pictures} pictures`);
+  if (lost.length) fail(`page(s) ${lost.join(', ')} went blank while the outlines were let go`);
+  else if (painted) ok(`${painted.length} page(s) on screen at the plan stayed drawn throughout the handover`);
 
   /* ---------------------------------------------------- one document only */
   console.log('\n— global: one document, nothing drawn until the plan is ready —');
@@ -362,26 +262,25 @@ try {
   const frameSeen = await page.evaluate('window.__frameSeen');
   console.log('  ' + JSON.stringify({ firstPageMs: global.firstMs, ...global.first, frameSeen }));
   if (frameSeen) fail('a page frame appeared in the global mode');
-  if (global.first.framed !== false) fail('the global mode reported itself as drawing frames');
-  if (global.first.frames !== 0) fail(`${global.first.frames} frame(s) were open when the first global page was drawn`);
-  if (global.first.topFonts < 1) fail('the first planned page was drawn before the document had any faces');
+  if (global.first.pictures !== 1) fail(`the first page arrived as ${global.first.pictures} picture(s)`);
+  if (global.first.ready !== true) fail('the global mode drew a page before the plan was ready');
+  if (global.first.topFonts < 1) fail('the first global page was drawn before the document had any faces');
   if (!global.first.family) fail('the first global page has no text run');
-  if (!state.rows.every((row) => !row.framed)) fail('a page is in a frame in the global mode');
-  else ok(`page 1 drawn ${global.firstMs} ms after the click, one document from the first pixel, no frame ever`);
+  if (!state.rows.every((row) => row.pictures === 1)) fail('a page holds more than one picture in the global mode');
+  else ok(`page 1 drawn ${global.firstMs} ms after the click, as text, only once the plan was ready, no frame ever`);
 
   /* ------------------------------------------------- the card, and memory */
   /**
    * Which mode a reader gets, which one they keep, and what the star means.
    *
-   * With nothing on the URL it is the progressive mode - the page at once, the
-   * text as soon as the plan has it, and one document after that - and the card
-   * stars that row, because a star here is a *recommendation* and not a state
-   * (the crop menu's star is the same): the row
-   * in force is the one the menu opens on and colours. Choosing another one and
-   * reading a document under it is a choice the reader made, so it is remembered
-   * with that document like every other setting, and the next visit builds the
-   * engine and the viewer with it - while the star stays where the recommendation
-   * is.
+   * With nothing on the URL it is the global mode - nothing drawn until the plan
+   * is ready, and then every page once - and the card stars that row, because a
+   * star here is a *recommendation* and not a state (the crop menu's star is the
+   * same): the row in force is the one the menu opens on and colours. Choosing
+   * another one and reading a document under it is a choice the reader made, so
+   * it is remembered with that document like every other setting, and the next
+   * visit builds the engine and the viewer with it - while the star stays where
+   * the recommendation is.
    */
   console.log('\n— the card: the default, the reader’s own choice, and the star —');
   await page.evaluate("localStorage.removeItem('webpdf.memory')");
@@ -389,36 +288,46 @@ try {
   await page.waitFor(() => typeof window.webpdf === 'object', { label: 'demo bootstrap', timeout: 90000 });
   const byDefault = await page.evaluate(() => ({ mode: window.webpdf.mode(), card: window.__card() }));
   console.log('  ' + JSON.stringify(byDefault));
-  if (byDefault.mode !== 'progressive') fail(`a reader who has chosen nothing should start in the progressive mode, got ${byDefault.mode}`);
-  if (byDefault.card.rows.length !== 3) fail(`the card should offer three modes, got ${JSON.stringify(byDefault.card.rows)}`);
-  if (byDefault.card.starred.join() !== 'progressive')
+  if (byDefault.mode !== 'global') fail(`a reader who has chosen nothing should start in the global mode, got ${byDefault.mode}`);
+  if (byDefault.card.rows.join() !== 'global,progressive')
+    fail(`the card should offer global first and progressive second, got ${JSON.stringify(byDefault.card.rows)}`);
+  if (byDefault.card.starred.join() !== 'global')
     fail(`the card should star the recommended mode, got ${JSON.stringify(byDefault.card.starred)}`);
   if (byDefault.card.selected.join() !== byDefault.mode) {
     fail(`the card should mark the mode in force (${byDefault.mode}), got ${JSON.stringify(byDefault.card.selected)}`);
   }
-  if (!/Draw at Once/.test(byDefault.card.label)) fail(`the card should name the mode in force, got ${JSON.stringify(byDefault.card.label)}`);
-  else ok(`a fresh page starts in ${byDefault.mode}, and the card stars the recommendation and marks the choice`);
+  if (!/Global Font Only/.test(byDefault.card.label)) fail(`the card should name the mode in force, got ${JSON.stringify(byDefault.card.label)}`);
+  else ok(`a fresh page starts in ${byDefault.mode}, first in the list, and the card stars it and marks it as the choice`);
 
   await page.evaluate(() => {
     document.getElementById('mode-btn').click();
-    document.querySelector('#mode-menu .menu-option[data-mode="global"]').click();
+    document.querySelector('#mode-menu .menu-option[data-mode="progressive"]').click();
   });
   const chosen = await page.evaluate(() => ({ mode: window.webpdf.mode(), label: document.getElementById('mode-label').textContent }));
-  if (chosen.mode !== 'global') fail(`choosing Global Font Only should take effect before the next document, got ${chosen.mode}`);
-  const remember = await openExample('global');
-  if (remember.first.framed !== false) fail('the chosen global mode did not take effect for the document that followed it');
+  if (chosen.mode !== 'progressive') fail(`choosing progressive should take effect before the next document, got ${chosen.mode}`);
+  // Read a document under the chosen mode, which is what writes the choice down.
+  await openExample('progressive');
   // The memory is written once the reader settles into the document.
   await sleep(1200);
   await page.goto(url);
   await page.waitFor(() => typeof window.webpdf === 'object', { label: 'demo bootstrap again', timeout: 90000 });
   const remembered = await page.evaluate(() => ({ mode: window.webpdf.mode(), card: window.__card() }));
   console.log('  ' + JSON.stringify(remembered));
-  if (remembered.mode !== 'global') fail(`the mode a reader chose should come back on the next visit, got ${remembered.mode}`);
-  else if (remembered.card.selected.join() !== 'global') {
+  if (remembered.mode !== 'progressive') fail(`the mode a reader chose should come back on the next visit, got ${remembered.mode}`);
+  else if (remembered.card.selected.join() !== 'progressive') {
     fail(`the card should mark the remembered mode as the one in force, got ${JSON.stringify(remembered.card.selected)}`);
-  } else if (remembered.card.starred.join() !== 'progressive') {
+  } else if (remembered.card.starred.join() !== 'global') {
     fail(`the star should stay on the recommendation, got ${JSON.stringify(remembered.card.starred)}`);
   } else ok('the chosen mode came back and is marked as the choice, with the star still on the recommendation');
+
+  // `?plan=0` predates the menu, when "do not plan" was the only other answer
+  // there was; it still means "do not wait for the plan", which is progressive.
+  await page.evaluate("localStorage.removeItem('webpdf.memory')");
+  await page.goto(`${url}${url.includes('?') ? '&' : '?'}plan=0`);
+  await page.waitFor(() => typeof window.webpdf === 'object', { label: 'demo bootstrap with plan=0', timeout: 90000 });
+  const legacy = await page.evaluate('window.webpdf.mode()');
+  if (legacy !== 'progressive') fail(`?plan=0 should still mean the mode that does not wait for the plan, got ${legacy}`);
+  else ok('?plan=0 still names the mode that does not wait for the plan');
 } catch (error) {
   fail(String(error && error.stack ? error.stack.split('\n')[0] : error));
 } finally {

@@ -131,8 +131,6 @@ let topbarHeight = 0;
  * own - see `document-loaded` below.
  */
 let sourceName = '';
-/** True while a document's pages are drawn one to a frame (see `render-mode`). */
-let pagesWereFramed = false;
 
 /* ---------------------------------------------------------------- sources */
 
@@ -270,34 +268,25 @@ const bionicMenu: Menu = createMenu({
  * then every glyph is an outline - the same shapes, in the same places, with no
  * text to select or search. The plan is cheap (0.2 s for a hundred pages, 0.9 s
  * for the 756-page specification, measured) but it is not instant, so the
- * question the three modes answer is what to do with it:
+ * question the two modes answer is what to do with it:
  *
+ *   - `'global'` draws nothing at all until the plan is ready, and then draws
+ *     once: the page a reader sees is never drawn twice. This is the mode the
+ *     page starts in and stars.
  *   - `'progressive'` draws at once - outlines, which look like the page they
  *     are - and redraws everything under the document's faces the moment they
- *     are ready, handing each page over to the one document without the reader
- *     seeing it. This is the mode the page starts in and stars.
- *   - `'frames'` keeps every page in a frame of its own and gives each frame the
- *     faces *that page* needs, so nothing about a page is shared with any other.
- *     A page is still drawn at once (as outlines), and redrawn with its faces
- *     when the plan arrives; it stays in frames afterwards.
- *   - `'global'` draws nothing at all until the plan is ready, and then draws
- *     once: the page a reader sees is never drawn twice.
+ *     are ready, handing each page over without the reader seeing it.
  */
 const RENDER_MODES: ReadonlyArray<{ id: RenderMode; label: string; note: string }> = [
   {
-    id: 'progressive',
-    label: 'Draw at Once, Then Text',
-    note: 'the page immediately as outlines, then the document’s faces — one document once they arrive',
-  },
-  {
-    id: 'frames',
-    label: 'IFrame + Per Page Font',
-    note: 'a frame and its own faces per page — nothing is shared between pages',
-  },
-  {
     id: 'global',
     label: 'Global Font Only',
-    note: 'one document — nothing is drawn until the document’s fonts are planned',
+    note: 'the most performant path — nothing is drawn until the document’s fonts are planned, then each page once',
+  },
+  {
+    id: 'progressive',
+    label: 'Draw at Once, Then Text',
+    note: 'the page immediately as outlines, then the document’s faces — handed over without the reader seeing it',
   },
 ];
 
@@ -307,13 +296,13 @@ const RENDER_MODES: ReadonlyArray<{ id: RenderMode; label: string; note: string 
  * A star in this page is a recommendation and not a state - the crop menu's
  * works the same way, and its README says so - so the row it sits on is the
  * setting worth choosing and the row *in force* is the one the menu opens on and
- * colours (`aria-selected`). Drawing at once and letting the text arrive is the
- * recommended one because a reader never waits for a document to be read before
- * seeing it, and because what they get in the meantime is the page itself - the
- * same glyphs, the same positions, with only the text layer still to come. The
- * other two are one click away on the same dropdown.
+ * colours (`aria-selected`). Waiting for the plan is the recommended one because
+ * the plan is cheap even for a 756-page document, and because waiting means no
+ * page is ever drawn twice: the reader gets the finished page, with its text, the
+ * first time it is on screen. `'progressive'` is one click away on the same
+ * dropdown, for a reader who would rather see the page at once.
  */
-const RECOMMENDED_MODE: RenderMode = 'progressive';
+const RECOMMENDED_MODE: RenderMode = 'global';
 
 function modeNamed(value: unknown): RenderMode | null {
   return RENDER_MODES.some((mode) => mode.id === value) ? (value as RenderMode) : null;
@@ -322,9 +311,9 @@ function modeNamed(value: unknown): RenderMode | null {
 function requestedMode(): RenderMode {
   const params = new URLSearchParams(location.search);
   // `?plan=0` is the name this page used before there was a menu, when "do not
-  // plan" was the only other answer there was; it still means the frame mode,
-  // which is the one that never leaves a frame.
-  if (params.get('plan') === '0') return 'frames';
+  // plan" was the only other answer there was; it still means "do not wait for
+  // the plan", which is the one mode that does not.
+  if (params.get('plan') === '0') return 'progressive';
   return modeNamed(params.get('mode')) ?? modeNamed(inherited(memory)?.renderMode) ?? RECOMMENDED_MODE;
 }
 
@@ -462,8 +451,8 @@ async function ensureViewer(): Promise<PdfViewer> {
     // neither a render nor a font registration - see the README.
     keepPages: 1,
     shadowDom: true,
-    // Frames with the page's own fonts until the document's plan is ready, then
-    // one document - see `RENDER_MODES` above, and `RenderMode` in the viewer.
+    // What is drawn while the document's fonts are planned - see `RENDER_MODES`
+    // above, and `RenderMode` in the viewer.
     renderMode,
     // Read at each scroll rather than captured, so chrome that changes height
     // (the outline's own header, a bar that grows a pixel) is accounted for.
@@ -520,15 +509,12 @@ function onViewerEvent(event: ViewerEvent): void {
       viewer?.stepZoom(-1);
       break;
     }
-    case 'render-mode':
-      // How the pages are drawn changed. Only the change is worth saying out
-      // loud: the first document's fonts were planned while the reader was
-      // looking at frames, and the pages are one document from here on.
-      if (event.mode === 'frames') pagesWereFramed = true;
-      else if (pagesWereFramed) {
-        pagesWereFramed = false;
-        notify('The document’s fonts are planned — the pages are one document now.');
-      }
+    case 'plan-change':
+      // In `'global'` the pages were blank a moment ago and are about to be
+      // drawn; in `'progressive'` they were outlines and are about to be text.
+      // Either way the reader is looking at the document throughout, so there is
+      // nothing to say - the page itself is the answer. A host that wants a
+      // progress strip reads `plan`.
       break;
     case 'page-change':
       currentPage = event.page;
@@ -1538,8 +1524,6 @@ declare global {
       open(url: string): Promise<void>;
       /** The rendering mode this session was started in. */
       mode(): RenderMode;
-      /** Whether the pages are drawn one to a frame at this moment. */
-      pagesInFrames(): boolean;
       /** How far the document's font plan has got, or null before one starts. */
       plan(): FontPlanProgress | null;
     };
@@ -1550,7 +1534,6 @@ window.webpdf = {
   info: () => info,
   open: (url) => openSource(resolve(url)),
   mode: () => renderMode,
-  pagesInFrames: () => viewer?.pagesInFrames ?? false,
   plan: () => viewer?.planProgress ?? null,
 };
 

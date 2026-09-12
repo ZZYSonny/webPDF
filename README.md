@@ -131,6 +131,43 @@ There is no configuration in which the output is *wrong*; the worst case is the
 older, larger, still-correct representation. And an outline is pixel-identical to
 the text it replaces: same glyph, same position, same paint.
 
+### One document, and the iframe-per-page that is gone
+
+An earlier design drew every page inside its own `<iframe>`, and gave each frame
+the faces *that page* needed. That was not a layout choice and not an
+implementation convenience: it was the only way to stop a page's fonts from
+repainting the rest of the document, and it is worth writing down why, because
+the reason it existed is gone.
+
+Registering a `@font-face` is not an incremental change to a document. The
+browser adds the face to the document's font set and then re-lays-out every text
+run in that document, to find out whether any of them now resolves to something
+else. Measured in Chromium, adding **one** face to a document holding a 15-page
+paper touched **3347 nodes and cost 112.9 ms** — several dropped frames, for one
+face. The old per-page pipeline (`src/`, since deleted) built one face per page,
+out of the glyphs that page happened to draw, so every page arriving minted a new
+family and registered it: a page boundary was a whole-document repaint. The frame
+was the isolation that made that survivable — a page's faces landed in the page's
+own document, where no other page could be invalidated by them.
+
+None of that is needed now, because the core does not build fonts per page. It
+builds **one face per *font*, for the whole document** (`Plan`,
+`core/src/font/plan.rs`), and the viewer writes every one of those faces into the
+single document **once**, before the first page is drawn (`wpdf_stylesheet`). One
+write, one re-layout, and never again: a page drawn later names families the
+document is already carrying, so it registers nothing and invalidates nothing.
+There is no per-page face left to isolate, so there is nothing for a frame to
+isolate — and with the frame gone the pages share one document, which is what
+gives the reader selection across pages, find-in-page over the paper, and a
+caret.
+
+The one case where a face is written late at all is a page drawn before the plan
+is ready, which is what *Draw at Once, Then Text* is for. That page is drawn as
+**outlines**, and outlines name no face: they are paths. It is drawn again once
+the plan lands, and the document's faces went in before that redraw. So even
+there the write happens once, and there is still no per-page face and still
+nothing a frame would absorb.
+
 ---
 
 ## Results
@@ -244,19 +281,20 @@ pages' zoom belongs to the viewer:
 * **The rendering mode is chosen on the card too, and remembered.** This is the
   one place where the core's architecture is visible. There is a single font
   path — the document's — and text exists only once the plan has built its faces;
-  until then a page is outlines. The three modes are three answers to what to do
-  about that:
+  until then a page is outlines. The two modes are two answers to what to do
+  about that, and the menu lists them with global first:
+  * *Global Font Only* draws nothing until the plan is ready, and then draws each
+    page once, as text. This is the default and the starred row, and it is the
+    most performant path: no page is ever drawn twice.
   * *Draw at Once, Then Text* draws immediately (as outlines), and hands each
-    page over to the one document when the faces arrive, with the page under the
-    frame staying on screen throughout. This is the default and the starred row.
-  * *IFrame + Per Page Font* keeps every page in a frame of its own, carrying the
-    faces that page needs, so nothing about a page is shared with any other.
-  * *Global Font Only* shows nothing until the plan is ready, and then draws
-    once.
+    page over to the document's faces when they arrive, with the outlines staying
+    on screen underneath until the new page has painted.
 
   A star here is a recommendation and not a state (the same as the crop menu's),
   and the row in force is the one the menu opens on and colours. The choice is
-  written down with the document it was made for; `?mode=` names one for a test.
+  written down with the document it was made for; `?mode=` names one for a test,
+  and `?plan=0` — the name this page used before there was a menu — still means
+  the one that does not wait for the plan.
 * **One bar, one line, no status bar.** The bar is the document's chrome and it
   arrives with the first page; it stays a single row at every window width, and
   what gives way to keep it there is the find box: below 560px the page count and
@@ -368,7 +406,7 @@ demo/                       the viewer (the Vite root, and the site)
                             and the frame a print goes into
   main.ts                   the bar, the card, and everything wired to them
   viewer.ts                 the scrolling viewer: page geometry, the window, the
-                            three render modes, the font handover
+                            two render modes, and the font handover
   layout.ts                 page geometry and the visible-range maths
   memory.ts                 where the reader was: the hundred most recent documents
   search.ts                 find, and the highlights it paints
@@ -426,7 +464,7 @@ serves the demo, and drives all of it in Chromium over CDP:
 | --- | --- |
 | `tests/core/wasm.mjs` | the wasm bridge's exports, driven from Node in a second — open, plan, stylesheet, render, crop, links, save, close |
 | `demo.mjs` | the whole application: the card, the bar at every width, the outline, the search, crop, bionic, links, Ctrl+S, Ctrl+P — and the screenshot in this README |
-| `modes.mjs` | the three render modes: what a page is drawn in, when the text arrives, and that the handover is invisible |
+| `modes.mjs` | the two render modes: what is drawn while the plan is walking, that no page frame is ever made, and that the handover is invisible |
 | `pinch.mjs` | the zoom contract, and that the browser's own pinch does no layout work |
 | `bridge.mjs` | a host page: what crosses the bridge, and a document with a password |
 | `pwa.mjs` | the service worker, the kept engine, a redeploy, and the viewer with no network at all |
@@ -445,9 +483,10 @@ wants; the published site is `dist/demo`, and the extension points at it.
 
 * **Text arrives with the plan.** The core has one font path — the document's —
   so a page rendered before the plan has finished is glyph outlines: the same
-  pixels, no text layer. That is what the render modes are about, and why the
-  default draws at once. For a large document the outline phase is a second or
-  two; for a paper it is usually over before the first page is on screen.
+  pixels, no text layer. That is what the render modes are about. The default
+  waits for the plan, which is 0.2 s for a hundred pages and 0.9 s for the
+  756-page specification, so a reader normally sees the finished page; the other
+  mode draws the outlines at once and swaps the text in underneath.
 * **Right-to-left and complex-shaping scripts stay outlines.** The text device
   reports one character per glyph in visual order, and the browser would shape
   the emitted letters in logical order; the two disagree, so the glyphs are left

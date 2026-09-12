@@ -17,14 +17,13 @@ const url = process.argv[2] ?? 'http://127.0.0.1:5175/';
 /**
  * The rendering mode this run is about.
  *
- * The demo starts in the progressive mode - a page at once, then the document's
- * faces (see `RenderMode`) - and the checks below are about the *planned*
- * document: one document, one face per font, every face before the first page
- * and none after it. So this run asks for that mode explicitly and lets the
- * switch happen before it starts. The three modes themselves, and what each one
- * is drawn in while the plan is walking, are `modes.mjs`.
+ * The demo starts in the global mode - nothing drawn until the document's fonts
+ * are planned, and then every page once (see `RenderMode`) - and the checks below
+ * are about the *planned* document: one document, one face per font, every face
+ * before the first page and none after it. So this run asks for that mode
+ * explicitly. What each mode draws while the plan is walking is `modes.mjs`.
  */
-const at = `${url}${url.includes('?') ? '&' : '?'}mode=progressive`;
+const at = `${url}${url.includes('?') ? '&' : '?'}mode=global`;
 const out = process.argv[3] ?? path.join(here, 'out', 'demo.png');
 fs.mkdirSync(path.dirname(out), { recursive: true });
 
@@ -91,8 +90,7 @@ await page.send('Page.addScriptToEvaluateOnNewDocument', {
     window.__diag = () => ({
       pageno: document.getElementById('pageno')?.value ?? '',
       pagecount: document.getElementById('pagecount')?.textContent ?? '',
-      framed: window.webpdf?.pagesInFrames?.() ?? null,
-      frames: document.getElementById('viewer')?.shadowRoot?.querySelectorAll('iframe').length ?? -1,
+      ready: window.webpdf?.plan?.()?.ready ?? null,
       live: window.__pageSvgs().length,
       texts: window.__pageTexts().length,
       uses: window.__pageSvgs().reduce((n, svg) => n + svg.querySelectorAll('use').length, 0),
@@ -210,17 +208,19 @@ const open = async (value) => {
     console.log('  console: ' + JSON.stringify(page.consoleMessages.slice(-6)));
     throw error;
   }
+  // The document is planned once the plan says so *and* the redraw it caused has
+  // settled. A page drawn before the plan - which is what `progressive` does -
+  // holds two pictures for the length of the handover, the outlines and the text;
+  // it is over when no slot holds two.
   await page.waitFor(
     () => {
-      if (window.webpdf.pagesInFrames() !== false) return false;
-      // The pages are drawn again one at a time, and each frame is let go only
-      // once the page under it has painted, so "one document" is the last frame
-      // going and not the flag that says the handover has started.
+      if (window.webpdf.plan()?.ready !== true) return false;
       const sr = document.getElementById('viewer')?.shadowRoot;
-      return (sr?.querySelectorAll('iframe').length ?? -1) === 0;
+      const pages = [...(sr?.querySelectorAll('.wpdf-page') ?? [])];
+      return pages.length > 0 && pages.every((el) => el.querySelectorAll('svg.wpdf-page-svg').length === 1);
     },
     {
-      label: `one document for ${value}`,
+      label: `the planned document for ${value}`,
       timeout: 120000,
     },
   );
@@ -429,13 +429,13 @@ try {
   if (!beforeLoad.barHidden) fail('the bar should not be in the way before a document is open');
   if (beforeLoad.emptyHidden !== false) fail('the empty state should be showing before a document is open');
   if (beforeLoad.offered.includes(false)) fail('the empty card should offer a file, the example papers and the rendering mode');
-  // The rendering mode: three ways to draw a page while the document's fonts
-  // are being planned. A star here is a recommendation and not a state - the
-  // crop menu's is the same - so the starred row is the recommended mode, and
-  // the row in force is the one the menu marks as selected. This run asks for
-  // `progressive` on the URL, so that is the choice; the mode a reader gets with
-  // no URL at all, and the one they are remembered as having chosen, are
-  // `modes.mjs`.
+  // The rendering mode: two ways to draw a page while the document's fonts are
+  // being planned, listed with global first. A star here is a recommendation and
+  // not a state - the crop menu's is the same - so the starred row is the
+  // recommended mode, and the row in force is the one the menu marks as selected.
+  // This run asks for `global` on the URL, so that is the choice; the mode a
+  // reader gets with no URL at all, and the one they are remembered as having
+  // chosen, are `modes.mjs`.
   const chosenMode = await page.evaluate('window.webpdf.mode()');
   const modes = await page.evaluate(() => {
     document.getElementById('mode-btn').click();
@@ -448,8 +448,9 @@ try {
   await page.evaluate(() => document.getElementById('mode-btn').click());
   const starred = modes.filter((row) => row.starred).map((row) => row.mode);
   const selected = modes.filter((row) => row.selected).map((row) => row.mode);
-  if (modes.length !== 3) fail(`the rendering mode should offer three modes, got ${JSON.stringify(modes)}`);
-  if (starred.join() !== 'progressive') fail(`the card should star the recommended mode, got ${JSON.stringify(starred)}`);
+  if (modes.length !== 2) fail(`the rendering mode should offer two modes, got ${JSON.stringify(modes)}`);
+  if (modes[0]?.mode !== 'global') fail(`the rendering mode should list global first, got ${JSON.stringify(modes.map((m) => m.mode))}`);
+  if (starred.join() !== 'global') fail(`the card should star the recommended mode, got ${JSON.stringify(starred)}`);
   if (selected.join() !== chosenMode) fail(`the card should mark the mode in force (${chosenMode}), got ${JSON.stringify(selected)}`);
   if (beforeLoad.gone.length) fail(`the bar still carries ${beforeLoad.gone.join(', ')}`);
   if (!beforeLoad.options.includes(PUBLIC_EXAMPLE)) {
@@ -1747,28 +1748,25 @@ try {
    * document again, so a page arriving with a face of its own used to re-lay-out
    * the whole viewport. The engine plans the document's fonts - one face per
    * *font*, not per page - in the background, and the viewer writes all of them
-   * into its own document in one go the moment the plan is ready, draws the
-   * pages again under them, and lets each frame go once the page beneath it has
-   * painted. After that there is one document,
-   * no page is a document of its own, and a redraw (a fade on and off, which
-   * re-renders every page) registers nothing at all.
+   * into its own document in one go the moment the plan is ready, before the
+   * first page is drawn. After that there is one document, no page is a document
+   * of its own, and a redraw (a fade on and off, which re-renders every page)
+   * registers nothing at all.
    */
   console.log('— every face goes in once, when the plan is ready —');
   await page.waitFor(
     () => {
-      if (window.webpdf.pagesInFrames() !== false) return false;
+      if (window.webpdf.plan()?.ready !== true) return false;
       const sr = document.getElementById('viewer')?.shadowRoot;
-      return (sr?.querySelectorAll('iframe').length ?? -1) === 0;
+      const pages = [...(sr?.querySelectorAll('.wpdf-page') ?? [])];
+      return pages.length > 0 && pages.every((el) => el.querySelectorAll('svg.wpdf-page-svg').length === 1);
     },
     {
-      label: 'the pages to become one document',
+      label: 'the planned document to settle',
       timeout: 90000,
     },
   );
   const facesBefore = await page.evaluate('window.__allFaces()');
-  const framesBefore = await page.evaluate(
-    "document.getElementById('viewer').shadowRoot.querySelectorAll('iframe').length",
-  );
   await page.evaluate(() => window.webpdf.viewer().setBionic(true, 0.4));
   await new Promise((r) => setTimeout(r, 1500));
   await page.evaluate(() => window.webpdf.viewer().setBionic(false));
@@ -1787,13 +1785,11 @@ try {
         registered: total(facesAfter),
         inTheViewerDocument: top?.faces.length ?? 0,
         perPageDocuments: facesAfter.length - 1,
-        pageFrames: framesBefore,
         repeated: repeated.length,
         afterRedraw: total(facesAfter) - total(facesBefore),
       }),
   );
   if (total(facesAfter) === 0) fail('no font face was registered at all, so the pages are not drawn with the fonts they were built with');
-  if (framesBefore) fail(`${framesBefore} page frame(s) are still in the viewer: a page should not need a document of its own`);
   // Every face in the one document the pages are in. (The demo shell's own print
   // frame is a document too, and it holds none.)
   const withFaces = facesAfter.filter((d) => d.faces.length > 0).length;

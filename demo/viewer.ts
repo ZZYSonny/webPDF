@@ -33,21 +33,17 @@
  *
  *  - Pages are rendered for a window that reaches a whole viewport past the
  *    viewport on each side, so a page is drawn well before it is looked at.
- *  - A page is never a document of its own for longer than it has to be. The
- *    engine plans the document's fonts in the background - one `@font-face` per
- *    *font*, for every page - and until that plan is ready a page's faces are
- *    its own, built from the glyphs that page drew. Registering a face makes
- *    Chromium lay out every text run of the document it lands in, so while the
- *    plan is being walked each page is drawn in a frame of its own, where its
- *    faces cannot touch another page. When the plan is ready every face the
- *    document will ever need is written in one go, every page drawn that way is
- *    drawn again under those faces, and the frames are let go *once the new page
- *    has painted* - it goes in under the frame, which keeps showing the page the
- *    reader already had, so the handover is a page drawn again and not a page
- *    that went blank. From then on the pages are one document, and selection
- *    across pages, find-in-page and a caret are the reader's. `renderMode` says
- *    which way a host wants to get there, and `'frames'` is how a host asks for
- *    a page per document and nothing else (`renderMode`).
+ *  - There is one font path and it is the document's. The engine plans every
+ *    page's fonts in the background - one `@font-face` per *font* - and until
+ *    that plan is ready no page can carry text at all: its glyphs are outlines.
+ *    So the pages are one document from the first pixel, and `renderMode` decides
+ *    only what is drawn in the meantime. `'global'` waits and draws each page
+ *    once, as text. `'progressive'` draws it at once, as outlines, and draws it
+ *    again under the document's faces when the plan is ready; the second drawing
+ *    goes in *under* the first, which stays on screen until the new one has
+ *    painted, so the handover is a page drawn again and not a page that went
+ *    blank. From the plan on, selection across pages, find-in-page and a caret
+ *    are the reader's.
  *  - A finished page is installed at a quiet moment rather than the moment it
  *    arrives: parsing and laying out 100-300 kB of SVG in the middle of a scroll
  *    costs a frame. A page the reader is looking at, or is one page away from,
@@ -81,21 +77,17 @@ import {
   type ZoomMode,
 } from './layout.ts';
 
-export type RenderMode = 'progressive' | 'frames' | 'global';
-
-/** How the pages are actually being drawn at this moment. */
-export type PageMode = 'frames' | 'document';
+export type RenderMode = 'progressive' | 'global';
 
 export type ViewerEvent =
   | { type: 'document-loaded'; info: DocumentInfo }
   /**
-   * How the pages are drawn has changed: `frames` while the document's fonts
-   * are being planned (or for the whole document, when that is what the host
-   * asked for), `document` once they are one document. A viewer that starts in
-   * `document` - the plan was ready before the first page, or `planFonts` is
-   * off and the host wants one document anyway - never emits `frames`.
+   * The document's font plan has moved: the faces are in hand, so every page
+   * drawn from now on carries text. Before it, the pages can only be outlines,
+   * which is what `'progressive'` shows and what `'global'` waits out. Emitted
+   * once per change rather than once per slice; `plan` says how far the walk got.
    */
-  | { type: 'render-mode'; mode: PageMode; plan: FontPlanProgress | null }
+  | { type: 'plan-change'; plan: FontPlanProgress | null; ready: boolean }
   | { type: 'page-change'; page: number; pageCount: number }
   | {
       type: 'zoom-change';
@@ -167,10 +159,10 @@ export interface PdfViewerOptions {
   /** Simultaneous page renders. 1 keeps scrolling smoothest on the main thread. */
   concurrency?: number;
   /**
-   * How the pages are drawn while the document's fonts are being planned. See
-   * `RenderMode`: `'progressive'` (the default) shows a frame per page until
-   * the plan is ready and then one document, `'frames'` keeps a frame per page
-   * for good, and `'global'` shows nothing until the pages can be one document.
+   * What is drawn while the document's fonts are being planned. See
+   * `RenderMode`: `'global'` (the default) draws nothing until the plan is ready
+   * and then every page once, as text; `'progressive'` draws each page at once as
+   * outlines and draws it again under the document's faces when the plan is ready.
    */
   renderMode?: RenderMode;
   /**
@@ -208,25 +200,14 @@ export interface PdfViewerOptions {
 interface PageSlot {
   index: number;
   el: HTMLDivElement;
-  /**
-   * The page's own document, while the pages are drawn one to a frame (see
-   * `renderMode`). It is made with the slot's first page and kept across a
-   * redraw of it, which is what makes a fade, a zoom or a crop of the same page
-   * register no face at all.
-   */
-  frame: HTMLIFrameElement | null;
-  /** The frame's stylesheet: its reset, then the page's font faces. */
-  sheet: CSSStyleSheet | null;
-  /** Families already registered in that frame's document. */
-  fonts: Set<string>;
   svg: Element | null;
   /** `empty`: nothing asked for yet. `pending`: asked for, not on screen. `done`: in the DOM. */
   state: 'empty' | 'pending' | 'done';
   /**
-   * The page on screen was drawn before the document's fonts were planned, so
-   * it is out of date the moment the plan is: it keeps its own picture - a frame
-   * of its own, over the page being drawn under the document's faces - until the
-   * new one has painted (`swapInDocument`).
+   * The page on screen was drawn before the document's fonts were planned, so it
+   * is out of date the moment the plan is: it is outlines where the page will be
+   * text. It keeps that picture until the new one has painted, and the new one
+   * goes in under it rather than over it (`swapInDocument`).
    */
   stale: boolean;
 }
@@ -270,27 +251,6 @@ const PREPARE_AHEAD = 3;
 
 /** Priority of work that is only being done early. Below every page on screen. */
 const WARM_PRIORITY = 100;
-
-/**
- * How long a page's faces may take to register inside its own frame while the
- * reader is at rest.
- *
- * A page of a paper can bring a dozen subsets, and compiling them all is tens
- * of milliseconds - a dropped frame. Nobody is waiting for a prepared page, so
- * it takes the next frame instead. Only the pages off screen are given this
- * budget: a page the reader is arriving at goes in with all of its faces.
- */
-const FACE_BUDGET_MS = 6;
-
-/**
- * The keys a host answers for the document, and a page frame must not eat.
- *
- * A frame is a document, so Ctrl+P in one prints the frame and Ctrl+F searches
- * it - not the document the reader is reading. These are taken over inside the
- * page and repeated on the viewer's own document, where the host's listener is;
- * every other key, Ctrl+C included, belongs to the page.
- */
-const HOST_KEYS = new Set(['p', 's', 'f', 'o']);
 
 /**
  * Zoom presets: Ctrl+= and Ctrl+- walk this list, and hosts that render their own
@@ -349,11 +309,11 @@ export class PdfViewer {
   private readonly stagedFonts = new Map<string, FontAsset>();
   /** Families already in the stylesheet. A face is registered once, ever. */
   private readonly insertedFonts = new Set<string>();
-  /** How the pages are drawn right now: a frame each, or the one document. */
-  private pageMode: PageMode = 'document';
   /**
-   * True while nothing is drawn on purpose: the pages are going to be one
-   * document and the document's fonts are not planned yet (`'global'` mode).
+   * True while nothing is drawn on purpose: the pages cannot carry text until
+   * the document's fonts are planned, and `'global'` draws nothing rather than
+   * draw a page twice. `'progressive'` draws the page as outlines instead, so it
+   * never waits.
    */
   private waiting = false;
   /** Unsubscribes from the plan this document is waiting for, if it is. */
@@ -437,7 +397,7 @@ export class PdfViewer {
       overscanViewports: Math.max(0, opts.overscanViewports ?? 1),
       prepareAhead: Math.max(0, Math.round(opts.prepareAhead ?? PREPARE_AHEAD)),
       concurrency: opts.concurrency ?? 1,
-      renderMode: opts.renderMode ?? 'progressive',
+      renderMode: opts.renderMode ?? 'global',
       shadowDom: opts.shadowDom ?? false,
       scrollMargin: opts.scrollMargin ?? 0,
       history: opts.history ?? true,
@@ -584,7 +544,7 @@ export class PdfViewer {
     this.scrollToOffset(0);
     this.currentPage = 1;
     this.emit({ type: 'document-loaded', info });
-    this.emit({ type: 'render-mode', mode: this.pageMode, plan: this.planProgress });
+    this.emitPlan();
     this.emitZoom();
     this.update();
     if (this.cropRules.length > 0) this.measureCrop();
@@ -592,89 +552,82 @@ export class PdfViewer {
 
   /* --------------------------------------------------------- render mode */
 
-  /** How the pages are drawn at this moment, for a host that shows it. */
-  get pagesInFrames(): boolean {
-    return this.pageMode === 'frames';
-  }
-
   /**
    * The document's font plan as it stands: how many pages have been walked, how
    * many there are, and whether the faces are in hand. Public because it is the
    * one piece of state a host cannot work out for itself - it is the engine's,
-   * walked on the engine's own time - and because `render-mode` is emitted once
+   * walked on the engine's own time - and because `plan-change` is emitted once
    * per change rather than once per slice.
    */
   get planProgress(): FontPlanProgress | null {
     return this.engine.planProgress?.() ?? null;
   }
 
+  private emitPlan(): void {
+    const plan = this.planProgress;
+    this.emit({ type: 'plan-change', plan, ready: plan?.ready === true });
+  }
+
   /**
-   * Decide how this document is drawn, and wait for the plan if the answer is
-   * going to change.
+   * Decide what to draw while the document's fonts are being planned.
    *
    * The engine starts planning a document's fonts the moment it is open, so the
-   * question is only ever "is it ready yet". It is not, to begin with: a paper's
-   * plan is 0.6-2.3 s of walking and building, and a 756-page specification's is
-   * 18. What happens in the meantime is the host's choice (`RenderMode`), and it
-   * is the whole reason this class has two ways of drawing a page.
+   * question is only ever "is it ready yet". It is not, to begin with: the walk
+   * is 0.2 s per hundred pages and 0.9 s for the 756-page specification
+   * (measured). That the pages cannot carry text until it is done is the whole
+   * reason this class has two ways of drawing a page, and `RenderMode` says which
+   * one a host wants.
    */
   private watchPlan(): void {
     this.unwatchPlan?.();
     this.unwatchPlan = null;
     const plan = this.planProgress;
     const ready = plan?.ready === true;
-    const mode = this.opt.renderMode;
-    // `'frames'` is a frame per page for good, whatever the plan does; `'global'`
-    // wants one document from the first pixel; `'progressive'` starts in frames
-    // and asks for one as soon as the plan is ready. A document whose plan is
-    // already in hand starts there - except in `'frames'`, which never leaves.
-    this.pageMode = mode === 'frames' ? 'frames' : ready || mode === 'global' ? 'document' : 'frames';
-    // A document that is going to be one document, and whose plan is not ready
-    // yet, draws nothing at all: a page drawn now is a page drawn twice, and the
-    // second time is exactly the flash this mode exists to avoid. A page drawn
-    // one to a frame is not drawn twice - it is drawn as outlines and then
-    // redrawn with the faces of its own, and its picture never leaves the screen.
-    this.waiting = mode === 'global' && !ready && plan !== null;
+    // A plan already in hand - a one-page document, or a plan that finished while
+    // the document was being read - means every face the pages will ever need is
+    // there now, and they go in as one write before the first page is laid out.
+    // There is nothing to wait for and nothing to redraw.
     if (ready) {
-      // Planned already - a one-page document, or a plan that finished while the
-      // document was being read - so every face the pages will ever need is in
-      // hand now, and they go in as one write before the first page is laid out.
-      if (this.pageMode === 'document') void this.registerPlanned();
+      void this.registerPlanned();
       return;
     }
+    // No plan at all - a host that turned `planFonts` off - is not something to
+    // wait for either: the pages are outlines for good, and `'progressive'` and
+    // `'global'` come to the same thing.
     if (plan === null) return;
+    // `'global'` draws nothing at all until the plan is ready: a page drawn now
+    // is a page drawn twice, and the second time is exactly the flash the mode
+    // exists to avoid. `'progressive'` draws it now, as outlines, and draws it
+    // again under the document's faces - its picture never leaves the screen.
+    this.waiting = this.opt.renderMode === 'global';
     this.unwatchPlan = this.engine.onPlanReady?.(this.onPlanReady) ?? null;
   }
 
   /**
-   * The document's fonts are planned: the pages can be one document.
+   * The document's fonts are planned: the pages can carry text.
    *
    * Everything the plan built goes in as one write - registering a face
-   * re-lays-out every text run in the document however many rules arrive with
-   * it, so they may as well all arrive together - and every page on screen is
-   * drawn again, because it was drawn with the faces of its own frame and is
-   * about to be drawn with the document's. None of that is *seen*: the pages
-   * keep their own pictures, and each new page goes in under its frame and takes
-   * over from it once it has painted (`swapInDocument`).
+   * re-lays-out every text run in the document however many rules arrive with it,
+   * so they may as well all arrive together - and every page on screen is drawn
+   * again, because it was drawn as outlines and is about to be drawn as text.
+   * None of that is *seen*: each page keeps its picture, the new one goes in
+   * under it, and the old one goes once the new one has painted
+   * (`swapInDocument`).
    */
   private onPlanReady = (): void => {
     if (this.destroyed) return;
     this.waiting = false;
-    // A frame per page stays a frame per page: what the plan changes there is
-    // what a page is drawn *with*, not where it is drawn. The pages are stale
-    // either way - they were drawn as outlines, and there are faces now.
-    this.pageMode = this.opt.renderMode === 'frames' ? 'frames' : 'document';
     this.unwatchPlan?.();
     this.unwatchPlan = null;
     this.restale();
-    if (this.pageMode === 'document') void this.registerPlanned();
-    this.emit({ type: 'render-mode', mode: this.pageMode, plan: this.planProgress });
+    void this.registerPlanned();
+    this.emitPlan();
     this.update();
   };
 
   /**
-   * Every page drawn before the plan was ready is out of date: it was drawn with
-   * the faces of its own frame, and the document's are in hand now.
+   * Every page drawn before the plan was ready is out of date: it was drawn as
+   * outlines, and there are faces now.
    *
    * A page on screen says so and keeps its picture; one that is not on screen is
    * simply forgotten, because the redraw would have to happen before it could be
@@ -687,7 +640,7 @@ export class PdfViewer {
       this.results.delete(index);
     }
     for (const slot of this.slots.values()) {
-      if (slot.frame !== null && slot.svg !== null) slot.stale = true;
+      if (slot.svg !== null) slot.stale = true;
       else slot.state = 'empty';
     }
   }
@@ -711,7 +664,7 @@ export class PdfViewer {
     this.planPending = true;
     try {
       const assets = await planned;
-      if (this.destroyed || this.docSeq !== seq || this.pageMode !== 'document' || !assets?.length) return;
+      if (this.destroyed || this.docSeq !== seq || !assets?.length) return;
       this.insertFonts(assets);
     } finally {
       if (this.docSeq === seq) {
@@ -1115,23 +1068,10 @@ export class PdfViewer {
     this.results.delete(index);
     const slot = this.slots.get(index);
     if (!slot) return;
-    if (slot.frame && this.pageMode === 'document') {
-      // The page has a picture of its own - a frame drawn before the plan - and
-      // it keeps it until the redraw lands; what goes is what was written into
-      // the viewer's own document underneath it.
-      for (const child of [...slot.el.children]) if (child !== slot.frame) child.remove();
-      slot.svg = null;
-      slot.state = 'empty';
-      return;
-    }
-    // A page's own document is emptied rather than thrown away: it already
-    // holds the faces this page needs, and a face already registered in a
-    // document costs nothing to keep. A redraw that wants the same fonts - a
-    // fade, a zoom, a crop of the same page - registers none at all. In the
-    // viewer's own document, the same is true of the faces registered there.
-    const doc = slot.frame?.contentDocument;
-    if (doc) doc.body.replaceChildren();
-    else slot.el.replaceChildren();
+    // The page goes rather than being kept: a face already registered in this
+    // document costs nothing to keep, and a redraw that wants the same fonts - a
+    // fade, a zoom, a crop of the same page - registers none at all.
+    slot.el.replaceChildren();
     slot.svg = null;
     slot.state = 'empty';
     slot.stale = false;
@@ -1347,7 +1287,7 @@ export class PdfViewer {
       const el = document.createElement('div');
       el.className = 'wpdf-page';
       el.dataset.page = String(index + 1);
-      const s: PageSlot = { index, el, frame: null, sheet: null, fonts: new Set(), svg: null, state: 'empty', stale: false };
+      const s: PageSlot = { index, el, svg: null, state: 'empty', stale: false };
       slot = s;
       this.slots.set(index, slot);
       this.pagesEl.appendChild(el);
@@ -1558,29 +1498,16 @@ export class PdfViewer {
    * planned document there is nothing to write at all - every face the page
    * needs was registered when the plan became the document's.
    *
-   * A page that still has a frame of its own on screen is the one case where
-   * putting it in is not a plain write (`swapInDocument`).
+   * A page that still has its own outline picture on screen is the one case
+   * where putting it in is not a plain write (`swapInDocument`).
    */
   private insert(slot: PageSlot, index: number): void {
     const page = this.results.get(index);
     if (!page) return;
-    if (this.pageMode === 'frames') {
-      const doc = this.frameFor(slot);
-      if (doc) {
-        // Faces before text, in the page's own document: the page is then laid
-        // out once, with what it needs, and never invalidated afterwards.
-        this.facesInto(slot, page.fonts);
-        this.writeFramed(slot, doc, page);
-        return;
-      }
-      // No frame could be had - a host with frames disabled at the platform
-      // level - so the page goes into the viewer's document, faces and all.
-      // Correct, and only ever more expensive.
-    }
     // The document's faces are the ones this page was drawn with; until they are
     // written the page would be a page of invisible text, so it waits.
     if (this.planPending) return;
-    if (slot.frame) {
+    if (slot.stale && slot.svg) {
       this.swapInDocument(slot, page);
       return;
     }
@@ -1598,59 +1525,58 @@ export class PdfViewer {
   }
 
   /**
-   * Put a page drawn under the document's faces in *under* the frame that is
-   * still showing the page the reader already had.
+   * Put a page drawn under the document's faces in *under* the outline picture
+   * that is still showing the page the reader already had.
    *
-   * The page on screen was drawn with the faces of its own frame; the new one is
-   * drawn with the document's, and those faces were registered a moment ago.
-   * There is a font load, a layout and a paint between the markup arriving and
-   * the page being visible, and the browser paints none of it in the frame the
-   * old page stops being shown in. So the new page goes in where the frame can
-   * cover it, the frame keeps showing the page it had, and it is the *frame*
-   * that goes when the new page has painted (`reveal`) - which is a page drawn
-   * again and not a page that went blank.
+   * The page on screen was drawn as outlines; the new one is drawn as text, and
+   * the faces it names were registered a moment ago. There is a font load, a
+   * layout and a paint between the markup arriving and the text being visible,
+   * and `font-display:block` draws nothing at all until it is. So the new page
+   * goes in under the old one, the old one keeps showing the page it had, and it
+   * is the *old* one that goes when the new one has painted (`reveal`) - which is
+   * a page drawn again and not a page that went blank. The two pictures are the
+   * same glyphs in the same places, so the moment when both are on screen is not
+   * a moment the reader sees.
    */
   private swapInDocument(slot: PageSlot, page: RenderedPage): void {
-    const frame = slot.frame;
-    const svg = frame ? this.svgElement(page.svg) : null;
-    if (!frame || !svg) {
-      // Nothing to cover it with, or nothing to cover: a plain write is all
-      // that is left, and the page arrives as it always did.
+    const old = slot.svg;
+    const svg = old ? this.svgElement(page.svg) : null;
+    if (!old || !svg) {
+      // Nothing to cover it with, or nothing to cover: a plain write is all that
+      // is left, and the page arrives as it always did.
       this.putInDocument(slot, page);
       return;
     }
     this.releaseFonts();
-    // Both pictures fill the slot's box, the frame over the page.
-    for (const child of [...slot.el.children]) if (child !== frame) child.remove();
+    // Both pictures fill the slot's box, the old one over the new.
     svg.classList.add('wpdf-page-swap');
-    frame.classList.add('wpdf-page-swap');
-    slot.el.insertBefore(svg, frame);
+    old.classList.add('wpdf-page-swap');
+    slot.el.insertBefore(svg, old);
     slot.svg = svg;
     slot.state = 'done';
     slot.stale = false;
     this.positionSlot(slot);
-    void this.reveal(slot, frame, svg);
+    void this.reveal(slot, old, svg);
   }
 
   /**
-   * Let the frame go once the page under it has painted.
+   * Let the outline picture go once the page under it has painted.
    *
    * `font-display:block` means a face that has not loaded yet draws nothing
    * rather than the wrong thing, so the wait is explicit - the families the
    * markup names, loaded - and then two frames: the first lays the page out and
-   * paints it, the second runs after that paint, and the frame comes off over a
+   * paints it, the second runs after that paint, and the outlines come off over a
    * page that is already there. Either check failing means the slot moved on
    * while the faces loaded, and the caller that moved it on is the one that
-   * decides what happens to the frame.
+   * decides what happens to the old picture.
    */
-  private async reveal(slot: PageSlot, frame: HTMLIFrameElement, svg: Element): Promise<void> {
+  private async reveal(slot: PageSlot, old: Element, svg: Element): Promise<void> {
     await loadFaces(svg);
-    if (this.destroyed || slot.frame !== frame || slot.svg !== svg) return;
+    if (this.destroyed || slot.svg !== svg) return;
     await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
-    if (this.destroyed || slot.frame !== frame || slot.svg !== svg) return;
-    frame.remove();
+    if (this.destroyed || slot.svg !== svg) return;
+    old.remove();
     svg.classList.remove('wpdf-page-swap');
-    this.forgetFrame(slot);
   }
 
   /** A page's markup as an element, the way `putInDocument` writes it. */
@@ -1659,195 +1585,6 @@ export class PdfViewer {
     template.innerHTML = markup;
     return template.content.firstElementChild;
   }
-
-  /** Put a page's markup into the page's own document, now its faces are in. */
-  private writeFramed(slot: PageSlot, doc: Document, page: RenderedPage): void {
-    doc.body.innerHTML = page.svg;
-    slot.svg = doc.body.firstElementChild;
-    slot.state = 'done';
-    this.positionSlot(slot);
-  }
-
-  /* ------------------------------------------------------------ page frames */
-
-  /**
-   * The document this page is drawn in, made the first time the page goes in.
-   *
-   * A frame is left at `about:blank` and written into directly - no navigation,
-   * no load event, no second copy of the page - so it is same-origin and stays
-   * that way, which is what lets the viewer (and the host) keep reading it. It
-   * is never sandboxed for the same reason: a page the viewer cannot reach is a
-   * page it cannot search, measure or paint in, and one the reader cannot copy
-   * from. Everything a document gives a reader - selection, the clipboard, the
-   * context menu, find-in-page, a caret - is the frame's own, because it is a
-   * document like any other.
-   */
-  private frameFor(slot: PageSlot): Document | null {
-    const existing = slot.frame?.contentDocument;
-    if (existing) return existing;
-    const frame = document.createElement('iframe');
-    frame.className = 'wpdf-page-frame';
-    frame.title = `Page ${slot.index + 1}`;
-    // Clipboard access is the frame's own business, not something to inherit by
-    // luck: the reader selected the text, and copy should work.
-    frame.setAttribute('allow', 'clipboard-read; clipboard-write');
-    slot.el.appendChild(frame);
-    const win = frame.contentWindow as (Window & typeof globalThis) | null;
-    const doc = frame.contentDocument;
-    if (!win || !doc) {
-      frame.remove();
-      return null;
-    }
-    slot.frame = frame;
-    // A doctype, or the frame quietly lays out in quirks mode.
-    doc.open();
-    doc.write('<!doctype html><html><head><meta charset="utf-8"></head><body></body></html>');
-    doc.close();
-    doc.title = `Page ${slot.index + 1}`;
-    slot.sheet = this.styleFrame(doc, win);
-    this.wireFrame(doc, slot);
-    return doc;
-  }
-
-  /**
-   * The frame's own stylesheet. Constructed where possible: a host page's
-   * `style-src` cannot block one, which matters inside browser extensions and
-   * when embedding into a page whose CSP is not yours.
-   */
-  private styleFrame(doc: Document, win: Window & typeof globalThis): CSSStyleSheet | null {
-    const ctor = (win as unknown as { CSSStyleSheet?: typeof CSSStyleSheet }).CSSStyleSheet;
-    if (ctor && 'adoptedStyleSheets' in doc && 'replaceSync' in ctor.prototype) {
-      const sheet = new ctor();
-      sheet.replaceSync(FRAME_CSS);
-      doc.adoptedStyleSheets = [sheet];
-      return sheet;
-    }
-    const el = doc.createElement('style');
-    el.textContent = FRAME_CSS;
-    (doc.head ?? doc.documentElement).appendChild(el);
-    return null;
-  }
-
-  /**
-   * Register a page's faces in that page's document, once each.
-   *
-   * These are the faces the page itself drew, so they belong to the page and
-   * nowhere else: telling the viewer's document about them is what would make
-   * it lay out every other page again.
-   *
-   * `budgetMs` stops the work between faces and reports how many went in, so a
-   * page that brings a dozen subsets can be compiled over several frames
-   * instead of one. It is for pages nobody is waiting for; a page the reader is
-   * arriving at takes the whole cost in the frame it arrives in.
-   */
-  private facesInto(slot: PageSlot, assets: readonly FontAsset[], budgetMs = Infinity): number {
-    const doc = slot.frame?.contentDocument ?? null;
-    const started = performance.now();
-    let added = 0;
-    for (const asset of assets) {
-      if (slot.fonts.has(asset.family)) continue;
-      if (added > 0 && performance.now() - started >= budgetMs) return added;
-      slot.fonts.add(asset.family);
-      added++;
-      if (slot.sheet) {
-        try {
-          slot.sheet.insertRule(asset.css, slot.sheet.cssRules.length);
-          continue;
-        } catch (error) {
-          DEBUG('insertRule failed', asset.family, String(error));
-        }
-      }
-      if (!doc) continue;
-      let el = doc.querySelector<HTMLStyleElement>('style[data-wpdf="fonts"]');
-      if (!el) {
-        el = doc.createElement('style');
-        el.dataset.wpdf = 'fonts';
-        (doc.head ?? doc.documentElement).appendChild(el);
-      }
-      el.appendChild(doc.createTextNode('\n' + asset.css));
-    }
-    return added;
-  }
-
-  /** Let go of a page's document, and of what was registered in it. */
-  private forgetFrame(slot: PageSlot): void {
-    slot.frame = null;
-    slot.sheet = null;
-    slot.fonts.clear();
-  }
-
-  /**
-   * The gestures the viewer owns, listened for inside the page as well: a frame
-   * is a document, and nothing that happens in it bubbles out to this one.
-   */
-  private wireFrame(doc: Document, slot: PageSlot): void {
-    doc.addEventListener('click', this.onClick);
-    doc.addEventListener('keydown', this.onLinkKeyDown);
-    doc.addEventListener('keydown', this.onKeyDown);
-    doc.addEventListener('keydown', this.onFrameKeyDown(slot));
-    doc.addEventListener('pointerdown', this.onPagePointerDown(slot));
-    if (this.opt.acceptDrop) {
-      doc.addEventListener('dragover', this.onDragOver);
-      doc.addEventListener('dragleave', this.onDragLeave);
-      doc.addEventListener('drop', this.onDrop);
-    }
-  }
-
-  /**
-   * The keys a *host* has taken over, repeated in the viewer's own document.
-   *
-   * Ctrl+P, Ctrl+S, Ctrl+F and Ctrl+O mean the document - printing it, saving
-   * it, searching it, opening another - and a host answers them on its own
-   * document, which a page, being a document of its own, does not reach. They
-   * are taken over here (so the browser prints the frame instead of the
-   * document, or opens its own find bar over one page) and repeated on the
-   * page's own box, where the viewer's listeners and the host's are. Everything
-   * else - Ctrl+C above all - is left to the page, which is a document the
-   * reader can select and copy from.
-   */
-  private onFrameKeyDown = (slot: PageSlot) => (event: KeyboardEvent): void => {
-    if (!(event.ctrlKey || event.metaKey) || event.altKey) return;
-    if (!HOST_KEYS.has(event.key.toLowerCase())) return;
-    event.preventDefault();
-    slot.el.dispatchEvent(
-      new KeyboardEvent('keydown', {
-        key: event.key,
-        code: event.code,
-        ctrlKey: event.ctrlKey,
-        metaKey: event.metaKey,
-        shiftKey: event.shiftKey,
-        bubbles: true,
-        composed: true,
-        cancelable: true,
-      }),
-    );
-  };
-
-  /**
-   * A pointer went down on a page. The page is a document of its own, so nothing
-   * about the gesture reaches this one - but a host that closes a menu when the
-   * reader clicks the page (or that wants to know the reader touched it) is
-   * entitled to hear about it, so the gesture is repeated here, on the page's
-   * own container, in this document's coordinates.
-   */
-  private onPagePointerDown = (slot: PageSlot) => (event: PointerEvent): void => {
-    const frame = slot.frame;
-    if (!frame) return;
-    const box = frame.getBoundingClientRect();
-    slot.el.dispatchEvent(
-      new PointerEvent('pointerdown', {
-        bubbles: true,
-        composed: true,
-        cancelable: true,
-        clientX: box.left + event.clientX,
-        clientY: box.top + event.clientY,
-        button: event.button,
-        buttons: event.buttons,
-        pointerType: event.pointerType,
-        isPrimary: event.isPrimary,
-      }),
-    );
-  };
 
   /**
    * The quiet moment: put in whatever the reader has stopped in front of, and
@@ -1938,21 +1675,7 @@ export class PdfViewer {
       // where the line ends: there is nothing beyond it to install yet.
       if (!page) return false;
       const target = slot ?? this.ensureSlot(i);
-      if (this.pageMode !== 'frames') {
-        this.insert(target, i);
-        return true;
-      }
-      const doc = this.frameFor(target);
-      if (!doc) {
-        this.putInDocument(target, page);
-        return true;
-      }
-      // A page brings its own faces into its own document, and nobody is
-      // waiting for it: what a page costs is paid a few faces per idle frame
-      // rather than all at once in the frame the reader arrives on.
-      if (target.svg) return true;
-      if (this.facesInto(target, page.fonts, FACE_BUDGET_MS) > 0) return true;
-      this.writeFramed(target, doc, page);
+      this.insert(target, i);
       return true;
     }
     return false;
@@ -2040,13 +1763,11 @@ export class PdfViewer {
       cropPadding: this.padding,
       bionic: this.bionicOn,
       bionicDim: this.bionicDimValue,
-      // A page in a frame of its own carries the faces it draws with, so that
-      // frame is the only document anything about it touches. A page in the
-      // document names the document's faces, which is what makes the pages one
-      // document at all. Before the plan is ready there is nothing to name and
-      // nothing to carry: the page is outlines, and it is redrawn when the faces
-      // arrive (see `onPlanReady`).
-      embedFonts: this.pageMode === 'frames',
+      // The faces are the document's and the document carries them: a page names
+      // the families the plan built, and needs nothing of its own. Before the
+      // plan is ready there is nothing to name at all - the page is outlines -
+      // and it is drawn again when the faces arrive (see `onPlanReady`).
+      embedFonts: false,
     };
   }
 
@@ -2063,12 +1784,10 @@ export class PdfViewer {
       if (this.generationOf(index) !== entry.generation) return;
 
       this.results.set(index, rendered);
-      // Faces belong to the document that will draw them. While the pages are
-      // one to a frame, a page's faces go into that page's own document when it
-      // is put there (`facesInto`), and staging them here would register them in
-      // the viewer's document at the switch - faces nothing in it will ever ask
-      // for, each one an invalidation of every page on screen.
-      if (this.pageMode === 'document') this.stageFonts(rendered.fonts);
+      // Every face a page needs is the document's, and the document was told
+      // about all of them when the plan became its own (`registerPlanned`), so
+      // this only ever stages the faces of a render that beat the plan to it.
+      this.stageFonts(rendered.fonts);
       this.trimResults();
       kept = true;
       this.consider(index);
@@ -2366,13 +2085,9 @@ const VIEWER_CSS = `
 .wpdf-pages{position:relative;margin:0 auto}
 .wpdf-page{position:absolute;background:#fff;box-shadow:0 1px 3px rgba(0,0,0,.22);overflow:hidden;contain:strict}
 .wpdf-page-svg{display:block;width:100%;height:100%}
-/* A page is a document while the document's fonts are being planned; this is
-   the window it is seen through. No border, no scrolling of its own: the box is
-   the page, exactly. */
-.wpdf-page-frame{display:block;width:100%;height:100%;border:0;background:transparent}
-/* A page drawn again under the document's faces, while the frame that still
-   shows the page it had lies over it: the two fill the same box, so the frame
-   can be let go without the reader seeing anything but the page. */
+/* A page drawn as text, put in under the outline picture of the same page: both
+   fill the box, so the outlines can be let go without the reader seeing anything
+   but the page. */
 .wpdf-page-swap{position:absolute;inset:0}
 /* A PDF link is an invisible rectangle, so the only way to know it is there is
    to be told: the hit area lights up under the pointer and under the keyboard.
@@ -2384,22 +2099,6 @@ const VIEWER_CSS = `
 .wpdf-page-svg a.wpdf-link:focus-visible{outline:none}
 .wpdf-page-svg a.wpdf-link:focus-visible>rect{fill:rgba(37,99,235,.22);stroke:#2563eb;stroke-width:1}
 .wpdf-host.wpdf-drop-active::after{content:"";position:absolute;inset:6px;border:2px dashed #2563eb;border-radius:8px;pointer-events:none;z-index:5}
-`;
-
-/**
- * The stylesheet of a page's own document. It has one job beyond the reset:
- * make the page fill the frame exactly, whatever zoom the layout is at.
- * Everything else is left to the browser - selection colours, find-in-page
- * highlights, the caret, the context menu are a document's own and are not
- * styled here.
- */
-const FRAME_CSS = `
-html,body{margin:0;padding:0;height:100%;overflow:hidden;background:#fff}
-.wpdf-page-svg{display:block;width:100%;height:100%}
-.wpdf-page-svg a.wpdf-link{cursor:pointer}
-.wpdf-page-svg a.wpdf-link:hover>rect{fill:rgba(37,99,235,.16)}
-.wpdf-page-svg a.wpdf-link:focus-visible{outline:none}
-.wpdf-page-svg a.wpdf-link:focus-visible>rect{fill:rgba(37,99,235,.22);stroke:#2563eb;stroke-width:1}
 `;
 
 /**
