@@ -23,6 +23,14 @@
  *   * it is the reader's keyboard. Ctrl+S saves the document, Ctrl+O opens a
  *     local file, Ctrl+F and the zoom keys are forwarded into the frame - which
  *     a page cannot do for a frame it does not have focus in.
+ *
+ * The two sides are updated on different schedules: this extension is installed
+ * once, and the viewer it frames is redeployed whenever the repository is. So the
+ * handshake is versioned. The viewer's `hello` says which bridge revision it
+ * speaks and which host revisions it still serves, this page answers `ready` with
+ * its own revision, and a viewer that can no longer serve this extension is
+ * reported to the reader - an extension that is out of date should say so, not
+ * sit on a tab that never draws.
  */
 
 import { keyOfFile, type HostState } from './lib/history.js';
@@ -34,6 +42,30 @@ interface Viewer {
   /** The extension's version, for the record in `viewer.json`. */
   version: string;
 }
+
+/**
+ * The bridge revision this extension speaks.
+ *
+ * It is a promise in both directions, and the only thing either side needs to
+ * know about the other's version: a viewer keeps serving this revision until it
+ * says otherwise, and this extension understands everything a viewer that serves
+ * it can say. Adding to the protocol is compatible - a message this extension
+ * does not know is ignored, and anything the viewer adds is only sent to a host
+ * whose `ready` says it knows it.
+ *
+ * It is not a promise to keep working with a viewer that *breaks* the protocol:
+ * this extension does not guess at a changed message and does not carry two
+ * implementations of anything. A viewer that has to break it says so by no longer
+ * serving this revision, and what the reader gets is the card below rather than a
+ * tab that draws the wrong thing or nothing at all.
+ */
+const BRIDGE = 1;
+
+/** The oldest viewer revision this extension can be driven by. */
+const NEEDS = 1;
+
+/** The frame answered, and cannot serve this extension (or the other way round). */
+class Stale extends Error {}
 
 /** How long the viewer is given to say it is up. */
 const HELLO_MS = 30000;
@@ -146,11 +178,37 @@ async function attach(viewer: Viewer): Promise<Window> {
       reject(new Error(`the viewer at ${viewer.app} did not answer`));
     }, HELLO_MS);
     const onHello = (event: MessageEvent): void => {
-      const message = event.data as { wpdf?: string; kind?: string } | null;
+      const message = event.data as { wpdf?: string; kind?: string; bridge?: unknown; accepts?: unknown } | null;
       if (event.source !== app.contentWindow || message?.wpdf !== 'host' || message.kind !== 'hello') return;
       window.clearTimeout(give_up);
       window.removeEventListener('message', onHello);
-      resolve(event.source as Window);
+
+      // What the viewer says about itself. A viewer from before revisions says
+      // nothing, which is revision 1: the contract as it has always been.
+      const speaks = typeof message.bridge === 'number' ? message.bridge : 1;
+      const serves = Array.isArray(message.accepts) ? message.accepts.filter((each) => typeof each === 'number') : [1];
+      if (!serves.includes(BRIDGE)) {
+        reject(
+          new Stale(
+            `The viewer at ${booted.app} speaks bridge ${speaks} and serves hosts of revision ${serves.length ? serves.join(', ') : 'none'}, while this extension speaks bridge ${BRIDGE}. Install the current build of the extension - the crx on the repository's latest workflow run - and this tab will open documents again.`,
+          ),
+        );
+        return;
+      }
+      if (speaks < NEEDS) {
+        reject(
+          new Stale(
+            `The viewer at ${booted.app} speaks bridge ${speaks}, and this extension needs at least bridge ${NEEDS}. It is probably an older copy of the page served from the browser's cache; reloading in a moment should find the current one.`,
+          ),
+        );
+        return;
+      }
+
+      // Answer with this extension's own revision, so the viewer knows what it
+      // may say - and only then is the frame worth talking to.
+      frame = event.source as Window;
+      send({ kind: 'ready', bridge: BRIDGE });
+      resolve(frame);
     };
     window.addEventListener('message', onHello);
   });
@@ -428,6 +486,10 @@ void (async () => {
   try {
     frame = await attach(viewer);
   } catch (error) {
+    if (error instanceof Stale) {
+      fail('This extension is out of date', String(error.message), { save: query.url != null });
+      return;
+    }
     fail(
       'The viewer could not be loaded',
       `This build draws documents with the viewer at ${viewer.app}, which this browser could not reach — it is fetched and cached like any page, and that is the one thing this build does not carry with it. ${String((error as Error)?.message ?? error)}`,

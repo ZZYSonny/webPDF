@@ -35,6 +35,10 @@
  *   CORS           a web page cannot fetch a PDF that sends no
  *                  `Access-Control-Allow-Origin`, and the extension can - which
  *                  is the whole reason the fetching happens where it does
+ *   versions       an installed extension meets a redeployed viewer, so the
+ *                  bridge is versioned: a viewer that still serves this
+ *                  extension's revision draws the document, and one that does
+ *                  not is reported to the reader rather than left blank
  *   the artifact   the crx CI uploads is signed the way Chrome signs one: this
  *                  file packs the same directory with Chromium's own
  *                  `--pack-extension` and checks that the reader here accepts it,
@@ -81,10 +85,18 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 /* --------------------------------------------------------- the bare server */
 
 /**
- * A PDF served the way most of the web serves them: the right content type, no
- * CORS headers at all. This is the server the CORS question is asked of.
+ * What the web serves: a PDF the way most of the web serves them - the right
+ * content type, no CORS headers at all - and a stub viewer, which is what a
+ * *future* published page looks like to *this* extension. Which of the two is
+ * answered depends on the path.
  */
 const bare = http.createServer((req, res) => {
+  if (new URL(req.url ?? '/', 'http://x').pathname === '/viewer') {
+    const body = Buffer.from(STUB_VIEWER);
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Content-Length': String(body.length) });
+    res.end(body);
+    return;
+  }
   const body = fs.readFileSync(file);
   res.writeHead(200, { 'Content-Type': 'application/pdf', 'Content-Length': String(body.length) });
   res.end(body);
@@ -92,23 +104,55 @@ const bare = http.createServer((req, res) => {
 await new Promise((resolve) => bare.listen(0, '127.0.0.1', resolve));
 const bareOrigin = `http://127.0.0.1:${bare.address().port}`;
 
+/**
+ * A viewer from the future, as far as this extension is concerned.
+ *
+ * It speaks a later bridge revision, and it says which host revisions it serves -
+ * whether it still serves revision 1 is the whole question this stub exists to
+ * ask, and the answer is in its URL. It draws nothing: it reports what a viewer
+ * with a document on screen reports, which is all the extension needs to know
+ * that the handover arrived, and it records what the extension said about itself.
+ */
+const STUB_VIEWER = `<!doctype html>
+<meta charset="utf-8">
+<title>stub viewer</title>
+<script>
+  const query = new URLSearchParams(location.search);
+  const bridge = Number(query.get('bridge') ?? 1);
+  const accepts = (query.get('accepts') ?? '1').split(',').filter(Boolean).map(Number);
+  window.__ready = null;
+  window.__handed = 0;
+  addEventListener('message', (event) => {
+    const message = event.data;
+    if (!message || message.wpdf !== 'host') return;
+    if (message.kind === 'ready') window.__ready = message.bridge;
+    if (message.kind === 'open') {
+      const doc = message.doc ?? {};
+      window.__handed = doc.bytes ? doc.bytes.byteLength : 0;
+      parent.postMessage({ wpdf: 'host', kind: 'opened', info: { title: 'stub viewer', pages: 3, author: '' }, name: doc.name ?? 'document', size: doc.size ?? 0 }, '*');
+      parent.postMessage({ wpdf: 'host', kind: 'state', state: { pos: { page: 1, y: 0 }, settings: {} } }, '*');
+    }
+  });
+  parent.postMessage({ wpdf: 'host', kind: 'hello', bridge, accepts }, '*');
+</script>`;
+
 /* ------------------------------------------------------------ the browser */
 
 /** Start a browser with the extension loaded, and find the extension's own id. */
-async function withExtension() {
-  if (!fs.existsSync(path.join(extensionDir, 'manifest.json'))) {
-    throw new Error(`${extensionDir} is not built — run \`npm run build:extension\` first`);
+async function withExtension({ where = extensionDir, expectApp = url } = {}) {
+  if (!fs.existsSync(path.join(where, 'manifest.json'))) {
+    throw new Error(`${where} is not built — run \`npm run build:extension\` first`);
   }
   // Which viewer this build frames is a build-time answer, and the only one the
   // test cannot choose for itself: the rest of the flow is the same either way.
-  const staged = JSON.parse(fs.readFileSync(path.join(extensionDir, 'viewer.json'), 'utf8'));
-  if (!staged.app.startsWith(url)) {
+  const staged = JSON.parse(fs.readFileSync(path.join(where, 'viewer.json'), 'utf8'));
+  if (expectApp && !staged.app.startsWith(expectApp)) {
     throw new Error(
       `this build frames ${staged.app}, not this server — build it with \`node scripts/build-extension.mjs --remote ${url}\``,
     );
   }
   const browser = await launch({
-    extensions: [extensionDir],
+    extensions: [where],
     // Nothing is resolvable but the loopback address the test server is on: an
     // extension that reached for a CDN would fail here rather than quietly pass.
     args: ['--host-resolver-rules=MAP * ~NOTFOUND, EXCLUDE 127.0.0.1'],
@@ -173,19 +217,19 @@ async function waitForRule(browser) {
  * viewer tab alive at a time, because every frame on this server has the same URL
  * - the document travels to the frame as a message, not as a location.
  */
-async function frameTarget(browser) {
+async function frameTarget(browser, prefix = url) {
   const targets = await (await fetch(`http://127.0.0.1:${browser.port}/json/list`)).json();
-  const frames = targets.filter((target) => target.type === 'iframe' && target.url.startsWith(url));
-  if (frames.length > 1) throw new Error(`${frames.length} viewer frames are open — close all but one before asking`);
-  if (!frames.length) throw new Error(`no frame at ${url}`);
+  const frames = targets.filter((target) => target.type === 'iframe' && target.url.startsWith(prefix));
+  if (frames.length > 1) throw new Error(`${frames.length} frames at ${prefix} are open — close all but one before asking`);
+  if (!frames.length) throw new Error(`no frame at ${prefix}`);
   return await attach(frames[0].webSocketDebuggerUrl);
 }
 
 /** Ask the viewer's frame something. The frame is recreated with every tab load. */
-async function inFrame(browser, expression, { tries = 4 } = {}) {
+async function inFrame(browser, expression, { tries = 4, prefix = url } = {}) {
   let last = null;
   for (let i = 0; i < tries; i++) {
-    const frame = await frameTarget(browser).catch((error) => {
+    const frame = await frameTarget(browser, prefix).catch((error) => {
       last = error;
       return null;
     });
@@ -204,13 +248,13 @@ async function inFrame(browser, expression, { tries = 4 } = {}) {
 }
 
 /** The same, waiting for the frame to say something true. */
-async function waitInFrame(browser, predicate, { label, timeout = 60000 } = {}) {
+async function waitInFrame(browser, predicate, { label, timeout = 60000, prefix = url } = {}) {
   const source = `(${predicate.toString()})()`;
   const deadline = Date.now() + timeout;
   let last;
   while (Date.now() < deadline) {
     try {
-      last = await inFrame(browser, source, { tries: 1 });
+      last = await inFrame(browser, source, { tries: 1, prefix });
       if (last) return last;
     } catch (error) {
       last = `error: ${error.message}`;
@@ -279,6 +323,22 @@ async function openPdf(browser, page, target) {
     },
     { label: 'the viewer to draw a page' },
   );
+}
+
+/**
+ * A copy of the staged extension pointed at `app` instead of the published
+ * viewer.
+ *
+ * `viewer.json` is read at start-up, so one file is the whole difference between
+ * this build and a build of a page that does not exist yet - which is how a
+ * *future* viewer is put in front of *this* extension.
+ */
+function pointedAt(app, name) {
+  const into = path.join(here, 'out', `stub-${name}`);
+  fs.rmSync(into, { recursive: true, force: true });
+  fs.cpSync(extensionDir, into, { recursive: true });
+  fs.writeFileSync(path.join(into, 'viewer.json'), `${JSON.stringify({ app, version }, null, 2)}\n`);
+  return into;
 }
 
 fs.mkdirSync(path.join(here, 'out'), { recursive: true });
@@ -467,6 +527,49 @@ try {
 
   await intercepted.screenshot(path.join(here, 'out', 'extension.png'));
   await browser.close();
+
+  /* ------------------------------------------- a viewer that moved on */
+
+  // The extension is installed once and the viewer is redeployed whenever the
+  // repository is, so "old extension, new viewer" is the ordinary case rather
+  // than an edge one - and the promise that makes it safe is the bridge revision
+  // in `hello`. Two stub viewers stand in for a future published page: one that
+  // has moved on but still serves revision 1, and one that no longer does. What
+  // this extension must do is draw the document for the first and say it is out
+  // of date for the second - never sit on a tab that draws nothing.
+  const compatible = `${bareOrigin}/viewer?bridge=9&accepts=1`;
+  const abandoned = `${bareOrigin}/viewer?bridge=9&accepts=9`;
+
+  const moved = await withExtension({ where: pointedAt(compatible, 'compatible'), expectApp: null });
+  const movedPage = await moved.browser.newPage();
+  await movedPage.setViewport(1280, 900);
+  await movedPage.goto(pdfUrl);
+  const openedThere = await movedPage
+    .waitFor(() => (document.title === 'stub viewer' ? document.title : ''), { label: 'the newer viewer to report the document', timeout: 30000 })
+    .catch(async () => await movedPage.evaluate(() => document.getElementById('note-title')?.textContent ?? ''));
+  check('a newer viewer that still serves revision 1 draws the document', openedThere === 'stub viewer', openedThere);
+  const said = await inFrame(moved.browser, () => ({ ready: window.__ready ?? null, handed: window.__handed ?? 0 }), { prefix: bareOrigin }).catch(() => null);
+  check(
+    'and the bytes arrive, with the revision this extension speaks',
+    said?.ready === 1 && said?.handed === fs.statSync(file).size,
+    JSON.stringify(said),
+  );
+  await moved.browser.close();
+
+  const gone = await withExtension({ where: pointedAt(abandoned, 'abandoned'), expectApp: null });
+  const gonePage = await gone.browser.newPage();
+  await gonePage.setViewport(1280, 900);
+  await gonePage.goto(pdfUrl);
+  const card = await gonePage
+    .waitFor(() => (document.getElementById('note')?.hidden === false ? document.getElementById('note-title').textContent : ''), {
+      label: 'the extension to admit it is out of date',
+      timeout: 30000,
+    })
+    .catch(async () => await gonePage.evaluate(() => document.getElementById('note-title')?.textContent ?? ''));
+  check('a viewer that no longer serves it is reported, not left blank', /out of date/i.test(card), card);
+  const nothing = await inFrame(gone.browser, () => window.__handed ?? 0, { prefix: bareOrigin, tries: 2 }).catch(() => null);
+  check('and no document is handed to a viewer that would not draw it', nothing === 0, String(nothing));
+  await gone.browser.close();
 
   /* ------------------------------------------------------- the artifact */
 

@@ -93,6 +93,9 @@ try {
   console.log('\n› pinch / zoom contract');
   await run([path.join(here, 'pinch.mjs'), url], { stdio: 'inherit' });
 
+  console.log('\n› the host bridge: a new page, an old host');
+  await run([path.join(here, 'bridge.mjs'), url], { stdio: 'inherit' });
+
   console.log('\n› the extension, loaded in a browser');
   await run([path.join(here, 'extension.mjs'), url], { stdio: 'inherit' });
 } catch (err) {

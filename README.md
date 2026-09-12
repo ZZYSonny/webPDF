@@ -779,6 +779,31 @@ own storage, and the worker resolves a document only for a page that presents it
 A web page that frames or opens `viewer.html` therefore gets nothing back — it
 cannot guess the token, and the page it framed only ever talks to its own parent.
 
+### An old extension, a new viewer
+
+The two halves are updated on completely different schedules: the viewer is
+redeployed whenever this repository is, and the extension is updated when its
+reader gets round to it. So an installed extension meeting a page that has moved
+on is the ordinary case, not an accident, and the bridge is versioned so that it
+stays boring.
+
+`hello` carries `bridge` — the revision the page speaks — and `accepts`, the host
+revisions it still serves; the extension answers `ready` with its own revision.
+An extension from before revisions existed says nothing at all, which reads as
+revision 1, the contract as it always was, and it is served like any other. Adding
+a message is therefore free: it is sent only to a host whose `ready` says it knows
+it. `tests/browser/bridge.mjs` is a stub host that never announces itself, driving
+the real viewer end to end, and `tests/browser/extension.mjs` puts a stub *viewer*
+that speaks a later revision in front of the real extension — one that still
+serves revision 1, and one that does not.
+
+A break is a bump, not a contortion. When something genuinely has to change
+meaning, the old revision comes off `accepts` and stays off: the extension shows
+a card saying it is out of date, and the reader installs the current build. There
+is no obligation to keep serving a revision the page would only serve badly, and
+no silent break either — anything a host of a served revision would not understand
+is either gated on that host's revision or it is a new revision.
+
 ### Notes for any embedder
 
 The library was written with content scripts in mind:
@@ -1078,6 +1103,10 @@ is referenced relatively.
   instead of the viewer. Carrying the viewer would mean ~10 MB more in the package
   and `'wasm-unsafe-eval'` in the extension's policy — a deliberate trade for a
   viewer that can be fixed without shipping a new `.crx`.
+* **A viewer that breaks the bridge stops old extensions.** The protocol is
+  versioned, so an extension that only knows a revision the published page no
+  longer serves is told to update rather than quietly mis-served — and there is
+  one interface, not two kept alive forever.
 * **The worker path is verified in Chromium only.** It relies on module workers
   and `CompressionStream`, both of which are widely available, but the fallback
   exists precisely because worker startup can be blocked by a host's CSP.

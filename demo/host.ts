@@ -7,11 +7,12 @@
  * it wants to hear where the reader got to so that it can remember. That
  * conversation is one small `postMessage` protocol, and nothing else:
  *
- *   page -> host   {wpdf:'hello'}                       the page is up
+ *   page -> host   {wpdf:'hello', bridge, accepts}      the page is up, and what it speaks
  *   page -> host   {wpdf:'opened', info, name, size}    a document is on screen
  *   page -> host   {wpdf:'state', state}                where the reader is now
  *   page -> host   {wpdf:'error', message}              it could not be opened
  *   page -> host   {wpdf:'password'}                    it is encrypted; ask
+ *   host -> page   {wpdf:'ready', bridge}               the host is up, and what it speaks
  *   host -> page   {wpdf:'open', doc}                   open this document
  *   host -> page   {wpdf:'state'}                       say where the reader is
  *   host -> page   {wpdf:'apply', state}                put it back the way it was
@@ -28,10 +29,42 @@
  * by anyone can be handed a document by that anyone - that is what a viewer is
  * for - and what it says back is where the reader is, which is what the host
  * needs to put them back there.
+ *
+ * The two sides are updated on completely different schedules: this page is
+ * redeployed whenever the repository is, and the extension that frames it is
+ * updated whenever its reader gets round to it. So `hello` carries `bridge` (the
+ * revision this page speaks) and `accepts` (the host revisions it can still
+ * serve), the host answers with `ready`, and a host that does not answer at all
+ * is revision 1 - which is what every extension released before revisions existed
+ * looks like, and it is served. Adding a message is therefore free: it is only
+ * sent to a host whose `ready` says it knows it. Everything else is a new
+ * revision.
+ *
+ * That is a courtesy for compatible changes, not a promise to carry two
+ * interfaces forever. A change that genuinely has to break - a message that comes
+ * to mean something else, a document that can no longer be handed over the old
+ * way - takes the old revision off `accepts` and leaves it there; the host is
+ * then told to update instead of being quietly mis-served. What is not allowed is
+ * a *silent* break: if a host of a revision on this list would not understand
+ * something, that something is either gated on its `host` revision or it is a new
+ * revision, and nothing in between.
  */
 
 import type { ZoomMode } from '../src/index.ts';
 import type { CropRuleId } from '../src/index.ts';
+
+/** The bridge revision this page speaks. */
+export const BRIDGE = 1;
+
+/**
+ * The host revisions this page still serves - the promise an installed extension
+ * relies on. Taking one off the list is a breaking change to it: the host is told
+ * so through `error` rather than left waiting for a document that never comes.
+ *
+ * Removing one is the whole ceremony for a break. There is no obligation to keep
+ * serving a revision this page would only serve badly.
+ */
+export const ACCEPTS: readonly number[] = [1];
 
 /** Whether this page was opened to be driven by a host (`?host=1`). */
 export function isHosted(): boolean {
@@ -96,6 +129,13 @@ export interface HostDocumentInfo {
 export interface HostBridge {
   /** Whether the page is actually hosted (the bridge is talking to someone). */
   readonly active: boolean;
+  /**
+   * The host's revision: 1 for a host that never said, which is any extension
+   * from before revisions existed. Anything added to this protocol that an old
+   * host would not understand is sent only when this is at least the revision
+   * that understands it.
+   */
+  readonly host: number;
   /** A document is on screen: what it is, and what to call it. */
   opened(payload: { info: HostDocumentInfo | null; name: string; size: number }): void;
   /** It could not be opened, and the host is the one who can say why. */
@@ -114,6 +154,7 @@ const SECRET_MS = 120000;
 
 const noop: HostBridge = {
   active: false,
+  host: 1,
   opened: () => {},
   failed: () => {},
   notify: () => {},
@@ -134,6 +175,10 @@ export function createHostBridge(hooks: HostHooks): HostBridge {
   /** The last state sent, so an unchanged report is not sent twice. */
   let sent = '';
   let timer = 0;
+  /** The host's revision, until it says otherwise: the oldest one there is. */
+  let revision = 1;
+  /** A host this page cannot serve is told once, and given no document. */
+  let refused = false;
   /** A password question waiting on the host, if any. */
   let ask: ((password: string | null) => void) | null = null;
 
@@ -176,7 +221,24 @@ export function createHostBridge(hooks: HostHooks): HostBridge {
     if (!message || message.wpdf !== 'host') return;
 
     switch (message.kind) {
+      case 'ready': {
+        // The host has said which revision it is. A host that cannot be served
+        // is told so, in the one shape every revision understands: an error.
+        const said = typeof message.bridge === 'number' ? message.bridge : 1;
+        if (!ACCEPTS.includes(said)) {
+          refused = true;
+          post({
+            kind: 'error',
+            message: `This viewer speaks bridge ${BRIDGE} and serves hosts of revision ${ACCEPTS.join(', ')}; a host of revision ${said} needs a newer viewer than this one.`,
+          });
+          break;
+        }
+        revision = said;
+        break;
+      }
       case 'open':
+        // A host that was refused is not given a document to draw either.
+        if (refused) break;
         void (async () => {
           try {
             await hooks.open(message.doc ?? {});
@@ -206,12 +268,16 @@ export function createHostBridge(hooks: HostHooks): HostBridge {
     }
   });
 
-  // The handshake. The host answers with `open`; until it does, the page has no
+  // The handshake. The host answers with `open` - and with `ready` first, if it
+  // is new enough to know about revisions; until it does, the page has no
   // document, and nothing of its own to show.
-  post({ kind: 'hello' });
+  post({ kind: 'hello', bridge: BRIDGE, accepts: ACCEPTS });
 
   return {
     active: true,
+    get host() {
+      return revision;
+    },
     opened(payload) {
       post({ kind: 'opened', ...payload });
     },
