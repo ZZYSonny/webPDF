@@ -116,8 +116,7 @@ export class FontRegistry {
     outlines: ReadonlyMap<string, GlyphOutline>,
     placements: readonly GlyphPlacement[],
     opts: { letters?: ReadonlyMap<string, string> } = {},
-  ): Promise<PageFontPlan> {
-    // fontId -> gid -> preferred code point
+  ): Promise<PageFontPlan> {    // fontId -> gid -> preferred code point
     const wanted = new Map<number, Map<number, number>>();
     // fontId -> gid -> advance in em, derived from neighbouring glyph positions
     const advances = new Map<number, Map<number, number>>();
@@ -236,6 +235,25 @@ export class FontRegistry {
     }
 
     return { fonts, assets, built, reused };
+  }
+
+  /**
+   * Build (or reuse) one font under a family name the caller owns.
+   *
+   * `planPage` mints a family from the glyphs one page drew, which is what makes
+   * a page's font its own. A document-wide plan is the other way round: it knows
+   * every glyph a *font* has, mints the family once, and every page of the
+   * document asks for that same face. Both go through the same cache and the
+   * same insertion order, so `assets()` and `stylesheet()` are still the single
+   * list of what the document has registered.
+   */
+  async shared(family: string, glyphs: OutlineGlyph[]): Promise<{ asset: FontAsset; built: boolean }> {
+    const existing = this.cache.get(family);
+    if (existing) return { asset: existing, built: false };
+    const asset = await this.compile(family, glyphs);
+    this.cache.set(family, asset);
+    this.order.push(family);
+    return { asset, built: true };
   }
 
   private async compile(family: string, glyphs: OutlineGlyph[]): Promise<FontAsset> {

@@ -1069,6 +1069,7 @@ src/
     font/
       svg-path.ts           SVG path data parser (M/L/H/V/C/Z + implicit repeats)
       program.ts            a glyph read out of the PDF's own font program, by id
+      plan.ts               one font per font, for the whole document
       build.ts              outlines + cmap → OpenType/CFF (opentype.js)
       woff.ts               sfnt → WOFF (zlib via CompressionStream)
       registry.ts           per-page planning, caching, @font-face rules
@@ -1126,6 +1127,8 @@ tests/
                             and the asset's format label matches its bytes
   font-program.test.ts      a glyph drawn from the PDF's own font program is the
                             outline the page drew, glyph for glyph
+  font-plan.test.ts         a document's faces follow its fonts and not its pages,
+                            and the text upgrade still runs off them
   font-programs.mjs         what the corpus embeds, and what a browser takes
   pdf-cache.mjs             fetches the corpus, lists it, clears it
   browser/                  headless-Chromium verification over CDP
@@ -1310,6 +1313,16 @@ the workflow to point that somewhere else, or to nothing at all.
   makes one font per *document* font possible, and with it one `@font-face` for
   the whole document instead of one per page — the viewer's per-page frames exist
   only because registering a face re-lays-out the document it lands in.
+  `src/core/font/plan.ts` builds that plan: it walks the document once, text
+  only, and keeps the glyphs, the codes and the ligature letters of every font it
+  meets. Over the whole corpus that is a face per font rather than a face per
+  page — measured by `tests/font-plan.test.ts` and by counting families over
+  every page: 24 against 89 on *Attention* (15 pages), 27 against 88 on *ResNet*
+  (12), 56 against 326 on *GPT-4* (100). The pass costs 0.5–2.3 s of background
+  work on those three, so it is only taken up front for documents small enough to
+  afford it; past that the plan stays a window ahead of the reader. The renderer
+  and the viewer are not wired to it yet, so pages still build their own fonts
+  today.
   What it does not buy is hinting: these runs are positioned per character with
   `text-rendering="geometricPrecision"`, exact outlines at subpixel positions,
   which is what hints are there to override.

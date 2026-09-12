@@ -148,10 +148,60 @@ export interface PageFont {
  * plan at a cost of a couple of milliseconds a page.
  */
 export function pageFonts(page: mupdf.Page, programs?: Map<string, FontProgram>): PageFont[] {
+  return pageGlyphs(page, programs).fonts;
+}
+
+/** One glyph the page drew: which font, which id, for which code, and where. */
+export interface GlyphDraw {
+  /** Index into `PageGlyphs.fonts`. */
+  fontId: number;
+  gid: number;
+  /** The code point the display list recorded for it, or 0. */
+  code: number;
+  /**
+   * The glyph's text matrix, in the page's own coordinates - the same ones the
+   * generated SVG and the text device's characters use (y down from the top of
+   * the page). The display list hands this over y *up*, which is why it is
+   * turned round here: everything that pairs a glyph with a character, a
+   * ligature above all, matches them by this origin.
+   */
+  matrix: { a: number; b: number; c: number; d: number; e: number; f: number };
+}
+
+export interface PageGlyphs {
+  fonts: PageFont[];
+  /** Every glyph the page drew, in the order it drew them. */
+  draws: GlyphDraw[];
+}
+
+/**
+ * The page's fonts and the glyph stream they drew, from one walk.
+ *
+ * `visit` is called once per font instance with the handle the display list
+ * used, before this returns and while the page is still alive. It exists for
+ * the fonts that have no program to read - the base-14 faces FreeType
+ * substitutes - which can still be drawn, but only through their handle.
+ */
+export function pageGlyphs(
+  page: mupdf.Page,
+  programs?: Map<string, FontProgram>,
+  visit?: (handle: mupdf.Font, fontId: number, font: PageFont) => void,
+): PageGlyphs {
   const known = programs ?? programsOnPage(page);
-  const out: PageFont[] = [];
-  const byName = new Map<string, PageFont>();
-  const note = (font: mupdf.Font, gid: number, unicode: number): void => {
+  const fonts: PageFont[] = [];
+  const byName = new Map<string, number>();
+  const handles: mupdf.Font[] = [];
+  const draws: GlyphDraw[] = [];
+
+  // The display list reports a glyph's origin with y running *up* the page; the
+  // SVG writer, and the text device the ligatures are read from, both run it
+  // down. Folding the box turns one into the other, which is what lets a glyph
+  // be paired with the characters standing at the same point.
+  const bounds = page.getBounds();
+  const fold = bounds[1] + bounds[3];
+
+  const note = (font: mupdf.Font, trm: mupdf.Matrix, gid: number, unicode: number): void => {
+    // MuPDF reports -1 for a glyph it could not resolve.
     if (!Number.isInteger(gid) || gid < 0) return;
     let name: string;
     try {
@@ -159,17 +209,28 @@ export function pageFonts(page: mupdf.Page, programs?: Map<string, FontProgram>)
     } catch {
       return;
     }
-    let entry = byName.get(name);
-    if (!entry) {
-      entry = { name, program: known.get(name) ?? null, gids: new Set(), codes: new Map() };
-      byName.set(name, entry);
-      out.push(entry);
+    let fontId = byName.get(name);
+    if (fontId === undefined) {
+      fontId = fonts.length;
+      byName.set(name, fontId);
+      handles.push(font);
+      fonts.push({ name, program: known.get(name) ?? null, gids: new Set(), codes: new Map() });
     }
+    const entry = fonts[fontId];
     entry.gids.add(gid);
+    // The first code wins for a gid, as the SVG's own `data-text` does.
     if (unicode > 0 && !entry.codes.has(gid)) entry.codes.set(gid, unicode);
+    draws.push({
+      fontId,
+      gid,
+      code: unicode,
+      matrix: { a: trm[0], b: trm[1], c: trm[2], d: -trm[3], e: trm[4], f: fold - trm[5] },
+    });
   };
   const walk = (text: mupdf.Text): void => {
-    text.walk({ showGlyph: (font: mupdf.Font, _trm: mupdf.Matrix, gid: number, unicode: number) => note(font, gid, unicode) });
+    text.walk({
+      showGlyph: (font: mupdf.Font, trm: mupdf.Matrix, gid: number, unicode: number) => note(font, trm, gid, unicode),
+    });
   };
   const device = new mupdf.Device({
     fillText: walk,
@@ -184,7 +245,8 @@ export function pageFonts(page: mupdf.Page, programs?: Map<string, FontProgram>)
     device.close();
     device.destroy();
   }
-  return out;
+  if (visit) for (let i = 0; i < fonts.length; i++) visit(handles[i], i, fonts[i]);
+  return { fonts, draws };
 }
 
 /* ------------------------------------------------------------------ */
