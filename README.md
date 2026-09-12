@@ -397,7 +397,8 @@ vite.ext.config.ts          the extension build
 ## Development
 
 ```
-npm run build:wasm     build the core for the browser (needs .emsdk/)
+npm run build:wasm     build the core for the browser (needs .emsdk/, and a
+                       rustc with the wasm32-unknown-emscripten target)
 npm run dev            the demo, with the core served from demo/engine/
 npm run build          the wasm, then the demo, into dist/demo
 npm run typecheck      tsc over demo/, ext/ and tests/

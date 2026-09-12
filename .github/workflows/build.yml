@@ -14,7 +14,17 @@
 # stays, because a type error means the artifact would be built from source that
 # does not compile as written.
 #
-# The published site is the demo app plus the library it is built from, and it
+# The demo is two compiled halves, so this job installs two toolchains before it
+# builds anything. The core is Rust around C - MuPDF - and is built to
+# WebAssembly by Emscripten; the viewer is TypeScript, built by Vite.
+# `npm run build:pages` runs both in order, and `npm run build:wasm` finds the
+# Emscripten SDK through `$EMSDK`, sources its `emsdk_env.sh` and links with that
+# `emcc`. The SDK version is pinned rather than floated: the flag that makes
+# MuPDF's C and Rust's wasm target agree on an exception model is a property of
+# the toolchain, and the site should be the same binary `npm run build:wasm`
+# produces locally.
+#
+# The published site is the demo app with the core compiled into it, and it
 # carries no documents of its own: every paper it offers is fetched from its
 # public URL. Nothing in this repository is a PDF, so there is no corpus for the
 # build to ship, and the PDF cache the tests use is not consulted here at all.
@@ -63,11 +73,31 @@ jobs:
         with:
           node-version: 22
           cache: npm
+      # MuPDF's Rust wrapper generates its bindings with bindgen, and bindgen
+      # parses MuPDF's headers with libclang - so install one here rather than
+      # find out three minutes into a deploy whether the image shipped one.
+      - run: sudo apt-get update && sudo apt-get install -y libclang-dev
+      # rustc, plus the target that makes it emit wasm. The runner's stable is
+      # enough: `core/` is edition 2021 and its dependencies are pinned by
+      # Cargo.lock. This is the whole of the Rust setup.
+      - run: rustup target add wasm32-unknown-emscripten
+      # Emscripten, which compiles MuPDF's C for wasm and links the module and
+      # the JavaScript that starts it. The action adds `emcc` to the path and
+      # exports `EMSDK` for the steps below, so `npm run build:wasm` needs
+      # nothing else; a version bump here is the only thing that re-downloads an
+      # SDK.
+      - uses: emscripten-core/setup-emsdk@v15
+        with:
+          version: 6.0.9
       - run: npm ci
       - uses: actions/configure-pages@v6
       # Typechecking is part of the build here: a type error means the artifact
       # would be built from source that does not compile as written.
       - run: npm run typecheck
+      # The core first, then the demo around it: `build:pages` is `build:wasm`,
+      # `build:demo` and the no-Jekyll marker. The demo build reads the
+      # `demo/engine/` files the wasm build wrote and fails when they are not
+      # there, rather than publishing a viewer with no core behind it.
       - run: npm run build:pages
       # The extension, from the same commit as the site it frames: compile the
       # worker and the viewer page, then stage and sign the package - a staged
