@@ -1116,6 +1116,8 @@ tests/
   memory.test.ts            the viewer's memory, in Node (no browser, no extension)
   engine-save.test.ts       writing a document out, encrypted documents included
   engine-wasm.test.ts       which wasm source is used, and what a wrong one costs
+  worker-client.test.ts     what the worker engine is told, and what it hands
+                            back: the clonable options, and a document's faces
   font-outline.test.ts      a glyph's curve survives the font it is written into,
                             and the asset's format label matches its bytes
   font-program.test.ts      a glyph drawn from the PDF's own font program is the
