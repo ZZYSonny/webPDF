@@ -15,7 +15,10 @@ export default defineConfig({
   // to the library file wherever the host chooses to serve `dist/` from.
   base: './',
   build: {
-    outDir: 'dist',
+    // Its own directory under `dist/`, like the demo and the extension: a build
+    // that empties its output directory must not empty anyone else's, and this
+    // one is run before both of them.
+    outDir: 'dist/lib',
     emptyOutDir: true,
     target: 'es2022',
     lib: {

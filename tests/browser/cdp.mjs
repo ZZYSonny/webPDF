@@ -83,16 +83,31 @@ export async function launch(options = {}) {
     throw new Error(`Chromium did not start on port ${port}\n${stderr}`);
   }
 
+  let socket = null;
   const browser = {
     port,
     version,
     process: child,
+    /**
+     * The browser endpoint itself, for the things that are not a page's: the
+     * download behaviour, the target list, a profile-wide setting. Connected on
+     * first use, and kept.
+     */
+    async send(method, params = {}) {
+      socket ??= await connect(version.webSocketDebuggerUrl, null, { domains: false });
+      return await socket.send(method, params);
+    },
     async newPage() {
       const res = await fetch(`http://127.0.0.1:${port}/json/new?about:blank`, { method: 'PUT' });
       const target = await res.json();
       return connect(target.webSocketDebuggerUrl, { port, targetId: target.id });
     },
     async close() {
+      try {
+        socket?.close();
+      } catch {
+        /* ignore */
+      }
       try {
         await fetch(`http://127.0.0.1:${port}/json/close`);
       } catch {
@@ -119,7 +134,7 @@ export async function attach(wsUrl) {
   return await connect(wsUrl);
 }
 
-async function connect(wsUrl, tab = null) {
+async function connect(wsUrl, tab = null, { domains = true } = {}) {
   const ws = new WebSocket(wsUrl);
   await new Promise((resolve, reject) => {
     ws.addEventListener('open', resolve, { once: true });
@@ -151,9 +166,14 @@ async function connect(wsUrl, tab = null) {
       ws.send(JSON.stringify(sessionId ? { id, method, params, sessionId } : { id, method, params }));
     });
 
-  await send('Page.enable');
-  await send('Runtime.enable');
-  await send('Log.enable');
+  // The browser endpoint has no Page, Runtime or Log domain - it answers for
+  // `Browser.*` and `Target.*` only, which is why a connection to it can be
+  // asked for without them.
+  if (domains) {
+    await send('Page.enable');
+    await send('Runtime.enable');
+    await send('Log.enable');
+  }
 
   const consoleMessages = [];
   listeners.add((msg) => {

@@ -9,7 +9,7 @@
  * where it is; the browser's own cache is what makes the second document as fast
  * as the first.
  *
- * What the shell does is the part a page cannot do for itself:
+ * What the shell does is what a page cannot do for itself:
  *
  *   * it reads the document. An extension page has this extension's host
  *     permissions, so a PDF that a web page could not fetch across origins - the
@@ -17,12 +17,12 @@
  *     send - arrives here anyway, and is handed to the frame as bytes. Nothing
  *     is uploaded and nothing is proxied: the bytes go from the server to this
  *     tab, which is where they were going in the first place.
- *   * it remembers. The frame says where the reader is and how the document is
- *     set up; the worker writes that down for the hundred most recent documents,
- *     and hands it back the next time one of them is opened.
- *   * it is the reader's keyboard. Ctrl+S saves the document, Ctrl+O opens a
- *     local file, Ctrl+F and the zoom keys are forwarded into the frame - which
- *     a page cannot do for a frame it does not have focus in.
+ * Everything the reader *does* with the document belongs to the frame, because
+ * the frame is the document's page: where they were is remembered there (in the
+ * viewer's own storage, for the hundred most recent documents), the keyboard is
+ * its own once it has focus - this page hands it the focus and then stays out of
+ * the way - and Ctrl+S writes the bytes it already holds. The extension is a
+ * pipe with a memory of one URL, not a second application around the viewer.
  *
  * The two sides are updated on different schedules: this extension is installed
  * once, and the viewer it frames is redeployed whenever the repository is. So the
@@ -32,8 +32,6 @@
  * reported to the reader - an extension that is out of date should say so, not
  * sit on a tab that never draws.
  */
-
-import { keyOfFile, type HostState } from './lib/history.js';
 
 /** Written by the build: which viewer to frame, and what to call this build. */
 interface Viewer {
@@ -70,9 +68,6 @@ class Stale extends Error {}
 /** How long the viewer is given to say it is up. */
 const HELLO_MS = 30000;
 
-/** How long a burst of reading is allowed to go unwritten. */
-const SAVE_MS = 700;
-
 /* ------------------------------------------------------------- the pieces */
 
 function el<T extends HTMLElement>(id: string): T {
@@ -88,8 +83,6 @@ const note = el('note');
 const noteTitle = el('note-title');
 const noteText = el('note-text');
 const noteRetry = el<HTMLButtonElement>('note-retry');
-const noteSave = el<HTMLButtonElement>('note-save');
-const fileInput = el<HTMLInputElement>('file');
 
 /**
  * What this tab was opened for.
@@ -115,12 +108,8 @@ const query = ((): { token: string; url: string | null; page: number | null } =>
 
 /** The viewer's window, once it has said hello. */
 let frame: Window | null = null;
-/** What this tab is showing: the key the memory knows it by, and its URL. */
-let showing: { key: string; url: string | null; name: string; size: number } | null = null;
 /** What was handed to the frame, so a document the *frame* opened is told apart. */
-let handed: { name: string; size: number; key: string; url: string | null } | null = null;
-let saveTimer = 0;
-let lastState: HostState | null = null;
+let handed: { name: string; size: number; url: string | null } | null = null;
 
 /* ------------------------------------------------------------ the worker */
 
@@ -128,21 +117,6 @@ async function ask<T = unknown>(message: unknown): Promise<T> {
   const answer = (await chrome.runtime.sendMessage(message)) as { ok?: boolean; error?: string } & Record<string, unknown>;
   if (!answer || answer.ok === false) throw new Error(answer?.error ?? 'the extension worker did not answer');
   return answer as T;
-}
-
-/** Write the reader's position down now, rather than at the end of the window. */
-function flush(): void {
-  if (!saveTimer || !showing || !lastState) return;
-  clearTimeout(saveTimer);
-  saveTimer = 0;
-  void chrome.runtime.sendMessage({ type: 'state', key: showing.key, state: lastState });
-}
-
-/** The position and settings changed: write them, once the reader stops moving. */
-function rememberState(state: HostState): void {
-  lastState = state;
-  if (saveTimer) clearTimeout(saveTimer);
-  saveTimer = window.setTimeout(flush, SAVE_MS);
 }
 
 /* ----------------------------------------------------------- what is shown */
@@ -292,12 +266,11 @@ async function readDocument(url: string): Promise<ArrayBuffer> {
 
 /* ---------------------------------------------------------------- a failure */
 
-function fail(title: string, text: string, options: { retry?: boolean; save?: boolean } = {}): void {
+function fail(title: string, text: string, options: { retry?: boolean } = {}): void {
   loading.hidden = true;
   noteTitle.textContent = title;
   noteText.textContent = text;
   noteRetry.hidden = options.retry === false;
-  noteSave.hidden = options.save !== true;
   note.hidden = false;
 }
 
@@ -307,23 +280,13 @@ function fail(title: string, text: string, options: { retry?: boolean; save?: bo
  * Hand a document to the frame.
  *
  * Everything the viewer needs is in this one message: the bytes (transferred, not
- * copied), what to call them, and what was remembered about the document - the
- * position and the settings. The frame reports back what it opened, and from then
- * on it is the one saying where the reader is.
+ * copied), what to call them, where they came from, and the page the tab's URL
+ * asked for. Where the *reader* was is not in here: that is the viewer's own
+ * memory, and it is the viewer that puts it back.
  */
-function handOff(doc: {
-  bytes?: ArrayBuffer;
-  url: string | null;
-  key: string;
-  name: string;
-  size: number;
-  page: number | null;
-  state: HostState | null;
-}): void {
-  showing = { key: doc.key, url: doc.url, name: doc.name, size: doc.size };
-  handed = { name: doc.name, size: doc.size, key: doc.key, url: doc.url };
-  lastState = doc.state;
-  const message = { kind: 'open', doc: { bytes: doc.bytes, url: doc.url, name: doc.name, size: doc.size, page: doc.page, state: doc.state } };
+function handOff(doc: { bytes?: ArrayBuffer; url: string | null; name: string; size: number; page: number | null }): void {
+  handed = { name: doc.name, size: doc.size, url: doc.url };
+  const message = { kind: 'open', doc };
   send(message, doc.bytes ? [doc.bytes] : []);
 }
 
@@ -334,29 +297,15 @@ async function openFromTab(): Promise<void> {
     fail('Nothing to open', 'This tab was not opened for a document. Open a PDF from the address bar, a link, or your file manager.', { retry: false });
     return;
   }
-  const resolved = await ask<{ url: string; key: string; name: string; state: HostState | null }>({
-    type: 'resolve',
-    token: query.token,
-    url,
-  });
+  const resolved = await ask<{ url: string; name: string }>({ type: 'resolve', token: query.token, url });
   const bytes = await readDocument(resolved.url);
   handOff({
     bytes,
     url: resolved.url,
-    key: resolved.key,
     name: resolved.name || nameOfUrl(resolved.url),
     size: bytes.byteLength,
     page: query.page,
-    state: resolved.state,
   });
-}
-
-/** A file the reader chose with Ctrl+O: no URL, and a key made of its name and size. */
-async function openLocalFile(file: File): Promise<void> {
-  const key = keyOfFile(file.name, file.size);
-  const stored = await ask<{ state: HostState | null }>({ type: 'entry', key });
-  const bytes = await file.arrayBuffer();
-  handOff({ bytes, url: null, key, name: file.name, size: file.size, page: null, state: stored.state });
 }
 
 /** What to call a document with no title: its URL, without the scheme. */
@@ -369,10 +318,10 @@ function nameOfUrl(url: string): string {
 /**
  * What the frame says.
  *
- * `opened` is the document being on screen, which is the moment this tab knows
- * what it is showing and the moment the memory gets its entry. `state` is the
- * reader moving. Neither is trusted for anything but what it is: a name, a size,
- * a page number and a handful of settings.
+ * Only two things: the document is on screen - which is the moment this tab knows
+ * what it is showing, and can name itself after it - and it could not be opened.
+ * Nothing here is trusted for anything but what it is: a name, a size, a title, a
+ * page count.
  */
 function onFrameMessage(event: MessageEvent): void {
   if (event.source !== app.contentWindow) return;
@@ -386,96 +335,49 @@ function onFrameMessage(event: MessageEvent): void {
       const size = typeof message.size === 'number' ? message.size : 0;
       // A document the *frame* opened - a PDF dropped onto the pages, or one
       // chosen from its own Ctrl+O - is not the one that was handed to it, and
-      // has to be looked up under its own name.
-      const mine = handed && handed.name === name && handed.size === size;
-      const key = mine && handed ? handed.key : keyOfFile(name, size);
+      // the toolbar button should not offer to reopen it: there is no URL this
+      // tab knows for it.
+      const mine = handed !== null && handed.name === name && handed.size === size;
       const url = mine && handed ? handed.url : null;
-      showing = { key, url, name, size };
       handed = null;
       loading.hidden = true;
       note.hidden = true;
       document.title = info?.title || name;
-      void chrome.runtime.sendMessage({
-        type: 'remember',
-        key,
-        url,
-        name,
-        title: info?.title ?? '',
-        pages: info?.pages ?? 0,
-      });
-      if (!mine) void restore(key);
+      // The one thing the worker keeps for the toolbar button: which document
+      // this extension last handed over, so it can be opened again.
+      if (url) void chrome.runtime.sendMessage({ type: 'last', url, name });
       break;
     }
-    case 'state':
-      if (showing && message.state) rememberState(message.state as HostState);
-      break;
     case 'error':
-      fail('The document could not be opened', String(message.message ?? 'the viewer reported an error'), {
-        save: showing?.url != null,
-      });
+      fail('The document could not be opened', String(message.message ?? 'the viewer reported an error'));
       break;
-    case 'password': {
-      // A cross-origin frame cannot open a prompt of its own; this page can.
-      const password = window.prompt('This document is password protected. Password:');
-      send({ kind: 'secret', password: password ?? null });
-      break;
-    }
   }
 }
 
-/** Put a document the frame opened itself back where the reader left it. */
-async function restore(key: string): Promise<void> {
+/* ------------------------------------------------------------- the keyboard */
+
+/**
+ * The keyboard belongs to the viewer, and this page hands it over.
+ *
+ * The frame fills the tab, so a click lands in it and the viewer's own Ctrl+F,
+ * Ctrl+O and zoom keys work from then on - but the load itself starts with this
+ * page focused, and a keystroke before the reader clicks anything would go to the
+ * browser instead. So the frame is focused as soon as it is up, and again
+ * whenever the tab comes back into view, and after that this page has no keys of
+ * its own at all: no relay, nothing to keep in step with the viewer.
+ */
+function focusFrame(): void {
   try {
-    const stored = await ask<{ state: HostState | null }>({ type: 'entry', key });
-    if (stored.state) send({ kind: 'apply', state: stored.state });
+    app.focus();
   } catch {
-    /* nothing remembered about it: it opens at its first page, which it is on */
+    /* nothing to focus yet */
   }
 }
-
-/* ------------------------------------------------------------ the keyboard */
-
-async function save(): Promise<void> {
-  const url = showing?.url ?? query.url;
-  if (!url) return;
-  await chrome.downloads.download({ url, filename: nameOfUrl(url).split('/').pop() ?? undefined });
-}
-
-window.addEventListener('keydown', (event) => {
-  if (!event.ctrlKey && !event.metaKey) return;
-  const key = event.key.toLowerCase();
-  if (key === 's') {
-    event.preventDefault();
-    void save();
-  } else if (key === 'o') {
-    event.preventDefault();
-    fileInput.click();
-  } else if (key === 'f') {
-    event.preventDefault();
-    send({ kind: 'find' });
-  } else if (key === '=' || key === '+' || key === '-' || key === '0') {
-    // Forwarded as a real key in the frame's own document: the viewer's zoom
-    // handling stays in one place, and this page has no opinion about it.
-    event.preventDefault();
-    send({ kind: 'key', key: event.key });
-  }
-});
-
-fileInput.addEventListener('change', () => {
-  const file = fileInput.files?.[0];
-  fileInput.value = '';
-  if (!file) return;
-  void openLocalFile(file).catch((error: unknown) => {
-    fail('The file could not be read', String((error as Error)?.message ?? error));
-  });
-});
 
 noteRetry.addEventListener('click', () => location.reload());
-noteSave.addEventListener('click', () => void save());
 window.addEventListener('message', onFrameMessage);
-window.addEventListener('pagehide', flush);
 document.addEventListener('visibilitychange', () => {
-  if (document.visibilityState === 'hidden') flush();
+  if (document.visibilityState === 'visible') focusFrame();
 });
 
 /* ---------------------------------------------------------------- the start */
@@ -485,15 +387,17 @@ void (async () => {
   const viewer = (await response.json()) as Viewer;
   try {
     frame = await attach(viewer);
+    // The reader's keys are the viewer's from here on: this page has no keyboard
+    // of its own, so the frame is what must have the focus.
+    focusFrame();
   } catch (error) {
     if (error instanceof Stale) {
-      fail('This extension is out of date', String(error.message), { save: query.url != null });
+      fail('This extension is out of date', String(error.message));
       return;
     }
     fail(
       'The viewer could not be loaded',
       `This build draws documents with the viewer at ${viewer.app}, which this browser could not reach — it is fetched and cached like any page, and that is the one thing this build does not carry with it. ${String((error as Error)?.message ?? error)}`,
-      { save: query.url != null },
     );
     return;
   }
@@ -501,6 +405,6 @@ void (async () => {
   try {
     await openFromTab();
   } catch (error) {
-    fail('The document could not be opened', String((error as Error)?.message ?? error), { save: query.url != null });
+    fail('The document could not be opened', String((error as Error)?.message ?? error));
   }
 })();

@@ -15,7 +15,13 @@
  *   the announcement  `hello` says which bridge revision the page speaks and
  *                     which host revisions it still serves
  *   an old host       a host that never announces a revision is served: the
- *                     document is drawn and the position comes back
+ *                     document is drawn, and the host is told what opened and
+ *                     nothing else - no positions, no settings, no state
+ *   the memory        the page keeps the reader's place itself, in its own
+ *                     storage, where a host cannot see it
+ *   the password      an encrypted document is asked for in the page's own card:
+ *                     a cross-origin frame cannot raise a `window.prompt`, but it
+ *                     can draw a field, and the host is not asked at all
  *   an unknown host   a host the page cannot serve is told so, in the `error`
  *                     shape every revision understands, and is given no document
  *                     to draw either
@@ -29,7 +35,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { launch } from './cdp.mjs';
+import { attach, launch } from './cdp.mjs';
 import { PAPERS, cachedFile } from '../pdf-cache.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -42,6 +48,29 @@ if (!file) {
   process.exit(1);
 }
 const bytes = fs.readFileSync(file);
+const pdfUrl = new URL(`/pdf/${path.basename(file)}`, url).href;
+
+/** The password the encrypted copy is made with, and the one that is typed. */
+const PASSWORD = 'hunter2';
+
+/**
+ * The same paper, encrypted, for the one question the page has to ask.
+ *
+ * Made here rather than kept in the repository - nothing in this repository is a
+ * PDF, and a document a host hands over does not need a file to begin with.
+ */
+async function encrypted(source, password) {
+  const mupdf = await import('mupdf');
+  const doc = mupdf.PDFDocument.openDocument(new Uint8Array(source), 'application/pdf');
+  const saved = doc.saveToBuffer({
+    encrypt: 'aes-256',
+    'user-password': password,
+    'owner-password': password,
+    permissions: -1,
+  });
+  doc.destroy();
+  return Buffer.from(saved.asUint8Array());
+}
 
 let failures = 0;
 const started = Date.now();
@@ -80,12 +109,12 @@ const HOST_PAGE = `<!doctype html>
   });
 
   // What a host with a document does: hand it over, transferred, not copied.
-  window.handOver = (base64, name) => {
+  window.handOver = (base64, name, source) => {
     const binary = atob(base64);
     const data = new Uint8Array(binary.length);
     for (let i = 0; i < binary.length; i++) data[i] = binary.charCodeAt(i);
     frame.contentWindow.postMessage(
-      { wpdf: 'host', kind: 'open', doc: { bytes: data.buffer, url: null, name, size: data.length, page: null, state: null } },
+      { wpdf: 'host', kind: 'open', doc: { bytes: data.buffer, url: source, name, size: data.length, page: null } },
       viewer,
       [data.buffer],
     );
@@ -102,11 +131,38 @@ const host = http.createServer((req, res) => {
   res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Content-Length': String(body.length) });
   res.end(body);
 });
-await new Promise((resolve) => host.listen(0, '127.0.0.1', resolve));
-const hostOrigin = `http://127.0.0.1:${host.address().port}`;
+// A *different* loopback address, so the stub host and the viewer are not just
+// different origins but different sites: the frame is then a target of its own,
+// which is how this test reads the memory the page keeps for itself.
+await new Promise((resolve) => host.listen(0, '127.0.0.2', resolve));
+const hostOrigin = `http://127.0.0.2:${host.address().port}`;
 const hostPage = (n) => `${hostOrigin}/host?case=${n}#${encodeURIComponent(url)}`;
 
 const base64 = bytes.toString('base64');
+
+/**
+ * Ask the viewer's own document something.
+ *
+ * The stub host and the viewer are different sites, so the frame is a target of
+ * its own; this is the only way to look inside it, and it is exactly what the
+ * host cannot do.
+ */
+async function frameState(browser, prefix, expression) {
+  for (let i = 0; i < 20; i++) {
+    const targets = await (await fetch(`http://127.0.0.1:${browser.port}/json/list`)).json();
+    const frame = targets.find((target) => target.type === 'iframe' && target.url.startsWith(prefix));
+    if (frame) {
+      const attached = await attach(frame.webSocketDebuggerUrl);
+      try {
+        return await attached.evaluate(expression);
+      } finally {
+        await attached.close();
+      }
+    }
+    await sleep(250);
+  }
+  return null;
+}
 
 /* ---------------------------------------------------------------- the checks */
 
@@ -129,7 +185,9 @@ try {
   );
 
   // The old host hands over the document without ever saying what revision it is.
-  await page.evaluate(`window.handOver(${JSON.stringify(base64)}, ${JSON.stringify(path.basename(file))})`);
+  await page.evaluate(
+    `window.handOver(${JSON.stringify(base64)}, ${JSON.stringify(path.basename(file))}, ${JSON.stringify(pdfUrl)})`,
+  );
   const opened = await page
     .waitFor(() => window.__heard.find((message) => message.kind === 'opened') ?? null, { label: 'the document to be drawn', timeout: 60000 })
     .catch(() => null);
@@ -139,14 +197,61 @@ try {
     JSON.stringify(opened?.info ?? opened),
   );
 
-  const state = await page
-    .waitFor(() => window.__heard.filter((message) => message.kind === 'state').pop() ?? null, { label: 'the reader\'s position', timeout: 30000 })
-    .catch(() => null);
+  // What it hears is what opened, and nothing else: no positions, no settings,
+  // nothing that would make a host a second place the reader's memory lives.
+  const kinds = [...new Set(await page.evaluate(() => window.__heard.map((message) => message.kind)))].sort();
+  check('and is told what opened, and nothing else', kinds.join() === 'hello,opened', kinds.join());
+
+  // The memory is the page's own, in the page's own storage. It is read here the
+  // way a reader's browser would: from the frame's document, which the host
+  // cannot reach at all.
+  const memory = await frameState(browser, url, `(() => {
+    const stored = JSON.parse(localStorage.getItem('webpdf.memory') ?? '{}');
+    const entry = stored[${JSON.stringify('url:' + pdfUrl)}] ?? null;
+    return entry && { pos: entry.pos, settings: entry.settings, keys: Object.keys(stored).length };
+  })()`);
   check(
-    'and it hears where the reader is',
-    (state?.state?.pos?.page ?? 0) >= 1,
-    JSON.stringify(state?.state?.pos ?? state),
+    'the page remembers the reader\'s place itself',
+    memory?.pos?.page === 1 && memory?.keys === 1,
+    JSON.stringify(memory),
   );
+
+  /* ------------------------------------ a document with a password */
+
+  // A host hands over an encrypted document and says nothing about it - it has no
+  // business knowing the password. The page asks in its own card, and the host
+  // hears nothing at all until the document is on screen.
+  const locked = (await encrypted(bytes, PASSWORD)).toString('base64');
+  await page.goto(hostPage(3));
+  await page.waitFor(() => window.__heard.some((message) => message.kind === 'hello'), { label: 'the page to say hello', timeout: 30000 });
+  await page.evaluate(`window.handOver(${JSON.stringify(locked)}, 'locked.pdf', ${JSON.stringify(pdfUrl + '#locked')})`);
+
+  const asked = await frameState(browser, url, `(async () => {
+    for (let i = 0; i < 60 && document.getElementById('password').hidden; i++) await new Promise((r) => setTimeout(r, 100));
+    return { card: !document.getElementById('password').hidden, focused: document.activeElement?.id ?? '' };
+  })()`);
+  check('an encrypted document is asked for in the page itself', asked?.card === true && asked?.focused === 'password-input', JSON.stringify(asked));
+  // Nothing at all goes to the host while the page waits for the reader: not a
+  // question, not an error, not a "waiting" - the page has its own reader to ask.
+  const quiet = await page.evaluate(() => window.__heard.map((message) => message.kind));
+  check('and the host is not asked about it', quiet.join() === 'hello', quiet.join() || 'nothing');
+
+  const unlocked = await frameState(browser, url, `(async () => {
+    const input = document.getElementById('password-input');
+    input.value = ${JSON.stringify(PASSWORD)};
+    document.getElementById('password-form').requestSubmit();
+    for (let i = 0; i < 200; i++) {
+      const viewer = window.webpdf?.viewer?.();
+      if (viewer && viewer.pageCount > 1 && viewer.pageElement(1)) return { pages: viewer.pageCount, card: !document.getElementById('password').hidden };
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    return { pages: 0, card: !document.getElementById('password').hidden };
+  })()`);
+  check('and the password it is given opens the document', unlocked?.pages > 1 && unlocked?.card === false, JSON.stringify(unlocked));
+  const told = await page
+    .waitFor(() => window.__heard.find((message) => message.kind === 'opened') ?? null, { label: 'the host to hear what opened', timeout: 30000 })
+    .catch(() => null);
+  check('and only then does the host hear what opened', (told?.info?.pages ?? 0) > 1, JSON.stringify(told?.info ?? told));
 
   /* ---------------------------------- a host the page cannot serve */
 
@@ -161,7 +266,9 @@ try {
   check('a host the page cannot serve is told why', /revision 99/.test(String(refused?.message ?? '')), String(refused?.message ?? ''));
 
   // And it is not given a document it would never draw.
-  await page.evaluate(`window.handOver(${JSON.stringify(base64)}, ${JSON.stringify(path.basename(file))})`);
+  await page.evaluate(
+    `window.handOver(${JSON.stringify(base64)}, ${JSON.stringify(path.basename(file))}, ${JSON.stringify(pdfUrl)})`,
+  );
   await sleep(2500);
   const drew = await page.evaluate(() => window.__heard.some((message) => message.kind === 'opened'));
   check('and is given no document to draw', drew === false, `${await page.evaluate(() => window.__heard.length)} messages heard`);

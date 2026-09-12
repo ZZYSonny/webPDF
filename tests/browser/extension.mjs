@@ -24,9 +24,13 @@
  *   no welcome     the hosted page never lays out the card that offers a
  *                  document: a probe is installed in the frame *before* its first
  *                  statement and samples its first frames
- *   the memory     the position and the settings come back after the document is
- *                  opened again, and the list of remembered documents is the
- *                  hundred most recent, oldest evicted
+ *   the memory     where the reader was comes back after the document is opened
+ *                  again - written by the viewer into its own storage, with the
+ *                  extension holding none of it (the hundred-document cap is
+ *                  `tests/memory.test.ts`, in Node)
+ *   the keyboard   the frame is given the keys, so the viewer's own find and zoom
+ *                  work with nothing relayed, and Ctrl+S writes the bytes the
+ *                  viewer is holding
  *   a dead worker  the redirect is a rule in the profile, so it still takes the
  *                  tab over with the service worker *stopped* - which is what
  *                  Chrome does to it after half a minute of idleness
@@ -130,7 +134,6 @@ const STUB_VIEWER = `<!doctype html>
       const doc = message.doc ?? {};
       window.__handed = doc.bytes ? doc.bytes.byteLength : 0;
       parent.postMessage({ wpdf: 'host', kind: 'opened', info: { title: 'stub viewer', pages: 3, author: '' }, name: doc.name ?? 'document', size: doc.size ?? 0 }, '*');
-      parent.postMessage({ wpdf: 'host', kind: 'state', state: { pos: { page: 1, y: 0 }, settings: {} } }, '*');
     }
   });
   parent.postMessage({ wpdf: 'host', kind: 'hello', bridge, accepts }, '*');
@@ -326,6 +329,50 @@ async function openPdf(browser, page, target) {
 }
 
 /**
+ * Press Ctrl+<key> in the frame, through the browser's own input pipeline.
+ *
+ * That is the whole point of doing it this way: the key lands wherever the focus
+ * is. If the extension page still had it, the viewer's handlers would never see
+ * the key - so these presses are also what checks that the frame was given the
+ * keyboard.
+ */
+async function pressInFrame(browser, key) {
+  const frame = await frameTarget(browser);
+  try {
+    for (const type of ['keyDown', 'keyUp']) {
+      await frame.send('Input.dispatchKeyEvent', {
+        type,
+        modifiers: 2, // ctrl
+        key,
+        code: `Key${key.toUpperCase()}`,
+        windowsVirtualKeyCode: key.toUpperCase().charCodeAt(0),
+        nativeVirtualKeyCode: key.toUpperCase().charCodeAt(0),
+      });
+    }
+    await sleep(300);
+    return await frame.evaluate(() => ({ focused: document.activeElement?.id ?? '', hasFocus: document.hasFocus() }));
+  } finally {
+    await frame.close();
+  }
+}
+
+/** Wait for a download to land, and be the size it is going to be. */
+async function waitForFile(dir, seconds) {
+  const deadline = Date.now() + seconds * 1000;
+  while (Date.now() < deadline) {
+    const name = fs.readdirSync(dir).find((each) => !each.endsWith('.crdownload'));
+    if (name) {
+      const full = path.join(dir, name);
+      const size = fs.statSync(full).size;
+      await sleep(200);
+      if (size > 0 && fs.statSync(full).size === size) return { name, size };
+    }
+    await sleep(250);
+  }
+  return null;
+}
+
+/**
  * A copy of the staged extension pointed at `app` instead of the published
  * viewer.
  *
@@ -412,17 +459,26 @@ try {
       viewer.goToDestination(5, 200);
     })()`,
   );
-  await sleep(1600); // the frame reports in 400 ms, the page writes it 700 ms later
-  const remembered = await page.evaluate(async () => {
-    const stored = await chrome.storage.local.get(null);
-    const entry = (stored.history ?? [])[0];
-    return entry ? { key: entry.key, name: entry.name, pages: entry.pages, pos: entry.pos, settings: entry.settings, opens: entry.opens } : null;
-  });
+  await sleep(1200); // the page waits out the burst before it writes: 400 ms
+  const remembered = await inFrame(
+    browser,
+    `(() => {
+      const memory = JSON.parse(localStorage.getItem('webpdf.memory') ?? '{}');
+      const entry = Object.entries(memory).find(([key]) => key.includes('1706.03762v7'))?.[1] ?? null;
+      return entry && { key: Object.keys(memory)[0], pos: entry.pos, settings: entry.settings, keys: Object.keys(memory).length };
+    })()`,
+  );
   check(
-    'what the reader did is written down',
+    'the viewer writes the reader\'s place into its own memory',
     remembered?.pos?.page === 5 && remembered.settings?.zoom?.level === 1.5 && remembered.settings?.bionic?.on === true && remembered.settings?.crop?.rules.join() === 'page-number',
     JSON.stringify(remembered),
   );
+
+  // And the extension knows nothing about it: the whole point of the memory being
+  // the viewer's is that the extension is a pipe. Two keys, both of them the
+  // extension's own business - the handover token and the last URL for the button.
+  const kept = await page.evaluate(async () => Object.keys(await chrome.storage.local.get(null)).sort());
+  check('and the extension stores no memory of the reader', kept.every((key) => key === 'token' || key === 'last'), JSON.stringify(kept));
 
   // Open it again, the way a reader would: same URL, new tab load.
   await openPdf(browser, page, pdfUrl);
@@ -433,37 +489,36 @@ try {
   check('the position comes back', restored.page === 5 && Math.abs((restored.y ?? 0) - 200) < 6, JSON.stringify({ page: restored.page, y: restored.y }));
   check('so do the settings', restored.zoom === 1.5 && restored.bionic === true && restored.dim === 0.4 && restored.crop.join() === 'page-number' && restored.padding === 6, JSON.stringify(restored));
 
-  /* ------------------------------------------------------- the hundred */
+  /* ------------------------------------------------- the keys and the save */
 
-  // Last, and after a pause: a page that has just been read is still reporting
-  // where it is, and a report landing in the middle of this would be a document
-  // touched more recently than the hundred below.
-  await sleep(2000);
-  const hundred = await page.evaluate(async () => {
-    const url = (i) => `https://example.invalid/paper-${i}.pdf`;
-    for (let i = 0; i < 105; i++) {
-      await chrome.runtime.sendMessage({ type: 'remember', key: `url:${url(i)}`, url: url(i), name: `paper-${i}.pdf`, title: `Paper ${i}`, pages: 12 });
-    }
-    const listed = await chrome.runtime.sendMessage({ type: 'list' });
-    const before = listed.entries.length;
-    // Moving inside a document must not look like opening it again, and must not
-    // throw away what the open said.
-    await chrome.runtime.sendMessage({ type: 'state', key: `url:${url(50)}`, state: { pos: { page: 7, y: 42 }, settings: { zoom: { level: 2, mode: 'custom' } } } });
-    const after = await chrome.runtime.sendMessage({ type: 'list' });
-    const moved = after.entries[0];
-    return {
-      before,
-      after: after.entries.length,
-      first: after.entries[0].key,
-      last: after.entries[after.entries.length - 1].key,
-      hasOldest: after.entries.some((e) => e.key === `url:${url(0)}`),
-      moved: { key: moved.key, title: moved.title, opens: moved.opens, pos: moved.pos },
-    };
-  });
-  check('exactly a hundred documents are remembered', hundred.before === 100 && hundred.after === 100, `${hundred.before} → ${hundred.after}`);
-  check('the oldest fall off the end', hundred.hasOldest === false && hundred.last === 'url:https://example.invalid/paper-5.pdf', hundred.last);
-  check('remembering one again moves it to the front', hundred.first === 'url:https://example.invalid/paper-50.pdf', hundred.first);
-  check('and a move is not an open', hundred.moved.title === 'Paper 50' && hundred.moved.opens === 1 && hundred.moved.pos.page === 7, JSON.stringify(hundred.moved));
+  // The viewer owns the keyboard, and this page hands it over: the frame is
+  // focused as soon as it is up, so Ctrl+F, Ctrl+O and the zoom keys are the
+  // viewer's own handlers with no relay in between - and Ctrl+S writes the bytes
+  // the frame is holding, rather than a second request for a file the reader
+  // already has.
+  // The extension page hands the keyboard over rather than relaying it: the frame
+  // element is what it has focused, and the presses below are what proves the keys
+  // land in the viewer. (`document.hasFocus()` in the frame is not usable here: a
+  // headless browser window is never "active", whatever a frame believes.)
+  const shellFocus = await page.evaluate(() => document.activeElement?.id ?? '');
+  check('the extension page hands the keyboard to the frame', shellFocus === 'app', `extension page focused on: ${shellFocus || 'nothing'}`);
+
+  const search = await pressInFrame(browser, 'f');
+  check("Ctrl+F reaches the viewer's own find, not the browser's", search?.focused === 'search', JSON.stringify(search));
+
+  // A real download, into a directory this test owns: the name it is written
+  // under is the document's own, and its size is the size of the paper.
+  const downloads = path.join(here, 'out', 'downloads');
+  fs.rmSync(downloads, { recursive: true, force: true });
+  fs.mkdirSync(downloads, { recursive: true });
+  await browser.send('Browser.setDownloadBehavior', { behavior: 'allow', downloadPath: downloads, eventsEnabled: true });
+  await pressInFrame(browser, 's');
+  const saved = await waitForFile(downloads, 20);
+  check(
+    'Ctrl+S saves the document the viewer was handed',
+    saved?.name === path.basename(file) && saved.size === fs.statSync(file).size,
+    JSON.stringify(saved),
+  );
 
   /* ------------------------------------------------- a worker that is gone */
 

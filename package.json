@@ -7,8 +7,8 @@
   "license": "AGPL-3.0-or-later",
   "exports": {
     ".": {
-      "types": "./dist/types/index.d.ts",
-      "default": "./dist/webpdf.js"
+      "types": "./dist/lib/types/index.d.ts",
+      "default": "./dist/lib/webpdf.js"
     }
   },
   "files": [

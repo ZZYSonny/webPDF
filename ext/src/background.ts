@@ -16,10 +16,11 @@
  *                      document, a rule the browser would not take) is taken
  *                      over on the spot
  *
- * What it does *not* do is fetch the document: the viewer page is an extension
- * page too, so it has the same access and can stream the bytes itself, with a
- * progress bar and a way to cancel. The worker's part is the memory - the last
- * hundred documents, and where the reader was in each - and the tab handover.
+ * What it does *not* do is fetch the document, and it does not remember anything
+ * about it either: the viewer page is an extension page too, so it has the same
+ * access and streams the bytes itself - and it is the viewer, not this worker,
+ * that remembers where the reader was, in its own storage. The worker's part is
+ * the interception, the tab handover and one URL for the toolbar button.
  *
  * The handover carries a token: the redirect the browser performs cannot know
  * which tab it was for, so the viewer URL carries a secret that only this worker
@@ -36,18 +37,7 @@
  * session rule (which the browser drops on exit) does not.
  */
 
-import {
-  find,
-  forget,
-  inheritedSettings,
-  isOpenable,
-  keyOfUrl,
-  read,
-  remember,
-  type Entry,
-  type HostState,
-  HISTORY_KEY,
-} from './lib/history.js';
+import { isOpenable } from './lib/url.js';
 
 /** The viewer page, as a URL this extension may be redirected to. */
 const VIEWER = chrome.runtime.getURL('viewer.html');
@@ -57,6 +47,9 @@ const RULE_ID = 1;
 
 /** Where the handover token lives. Beside the rule, and for the same reason. */
 const TOKEN_KEY = 'token';
+
+/** The document the toolbar button offers to open again: one URL, and its name. */
+const LAST_KEY = 'last';
 
 /** A URL whose *path* ends in `.pdf` - the rule and the checks agree on this. */
 function looksLikePdf(url: string): boolean {
@@ -93,15 +86,15 @@ function viewerUrl(token: string, url: string, page: number | null = null): stri
   return `${VIEWER}?t=${token}&${hint}u=${bare}`;
 }
 
-/* ------------------------------------------------------------- the memory */
-
-async function entries(): Promise<Entry[]> {
-  const stored = await chrome.storage.local.get(HISTORY_KEY);
-  return read(stored[HISTORY_KEY]);
+/** Where the reader was, when the viewer says so: one document, for the button. */
+async function rememberLast(entry: { url: string; name?: string }): Promise<void> {
+  await chrome.storage.local.set({ [LAST_KEY]: entry });
 }
 
-async function save(list: Entry[]): Promise<void> {
-  await chrome.storage.local.set({ [HISTORY_KEY]: list });
+async function lastDocument(): Promise<{ url: string; name?: string } | null> {
+  const stored = (await chrome.storage.local.get(LAST_KEY))[LAST_KEY] as { url?: unknown; name?: unknown } | undefined;
+  if (!stored || !isOpenable(stored.url)) return null;
+  return { url: stored.url, name: typeof stored.name === 'string' ? stored.name : undefined };
 }
 
 /* --------------------------------------------------- interception, part 1 */
@@ -196,20 +189,17 @@ chrome.webRequest.onHeadersReceived.addListener(
  * What the viewer page asks for.
  *
  * `resolve` is the handover: the page says which document it was opened for and
- * proves it was sent here, and gets back the URL to fetch and whatever was
- * remembered about it. Everything else is the memory being written to.
+ * proves it was sent here, and gets back the URL to fetch. `last` is the page
+ * saying what it opened, so that the toolbar button can offer it again. There is
+ * nothing else - no positions, no settings, no list: those are the viewer's own
+ * memory, in the viewer's own storage, where they can be shared with every other
+ * way of opening that page.
  */
 type Request =
   | { type: 'resolve'; token: string; url: string }
-  | { type: 'entry'; key: string }
-  | { type: 'remember'; key: string; url?: string | null; name?: string; title?: string; pages?: number }
-  | { type: 'state'; key: string; state: HostState }
-  | { type: 'forget'; key: string }
-  | { type: 'list' };
+  | { type: 'last'; url: string; name?: string };
 
 async function handle(request: Request, sender: chrome.runtime.MessageSender): Promise<unknown> {
-  const list = await entries();
-
   switch (request?.type) {
     case 'resolve': {
       if (request.token !== (await handoverToken())) return { ok: false, error: 'This tab was not opened by this extension.' };
@@ -217,56 +207,14 @@ async function handle(request: Request, sender: chrome.runtime.MessageSender): P
       // Only a document of its own: a viewer page inside another page's frame is
       // not the tab's document, and a document is what a tab is for.
       if (typeof sender.tab?.id !== 'number' || sender.frameId !== 0) return { ok: false, error: 'Not a viewer tab.' };
-      const key = keyOfUrl(request.url);
-      const known = find(list, key);
-      return {
-        ok: true,
-        url: request.url,
-        key,
-        name: known?.name || '',
-        // A document never read before starts with the reader's own settings and
-        // at its first page - see `inheritedSettings`.
-        state: known ? { pos: known.pos, settings: known.settings } : { pos: null, settings: inheritedSettings(list) },
-      };
+      await rememberLast({ url: request.url });
+      return { ok: true, url: request.url, name: '' };
     }
-    case 'entry': {
-      // A document the viewer opened by itself - a file dropped on the pages -
-      // is looked up by the same key everything else is: what it is called and
-      // how big it is.
-      if (typeof request.key !== 'string' || request.key === '') return { ok: false };
-      const known = find(list, request.key);
-      return {
-        ok: true,
-        state: known ? { pos: known.pos, settings: known.settings } : { pos: null, settings: inheritedSettings(list) },
-      };
-    }
-    case 'remember': {
-      if (typeof request.key !== 'string' || request.key === '') return { ok: false };
-      const next = remember(
-        list,
-        {
-          key: request.key,
-          url: isOpenable(request.url) ? request.url : null,
-          name: typeof request.name === 'string' ? request.name : undefined,
-          title: typeof request.title === 'string' ? request.title : undefined,
-          pages: typeof request.pages === 'number' ? request.pages : undefined,
-        },
-        { opened: true },
-      );
-      await save(next);
+    case 'last': {
+      if (!isOpenable(request.url)) return { ok: false };
+      await rememberLast({ url: request.url, name: typeof request.name === 'string' ? request.name : undefined });
       return { ok: true };
     }
-    case 'state': {
-      if (typeof request.key !== 'string' || request.key === '') return { ok: false };
-      await save(remember(list, { key: request.key, pos: request.state?.pos ?? null, settings: request.state?.settings ?? null }));
-      return { ok: true };
-    }
-    case 'forget': {
-      await save(forget(list, request.key));
-      return { ok: true };
-    }
-    case 'list':
-      return { ok: true, entries: list };
     default:
       return { ok: false };
   }
@@ -283,15 +231,17 @@ chrome.runtime.onMessage.addListener((message, sender, respond) => {
 /* ------------------------------------------------------------- the button */
 
 /**
- * The toolbar button opens the document that was read most recently, at the page
- * it was left on. With nothing remembered there is nothing to open - and the
- * extension does not have a page to offer instead, which is the point.
+ * The toolbar button opens the document this extension last handed over. It is
+ * not a list and not a history: the reader's place in it is the viewer's own
+ * memory, and the viewer puts it back. With nothing to open there is nothing to
+ * open - and this extension has no page to offer instead, which is the point.
  */
 chrome.action.onClicked.addListener(() => {
   void (async () => {
+    const document = await lastDocument();
+    if (!document) return;
     const token = await handoverToken();
-    const recent = (await entries()).find((entry) => entry.url);
-    if (recent?.url) await chrome.tabs.create({ url: viewerUrl(token, recent.url, recent.pos?.page ?? null) });
+    await chrome.tabs.create({ url: viewerUrl(token, document.url) });
   })();
 });
 

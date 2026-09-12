@@ -12,10 +12,10 @@
       (it is one small file and stays crisp at any size), with the PNG for the
       browsers and crawlers that will not take an SVG icon.
     -->
-    <link rel="icon" href="./demo/icon.svg" type="image/svg+xml" />
-    <link rel="icon" href="./demo/icon.png" type="image/png" sizes="512x512" />
-    <link rel="apple-touch-icon" href="./demo/icon.png" />
-    <link rel="stylesheet" href="./demo/styles.css" />
+    <link rel="icon" href="./icon.svg" type="image/svg+xml" />
+    <link rel="icon" href="./icon.png" type="image/png" sizes="512x512" />
+    <link rel="apple-touch-icon" href="./icon.png" />
+    <link rel="stylesheet" href="./styles.css" />
     <!--
       A hosted page (`?host=1`: the extension's viewer) is opened with a document
       already and must never offer one: the card that offers one - and the example
@@ -231,6 +231,30 @@
           </div>
         </div>
 
+        <!--
+          An encrypted document: the reader is asked here, in the page, rather
+          than by a `window.prompt` - a cross-origin frame cannot raise one, and
+          the page that is drawing the document is the right place to ask for the
+          key to it anyway. Filled in and shown by `askPassword` in `main.ts`.
+        -->
+        <div id="password" class="password" hidden>
+          <form id="password-form" class="password-card">
+            <h1>This document is encrypted</h1>
+            <p id="password-text">Enter the password to open it.</p>
+            <input
+              id="password-input"
+              class="password-input"
+              type="password"
+              autocomplete="current-password"
+              aria-label="Document password"
+            />
+            <div class="password-actions">
+              <button id="password-open" class="btn primary" type="submit">Open</button>
+              <button id="password-cancel" class="btn" type="button">Cancel</button>
+            </div>
+          </form>
+        </div>
+
         <div id="progress" class="progress" hidden><div id="progress-bar"></div></div>
       </section>
     </main>
@@ -241,6 +265,6 @@
     -->
     <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
 
-    <script type="module" src="/demo/main.ts"></script>
+    <script type="module" src="./main.ts"></script>
   </body>
 </html>

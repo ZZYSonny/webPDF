@@ -144,6 +144,22 @@ await page.send('Page.addScriptToEvaluateOnNewDocument', {
  * value is embedded in the expression because `page.evaluate(fn, args)` takes
  * evaluation options as its second argument, not arguments for the function.
  */
+/**
+ * A page that has never been asked to draw anything.
+ *
+ * The memory belongs to the page - it is read once, at start-up, and written back
+ * as the reader moves - so forgetting it means clearing the store *and* loading the
+ * page again. What is left is a document-free demo, which is where a section that
+ * is about defaults has to start.
+ */
+const forgetMemory = async () => {
+  await page.evaluate("localStorage.removeItem('webpdf.memory')");
+  await page.goto(url);
+  // The page's own handle is installed at the end of its module graph, which is
+  // what says the buttons on it are wired.
+  await page.waitFor(() => !!window.webpdf?.info, { label: 'the demo to come back up' });
+};
+
 const open = async (value) => {
   await page.evaluate(`document.getElementById('example-btn').click()`);
   await page.evaluate(`(() => {
@@ -927,6 +943,12 @@ try {
    * where the reader was.
    */
   console.log('— cropping pages to their content —');
+  // The page remembers where the reader was and how they had it set up, so this
+  // section - which is about the crop control's own defaults, and about a
+  // document that has not been touched - starts from a page that has never been
+  // asked to draw anything. Forgetting that means a reload: the page reads its
+  // memory once, at start-up.
+  await forgetMemory();
   await open(document_);
   await waitForPage(1);
 

@@ -165,12 +165,17 @@ export default defineConfig({
   // GitHub Pages' choosing rather than at a domain root - `./assets/...` is
   // correct from any depth, so nothing has to know the repository's name.
   base: './',
-  root: '.',
+  // The demo is a directory with a page in it, not a page with a directory of
+  // scripts beside it: `demo/index.html` is the entry, `demo/main.ts` the module
+  // it loads, and the dev server's `/` is the demo rather than the repository.
+  root: 'demo',
   // Nothing is copied verbatim; the cache is served by `papers()` above.
   publicDir: false,
   plugins: [papers(), hostMode()],
   build: {
-    outDir: 'dist/demo',
+    // Out of the Vite root and into the repository's build directory, which is
+    // where every other build output goes - and what the Pages artifact is.
+    outDir: '../dist/demo',
     emptyOutDir: true,
     target: 'es2022',
     assetsInlineLimit: 0,

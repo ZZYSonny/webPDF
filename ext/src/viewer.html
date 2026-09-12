@@ -35,16 +35,10 @@
         <p id="note-text"></p>
         <div class="note-actions">
           <button id="note-retry" type="button" class="primary">Try again</button>
-          <button id="note-save" type="button">Save the file instead</button>
         </div>
-        <p class="note-hint">Ctrl+S saves the document at any time; Ctrl+F finds text in it.</p>
       </div>
     </div>
 
-    <!-- Ctrl+O: a local file, read here and handed to the viewer. Nothing on
-         this page offers a file - a document is opened the way it always was -
-         but a reader who asks for one gets one. -->
-    <input id="file" type="file" accept="application/pdf,.pdf" hidden />
     <script type="module" src="viewer.js"></script>
   </body>
 </html>

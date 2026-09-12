@@ -127,13 +127,4 @@ declare namespace chrome {
     function setTitle(details: { title: string }): Promise<void>;
   }
 
-  namespace downloads {
-    /** Save a URL the reader asked for as a file: Ctrl+S in the viewer. */
-    function download(options: { url: string; filename?: string }): Promise<number>;
-  }
-
-  namespace extension {
-    /** Whether the reader has let this extension see `file://` URLs. */
-    function isAllowedFileSchemeAccess(): Promise<boolean>;
-  }
 }

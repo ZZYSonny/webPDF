@@ -18,8 +18,7 @@
     "storage",
     "declarativeNetRequestWithHostAccess",
     "webRequest",
-    "webNavigation",
-    "downloads"
+    "webNavigation"
   ],
   "host_permissions": ["<all_urls>"],
   "content_security_policy": {

@@ -805,6 +805,64 @@ html.wpdf-host .empty {
   display: none;
 }
 
+.password {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: color-mix(in srgb, var(--stage) 88%, transparent);
+  backdrop-filter: blur(2px);
+  z-index: 5;
+}
+
+.password-card {
+  max-width: 380px;
+  width: 100%;
+  display: grid;
+  gap: 10px;
+  padding: 20px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg-elevated);
+  box-shadow: 0 18px 40px rgb(0 0 0 / 35%);
+}
+
+.password-card h1 {
+  font-size: 16px;
+  margin: 0;
+  letter-spacing: -0.01em;
+}
+
+.password-card p {
+  color: var(--text-muted);
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.password-input {
+  width: 100%;
+  padding: 7px 9px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-sunken);
+  color: var(--text);
+  font: inherit;
+  letter-spacing: 0.08em;
+}
+
+.password-input:focus {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.password-actions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+}
+
 .empty-card {
   max-width: 560px;
   text-align: center;

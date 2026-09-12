@@ -646,10 +646,16 @@ data either way.
 ## The browser extension
 
 `ext/` is a Chrome extension that opens PDFs in this viewer. It is deliberately
-thin: it notices a document being opened, gives the tab to the viewer, and
-remembers where the reader was. There is no welcome page, no document list, no
-"open a file" button and no sample paper on it, because a document arrives the
-way it always did — clicked, typed, dropped or opened from the file manager.
+thin: it notices a document being opened, fetches it, and gives the tab to the
+viewer. There is no welcome page, no document list, no "open a file" button and no
+sample paper on it, because a document arrives the way it always did — clicked,
+typed, dropped or opened from the file manager.
+
+What it is not is a second application around the viewer. The reader's position,
+their settings, the keyboard and the password prompt are the *viewer's* — see
+[the bridge](#the-bridge-what-crosses-and-what-does-not) — so the extension has
+nothing to keep in step with it: it reads the document and hands over the bytes,
+and that is all it does.
 
 ```sh
 npm run build:extension        # → dist/ext/webpdf/, with a .zip and a .crx beside it
@@ -669,10 +675,12 @@ Install it by loading `dist/ext/webpdf` as an unpacked extension
 `.crx` the build writes beside it. Chrome refuses off-store CRX installs on
 Windows and macOS; on Linux, developer mode plus a drag onto `chrome://extensions`
 is enough. The build prints the extension id it produced, which is what
-`chrome-extension://<id>/…` URLs need — and the id is where the browser files the
-reader's remembered positions, so `ext/key.pem` (gitignored, made on the first
-build), `--key FILE` or `$WEBPDF_EXT_KEY` is what keeps them across builds. CI
-passes the secret if it is set, and prints the id it made when it is not.
+`chrome-extension://<id>/…` URLs need. The id is what the browser files the
+extension's *own* two values under — the handover token and the last document its
+button offers — and not the reader's positions, which belong to the viewer's
+origin; keeping the key (`ext/key.pem`, gitignored and made on the first build;
+`--key FILE`; `$WEBPDF_EXT_KEY`) keeps those two across builds. CI passes the
+secret if it is set, and prints the id it made when it is not.
 
 Two tests keep the `.crx` honest: `tests/extension.test.ts` checks the CRX3 layout
 and that the signature covers the archive it was built from, and the last part of
@@ -704,17 +712,29 @@ Three mechanisms, in order of how early they act:
 The gaps, honestly: a PDF opened in the second between installing the extension
 and the worker's first start (the rule is written then) lands in Chrome's viewer,
 and reloading it works; a link with a `download` attribute is opened rather than
-saved, so Ctrl+S — which downloads the document again, at its URL — is the way to
-save one; and a PDF inside another extension's sandboxed viewer is not a
-navigation this extension can see.
+saved, so Ctrl+S in the viewer — which writes the bytes it is holding, under the
+document's own name — is the way to save one; and a PDF inside another extension's
+sandboxed viewer is not a navigation this extension can see.
 
 ### The memory
 
-One entry per document, and it is the reader's own: the position (a page, and a
+One entry per document, and it is the reader's own: where they were (a page, and a
 point on it in the document's units), the zoom (a level, and whether it was a fit
-mode), the crop rules and padding, the bionic fade, whether the outline was open,
-the title, the page count, and when it was opened and last touched. Nothing else
-— no bytes, no text, no titles beyond the document's own.
+mode), the crop rules and padding, the bionic fade, and whether the outline was
+open. Nothing else — no bytes, no text, no titles, no history of what was read.
+
+**It belongs to the viewer, not to the extension.** A position in page units and a
+set of viewer settings are the viewer's own concepts, so `demo/memory.ts` keeps
+them, in the page's `localStorage`, under one key. The consequences are worth
+spelling out:
+
+* the same memory serves every way of opening the page — the extension, a link to
+  the published demo, a tab restored from the last session — because there is one
+  copy of it and it is the page's;
+* the extension stores none of it: uninstall the extension and the positions are
+  still there, install it and they are already known;
+* it is the *origin's* memory, so it is as durable as any site data: clearing
+  site data for the viewer's origin forgets it, and a private window starts empty.
 
 * A document is identified by its URL, minus the fragment (Chrome uses that for
   its own page number and it never reaches a server), or by name and size for a
@@ -723,21 +743,58 @@ the title, the page count, and when it was opened and last touched. Nothing else
   different screen; the crop is accounted for, so a position means the same thing
   cropped and uncropped, and a crop arriving under the reader no longer moves
   them (they stay on the sentence, the page gets shorter around it).
-* The list is the recency order: `chrome.storage.local` holds the last hundred
-  documents and the oldest falls off the end.
+* The store is the recency order: it holds the last hundred documents and the
+  oldest falls off the end (`tests/memory.test.ts`, in Node).
 * A document that has never been read opens at its first page with the settings
   of the last one. The *position* is deliberately not inherited.
+* Settings this version does not recognise are kept rather than dropped, so a
+  cached older copy of the page cannot throw away what a newer one wrote.
 
 The viewer's `place()` is what makes this exact — the page and the point in the
-document's own coordinates, which is also what `goToDestination(page, y)` takes:
+document's own coordinates, which is also what `goToDestination(page, y)` takes.
+It is deliberately not the browser's `scrollY`:
 
 ```ts
 const viewer = await createViewer({ container: '#view', source: file });
-addEventListener('beforeunload', () => localStorage.setItem('where', JSON.stringify(viewer.place())));
-// …next time
-const where = JSON.parse(localStorage.getItem('where') ?? 'null');
-if (where) viewer.goToDestination(where.page, where.y);
+// What the demo's memory keeps, and what it puts back:
+const where = viewer.place();                  // { page: 7, y: 231.5 }
+viewer.goToDestination(where.page, where.y);
 ```
+
+### The bridge: what crosses, and what does not
+
+The extension and the viewer are two documents on two origins, so the whole of
+their relationship is one small `postMessage` protocol — two kinds each way, and
+every one of them is something only the other side can do:
+
+| the viewer says | the extension says |
+|---|---|
+| `hello` — it is up, and which bridge revision it speaks | `ready` — it is up, and which revision it speaks |
+| `opened` — a document is on screen, and what to call it | `open` — here are the bytes, and what they are |
+| `error` — it could not be opened | |
+
+That is deliberately the whole list: two messages each way, and two of the four
+are the version handshake. Handing over a document is the extension's — it has the
+bytes, and the page never fetches one it was not given — and *what opened* is the
+page's, told to the extension so that it can name the tab and offer the document
+again from its toolbar button. Everything else is the page's own:
+
+* the position, the settings and the hundred-document memory (`demo/memory.ts`);
+* the keyboard — the extension focuses the frame and then has no keys of its own,
+  so Ctrl+F, Ctrl+O, Ctrl+0/± and Ctrl+S are the viewer's own handlers;
+* saving — a write of the bytes the page is already holding;
+* the password — a card in the page's own document. A cross-origin frame may not
+  raise a `window.prompt`, but it can draw a field, and the page drawing the
+  document is the right place to ask for the key to it.
+
+Nothing in the protocol is a viewer internal: no DOM, no `window.webpdf`, no
+storage. The extension holds the interception, the handover token and one URL for
+its button; the deletion test for all of this is that uninstalling it loses
+nothing but the interception — the positions are still there, because they were
+never the extension's.
+
+The protocol is versioned, because the two sides are updated on completely
+different schedules — see [an old extension, a new viewer](#an-old-extension-a-new-viewer).
 
 ### CORS, and why the fetching happens where it does
 
@@ -840,7 +897,7 @@ The library was written with content scripts in mind:
   automatically if a worker cannot be created or does not answer within 15 s -
   so opting in can never leave you with a viewer that does not render. Pass
   `worker: false` to force inline rendering. The prebuilt library resolves its
-  worker relative to `dist/webpdf.js`; if you move `assets/` somewhere else (an
+  worker relative to `dist/lib/webpdf.js`; if you move `assets/` somewhere else (an
   extension must often vendor it), pass `workerUrl` explicitly.
 * The MuPDF wasm binary is fetched relative to the module URL. If your extension
   needs to control that (for `web_accessible_resources`), set it explicitly
@@ -892,8 +949,10 @@ src/
                             a window wider than the viewport, a document per
                             page, pages installed at a quiet moment, pages
                             prepared and installed ahead while the reader rests
-demo/                       the demo application
+demo/                       the demo application (the Vite root, and the site)
+  index.html                the page: the bar, the panels, one viewer container
   main.ts                   the bar, the card, and everything wired to them
+  memory.ts                 where the reader was: the hundred most recent documents
   papers.mjs                the corpus: public URLs, and where they are cached
   papers-client.ts          which of them this page has a local copy of
   examples.ts               the picker's entries, cached copies first
@@ -905,7 +964,7 @@ demo/                       the demo application
   styles.css                the chrome's own stylesheet
   icon.svg, icon.png        the site icon: a page, held at the front and faded
 demo/                       (continued)
-  host.ts                   the host bridge: open this document, where is the reader
+  host.ts                   the host bridge: hand over a document, hear what opened
   host-mode.js              the one thing that must happen before the first paint
 ext/
   manifest.json             MV3 manifest; the build adds the version and the key
@@ -913,16 +972,18 @@ ext/
     background.ts           the worker: interception, the handover, the memory
     viewer.ts               the extension page: fetch, hand over, remember, keys
     viewer.html, viewer.css the shell: one frame, a progress line, one error card
-    lib/history.ts          the hundred most recent documents (pure, so testable)
+    lib/url.ts              the one question the worker asks about an address
     chrome.d.ts             the two dozen API members this extension uses, typed
 tests/
   *.test.ts                 Node tests (real PDFs through the real wasm)
-  extension.test.ts         the memory, and the crx format, in Node
+  extension.test.ts         which URLs the extension opens, and the crx, in Node
+  memory.test.ts            the viewer's memory, in Node (no browser, no extension)
   pdf-cache.mjs             fetches the corpus, lists it, clears it
   browser/                  headless-Chromium verification over CDP
     demo.mjs                the built demo, driven through its own UI
     frames.mjs              a page as a document: selection, clipboard, keys, wheel
     pinch.mjs               the pinch/zoom contract
+    bridge.mjs              the host protocol: a new page, an old host
     extension.mjs           the extension itself, loaded into Chrome
     compare.mjs, diff.mjs   text-vs-outlines fidelity, with a difference map
 scripts/
@@ -937,6 +998,10 @@ inside the worker, and under Node in the tests.
 
 ## Development
 
+Every build writes into its own directory under `dist/` — `dist/lib` for the
+library, `dist/demo` for the site, `dist/ext` for the extension and its `.crx` —
+so that a build which empties its output directory cannot empty anyone else's.
+
 ```sh
 npm install
 npm run dev          # demo on http://127.0.0.1:5173
@@ -944,6 +1009,7 @@ npm run pdfs         # fetch the test corpus into the cache (also happens on dem
 npm test             # Node tests: font pipeline over the real papers
 npm run test:browser # builds the demo, serves it, verifies in headless Chromium
 npm run verify       # typecheck + both test suites
+npm run build:lib    # the library, in dist/lib
 npm run build:pages  # the published site, in dist/demo
 npm run build:extension  # the extension, in dist/ext
 ```
@@ -1093,12 +1159,14 @@ is referenced relatively.
   after that has the rule already, whether or not the worker is running.
 * **The extension does not touch downloads.** A link with a `download` attribute
   (or a `Content-Disposition: attachment` response for a URL that ends in `.pdf`)
-  is opened rather than saved, and Ctrl+S in the viewer saves the document at its
-  URL. That is the price of intercepting before the request: whether a navigation
-  is a download is not something a redirect rule can see.
+  is opened rather than saved. That is the price of intercepting before the
+  request: whether a navigation is a download is not something a redirect rule can
+  see. Ctrl+S in the viewer writes the bytes it was handed, under the document's
+  own name — which means no second request and works for a document with no URL at
+  all, but the name comes from the URL rather than from `Content-Disposition`.
 * **The extension's viewer comes over the network.** The extension carries the
-  interception, the handover and the memory, not the viewer: it frames the
-  published page, so the first document after the browser's cache goes cold needs
+  interception and the handover, not the viewer: it frames the published page, so
+  the first document after the browser's cache goes cold needs
   a connection, and a PDF opened with no connection at all shows the error card
   instead of the viewer. Carrying the viewer would mean ~10 MB more in the package
   and `'wasm-unsafe-eval'` in the extension's policy — a deliberate trade for a
@@ -1107,6 +1175,16 @@ is referenced relatively.
   versioned, so an extension that only knows a revision the published page no
   longer serves is told to update rather than quietly mis-served — and there is
   one interface, not two kept alive forever.
+* **The reader's place lives in the viewer's origin.** That is what makes it
+  survive the extension being uninstalled, and it is also its limit: clearing site
+  data for the viewer's origin forgets every position, a private window starts
+  empty, and a reader who reaches the same document through two different viewer
+  origins (a local `vite preview`, say, and the published site) has two memories.
+* **The keyboard belongs to the viewer, so the keys are the viewer's.** Ctrl+F,
+  Ctrl+O, Ctrl+0/± and Ctrl+S are the viewer's own handlers, which is why they
+  behave the same whether the page is framed by the extension or opened directly.
+  A shortcut the viewer has no handler for is the browser's, as it always was —
+  the extension does not add any of its own.
 * **The worker path is verified in Chromium only.** It relies on module workers
   and `CompressionStream`, both of which are widely available, but the fallback
   exists precisely because worker startup can be blocked by a host's CSP.

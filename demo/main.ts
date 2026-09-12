@@ -28,7 +28,8 @@ import {
   type DocumentInfo,
   type ViewerEvent,
 } from '../src/index.ts';
-import { createHostBridge, isHosted, type HostBridge, type HostDocument, type HostPlace, type HostState } from './host.ts';
+import { createHostBridge, isHosted, type HostBridge, type HostDocument } from './host.ts';
+import { get, inherited, keyOfFile, keyOfUrl, MEMORY_KEY, put, read, write, type Memory, type Place, type Settings } from './memory.ts';
 import { createSearch, type SearchController, type SearchState } from './search.ts';
 import { createCropMenu, type CropMenu } from './crop.ts';
 import { createMenu, type Menu } from './menu.ts';
@@ -84,6 +85,11 @@ const els = {
   emptyOpen: $<HTMLButtonElement>('empty-open'),
   progress: $('progress'),
   toast: $('toast'),
+  password: $('password'),
+  passwordForm: $<HTMLFormElement>('password-form'),
+  passwordText: $('password-text'),
+  passwordInput: $<HTMLInputElement>('password-input'),
+  passwordCancel: $<HTMLButtonElement>('password-cancel'),
 };
 
 let viewer: PdfViewer | null = null;
@@ -93,6 +99,16 @@ let info: DocumentInfo | null = null;
 let currentPage = 1;
 let busy = 0;
 let toastTimer = 0;
+/** How long a burst of scrolling is allowed to go unwritten. */
+const REPORT_MS = 400;
+/**
+ * The reader's own memory: what this page has been asked to draw before, and
+ * where the reader was in it. Read once, at start-up, and written back whole.
+ */
+let memory: Memory = read(localStorage.getItem(MEMORY_KEY));
+/** What identifies the document on screen in that memory, if one is open. */
+let openKey: string | null = null;
+let rememberTimer = 0;
 /**
  * Height of the sticky bar, kept current by the observer at the bottom of this
  * file. The pages scroll *under* it, so every scroll the viewer performs has to
@@ -138,6 +154,17 @@ function labelOf(source: Source, host?: HostDocument | null): string {
   if (typeof source === 'string') return urlName(source);
   if (typeof File !== 'undefined' && source instanceof File) return source.name;
   return 'document';
+}
+
+/**
+ * A filename a browser will write, out of whatever the document is called.
+ *
+ * A URL names a document as `host/path/paper.pdf`, which is a fine title and not
+ * a filename: what is written to disk is the last part of it.
+ */
+function fileNameFor(label: string): string {
+  const base = label.split(/[\\/]/).filter(Boolean).pop() ?? 'document';
+  return /\.pdf$/i.test(base) ? base : `${base}.pdf`;
 }
 
 /** Fetch a document from a URL. */
@@ -299,9 +326,8 @@ function onViewerEvent(event: ViewerEvent): void {
       els.pageno.value = String(event.page);
       highlightOutline(event.page);
       search?.refresh();
-      // A page turn moved the reader, and the reader's position is the one thing
-      // a host remembers that the page cannot work out for itself later.
-      hostBridge.notify();
+      // A page turn moves the reader: this is the position to come back to.
+      rememberHere();
       break;
     case 'zoom-change':
       // The box shows the *layout* zoom; a pinch is the browser's page scale and
@@ -317,7 +343,7 @@ function onViewerEvent(event: ViewerEvent): void {
     case 'crop-change':
       // Nothing to do but say so: the viewer has already re-laid-out the pages.
       crop?.setProgress({ measured: event.measured, total: event.total, running: event.running });
-      hostBridge.notify();
+      rememberHere();
       break;
     case 'render':
       search?.refresh();
@@ -526,7 +552,7 @@ function setBionic(on: boolean, dim?: number): void {
   if (!viewer) return;
   viewer.setBionic(on, dim);
   fillBionicMenu();
-  hostBridge.notify();
+  rememberHere();
 }
 
 /* ---------------------------------------------------------------- panels */
@@ -645,7 +671,7 @@ function setOutline(open: boolean): void {
   els.toc.hidden = !open;
   els.tocToggle.setAttribute('aria-expanded', String(open));
   els.tocToggle.classList.toggle('active', open);
-  hostBridge.notify();
+  rememberHere();
 }
 
 function renderOutline(doc: DocumentInfo): void {
@@ -699,40 +725,94 @@ function highlightOutline(page: number): void {
 /* ------------------------------------------------------------------ load */
 
 /**
+ * What Ctrl+S writes: the bytes of the document on screen, when this page has
+ * them.
+ *
+ * A document handed over as bytes, or opened from the reader's own disk, is here
+ * - so saving it is this page's own job, with no second request for a file the
+ * reader already has and no URL to go stale. A document this page was only given
+ * the URL of is the engine's to fetch and the browser's to save, so Ctrl+S is
+ * left to the browser for it, which is what Ctrl+S has always meant there.
+ */
+let saving: { bytes: BlobPart; name: string } | null = null;
+
+/** The bytes of a document, when this page has them, and what to write them as. */
+function savable(source: Source, label: string): { bytes: BlobPart; name: string } | null {
+  const name = fileNameFor(label);
+  if (typeof Blob !== 'undefined' && source instanceof Blob) return { bytes: source, name };
+  if (source instanceof ArrayBuffer || ArrayBuffer.isView(source)) return { bytes: source as BlobPart, name };
+  return null;
+}
+
+/** Write the open document out, under the name it is known by. */
+function saveDocument({ bytes, name }: { bytes: BlobPart; name: string }): void {
+  const url = URL.createObjectURL(new Blob([bytes], { type: 'application/pdf' }));
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = name;
+  link.click();
+  // The browser has read the blob the moment the download begins; a minute is
+  // long enough for that and short enough not to hold a document all session.
+  window.setTimeout(() => URL.revokeObjectURL(url), 60000);
+}
+
+/**
  * Open a document, from wherever it came: a file the reader chose, a URL the
  * page was asked for, or bytes a host handed over.
  *
  * `host` is what the host knows about the document that the page cannot work out
- * for itself - its name, its size, and where the reader was the last time - and
- * it is the only thing that differs between the reader's own document and one
- * the extension brought. It ends with the host being told what was opened and
- * where the reader is, which is what makes the position in the record match the
- * position on the screen.
+ * for itself - its name, its size, and the page a `#page=` asked for - and it is
+ * the only thing that differs between the reader's own document and one the
+ * extension brought. Where the reader was is this page's own business: it is in
+ * the memory, and it is what the page puts back before the host is told what
+ * opened.
  */
 async function openSource(source: Source, host?: HostDocument | null): Promise<void> {
   const label = labelOf(source, host);
+  const key = keyFor(source, label, host);
   // Read by `document-loaded`, which fires while `load` is still running.
   sourceName = host?.url ? urlName(host.url) : label;
   busy++;
+  saving = null;
+  // Whatever the reader did to the document that is being replaced, write it down
+  // now: a settings change within the debounce window would otherwise be lost by
+  // the switch.
+  commitMemory();
+  openKey = null;
   els.progress.hidden = false;
   try {
     const v = await ensureViewer();
     let loaded: DocumentInfo;
-    try {
-      loaded = await v.load(source);
-    } catch (error) {
-      // An encrypted document is the one failure the reader can answer for.
-      if ((error as Error)?.name !== 'PasswordRequiredError') throw error;
-      const password = await askPassword();
-      if (!password) throw error;
-      loaded = await v.load(source, password);
+    // An encrypted document is the one failure the reader can answer for, so the
+    // question is repeated for as long as they are willing to answer it: a wrong
+    // password comes back as the same error, and only Cancel ends it. The count
+    // is a guard against a document that never accepts anything, not a limit a
+    // reader would ever reach.
+    let password: string | undefined;
+    for (let tries = 0; ; tries++) {
+      try {
+        loaded = await v.load(source, password);
+        break;
+      } catch (error) {
+        if ((error as Error)?.name !== 'PasswordRequiredError' || tries >= 20) throw error;
+        const answer = await askPassword(tries > 0);
+        if (answer == null) throw error;
+        password = answer;
+      }
     }
     notify(
       `${loaded.title || label} — ${loaded.pageCount} page${loaded.pageCount === 1 ? '' : 's'}` +
         (loaded.author ? ` · ${loaded.author}` : '') +
         (v.rendersInWorker ? ' · rendering in a worker' : ' · rendering inline'),
     );
-    if (host) restoreHost(host);
+    openKey = key;
+    // Where this document was left, or - if it has never been read here - the
+    // settings of the last one, at its first page.
+    restoreMemory(key, host);
+    saving = savable(source, label);
+    // Written now rather than at the end of the window: a document the reader
+    // opens and closes without moving is still a document they read.
+    commitMemory();
     hostBridge.opened({ info: hostInfo(), name: label, size: sizeOf(source, host) });
   } catch (error) {
     console.error(error);
@@ -754,44 +834,120 @@ function sizeOf(source: Source, host?: HostDocument | null): number {
 }
 
 /**
- * The password for an encrypted document. The reader is asked by whoever can
- * actually put a dialog in front of them: the top-level extension page when this
- * page is framed by one (a cross-origin frame cannot open a prompt), and the page
- * itself otherwise.
+ * The password for an encrypted document, asked for in the page.
+ *
+ * Not with `window.prompt`: a cross-origin frame may not raise a dialog at all,
+ * and a page that is drawing the document is the right place to ask for the key
+ * to it in any case. The card is ordinary markup in this document, so the prompt
+ * is the same whether the page was opened by a reader or framed by an extension -
+ * and the extension is not asked, because it has nothing to do with it.
+ *
+ * A wrong password comes back as another `PasswordRequiredError`, and the caller
+ * asks again: the only way out is Cancel, which is a null here.
  */
-async function askPassword(): Promise<string | null> {
-  if (hostBridge.active) return hostBridge.askPassword();
-  return window.prompt('This document is password protected. Password:');
+function askPassword(again = false): Promise<string | null> {
+  els.passwordText.textContent = again
+    ? 'That password did not open it. Try again, or cancel.'
+    : 'Enter the password to open it.';
+  els.password.hidden = false;
+  els.passwordInput.value = '';
+  els.passwordInput.focus();
+  return new Promise((resolve) => {
+    const done = (password: string | null): void => {
+      els.password.hidden = true;
+      els.passwordForm.removeEventListener('submit', onSubmit);
+      els.passwordCancel.removeEventListener('click', onCancel);
+      document.removeEventListener('keydown', onKey, true);
+      resolve(password);
+    };
+    const onSubmit = (event: Event): void => {
+      event.preventDefault();
+      done(els.passwordInput.value || null);
+    };
+    const onCancel = (): void => done(null);
+    const onKey = (event: KeyboardEvent): void => {
+      if (event.key === 'Escape') {
+        event.stopPropagation();
+        done(null);
+      }
+    };
+    els.passwordForm.addEventListener('submit', onSubmit);
+    els.passwordCancel.addEventListener('click', onCancel);
+    document.addEventListener('keydown', onKey, true);
+  });
 }
 
 /**
  * Put the page back the way the reader left it: zoom, crop, fade and outline
  * first (they change the layout), then the position in it - a position is a page
  * and a point on it, so it means the same thing at every zoom.
+ *
+ * A document that has never been read here starts at the settings of the last one
+ * and at its first page; a page the *host* asked for (a `#page=7` on the URL it
+ * was opened with) is used only when there is nothing remembered, because a
+ * remembered position is where the reader actually left off.
  */
-function restoreHost(host: HostDocument): void {
-  const state = host.state ?? null;
-  if (state) applyHostState(state, null);
-  const place = state?.pos ?? (host.page ? { page: host.page, y: null } : null);
+function restoreMemory(key: string, host?: HostDocument | null): void {
+  const known = get(memory, key);
+  // A document that has been read here before comes back exactly as it was left,
+  // outline and all. One that has never been read starts the way this page always
+  // starts: the reader's own zoom, crop and fade, and the outline closed - which
+  // is where they were rather than how they like to read.
+  applySettings(known ? known.settings : outlineClosed(inherited(memory)));
+  const place = known?.pos ?? (host?.page ? { page: host.page, y: null } : null);
   if (place) viewer?.goToDestination(place.page, place.y ?? null);
 }
 
-/** Apply remembered settings (and optionally a position) to the open document. */
-function applyHostState(state: HostState | null | undefined, pos?: HostPlace | null): void {
-  if (!viewer || !state) return;
-  const settings = state.settings;
-  if (settings) {
-    // A fit mode is re-resolved against this window; a fixed scale is restored
-    // as it was, which is what makes "as I left it" true on any screen.
-    if (settings.zoom) viewer.setZoom(settings.zoom.mode === 'custom' ? settings.zoom.level : settings.zoom.mode);
-    if (settings.crop) ensureCropMenu(viewer).setRules(settings.crop.rules, settings.crop.padding);
-    if (settings.bionic) setBionic(settings.bionic.on, settings.bionic.dim);
-    if (typeof settings.outline === 'boolean') setOutline(settings.outline);
-    syncZoomBox();
+/** The reader's settings, with the outline left as a fresh document opens it. */
+function outlineClosed(settings: Settings | null): Settings | null {
+  return settings ? { ...settings, outline: false } : null;
+}
+
+/** Apply remembered settings to the open document. */
+function applySettings(settings: Settings | null): void {
+  if (!viewer || !settings) return;
+  // A fit mode is re-resolved against this window; a fixed scale is restored as
+  // it was, which is what makes "as I left it" true on any screen. What is not
+  // recognised is ignored rather than passed on: this may be a store a newer
+  // version of this page wrote, and only the page that wrote it knows what its
+  // own additions mean.
+  if (settings.zoom) {
+    const { level, mode } = settings.zoom;
+    if (mode === 'custom') viewer.setZoom(level);
+    else if (mode === 'fit-width' || mode === 'fit-page') viewer.setZoom(mode);
   }
-  const place = pos ?? state.pos;
-  if (place) viewer.goToDestination(place.page, place.y ?? null);
-  hostBridge.notify();
+  if (settings.crop) ensureCropMenu(viewer).setRules(settings.crop.rules, settings.crop.padding);
+  if (settings.bionic) setBionic(settings.bionic.on, settings.bionic.dim);
+  if (typeof settings.outline === 'boolean') setOutline(settings.outline);
+  syncZoomBox();
+}
+
+/**
+ * Write where the reader is, once they stop moving.
+ *
+ * Every scroll and every settings change comes through here, so the write waits
+ * out the burst: the position that matters is the one they stop at. A tab that is
+ * going away is the exception - that is the one moment there is no later.
+ */
+function rememberHere(): void {
+  if (!openKey || !viewer) return;
+  if (rememberTimer) return;
+  rememberTimer = window.setTimeout(commitMemory, REPORT_MS);
+}
+
+/** Write it now, rather than at the end of the window. */
+function commitMemory(): void {
+  if (rememberTimer) {
+    clearTimeout(rememberTimer);
+    rememberTimer = 0;
+  }
+  if (!openKey || !viewer) return;
+  memory = put(memory, openKey, hostState());
+  try {
+    localStorage.setItem(MEMORY_KEY, write(memory));
+  } catch {
+    /* storage full, or blocked: the reader's place is not worth an error card */
+  }
 }
 
 /** What the host is told about the document on screen. */
@@ -801,20 +957,33 @@ function hostInfo(): { title: string; pages: number; author: string } | null {
 
 /**
  * Where the reader is, and how the document is set up, in one JSON-safe object -
- * the whole of what a host remembers about a document. Everything in it is
- * either a page number, a factor or a flag: no pixels, so it outlives a zoom, a
- * resize and a different screen.
+ * the whole of what is remembered about a document. Everything in it is either a
+ * page number, a factor or a flag: no pixels, so it outlives a zoom, a resize and
+ * a different screen.
  */
-function hostState(): HostState {
+function hostState(): { pos: Place | null; settings: Settings } {
   return {
     pos: viewer?.place() ?? null,
     settings: {
       zoom: viewer ? { level: viewer.zoom, mode: viewer.zoomMode } : null,
-      crop: viewer ? { rules: [...viewer.crop], padding: viewer.cropPadding } : null,
+      // With no rules there is no crop to remember - and the padding field is
+      // inert without them, so a "padding" of its own is not something the reader
+      // ever chose. (The viewer's own default padding is zero; the demo's is 6pt,
+      // and inheriting a zero would quietly replace it.)
+      crop: viewer && viewer.crop.length ? { rules: [...viewer.crop], padding: viewer.cropPadding } : null,
       bionic: viewer ? { on: viewer.bionic, dim: viewer.bionicDim } : null,
       outline: !els.toc.hidden,
     },
   };
+}
+
+/**
+ * What identifies the document on screen, for the memory: where it came from, or
+ * - for a file that never had a URL - its name and its size.
+ */
+function keyFor(source: Source, label: string, host?: HostDocument | null): string {
+  const url = host?.url ?? (typeof source === 'string' ? source : null);
+  return url ? keyOfUrl(url) : keyOfFile(label, sizeOf(source, host));
 }
 
 /* ---------------------------------------------------------------- events */
@@ -908,6 +1077,13 @@ window.addEventListener('keydown', (event) => {
     event.preventDefault();
     els.search.focus();
     els.search.select();
+  } else if (key === 's' && saving) {
+    // The bytes are here, so writing them is this page's own job: no second
+    // request for a file the reader already has, and it works for a document
+    // with no URL at all. A document this page only knows the URL of is left to
+    // the browser, which is what Ctrl+S has always meant there.
+    event.preventDefault();
+    saveDocument(saving);
   }
 });
 
@@ -947,8 +1123,14 @@ window.webpdf = { viewer: () => viewer, info: () => info };
 /**
  * The host, when there is one: the extension this page is the viewer for, or any
  * other application that opened it with `?host=1`. It is inert when the page is
- * opened by a reader, which is every other way of getting here - so the calls to
- * it below are the page saying what changed, not the page being a host's.
+ * opened by a reader, which is every other way of getting here.
+ *
+ * What it is for is the two things only a host can do: hand over a document (it
+ * has the bytes, and this page never fetches one it was not given) and put a
+ * password prompt in front of the reader is the page's own card, not the host's.
+ * Everything else - where the reader is, how they had it set up, the keyboard,
+ * saving - is this page's own, and the host is told what opened only so that it
+ * can name the tab.
  */
 const hostBridge: HostBridge = createHostBridge({
   open: async (doc) => {
@@ -956,12 +1138,6 @@ const hostBridge: HostBridge = createHostBridge({
     const source: Source | null = bytes ?? doc.url ?? null;
     if (!source) throw new Error('the host sent no document');
     await openSource(source, doc);
-  },
-  state: hostState,
-  apply: applyHostState,
-  find: () => {
-    els.search.focus();
-    els.search.select();
   },
 });
 
