@@ -12,10 +12,11 @@
  * narrow the window is: the document, its outline and the page number on the
  * left, the layout zoom level in the middle, finding and the two drawing modes
  * on the right. Everything on it that opens something is a dropdown built from
- * `menu.ts`; everything else is an icon. There is no status bar - messages float
- * in a toast, and the last render's cost is not shown at all - so the pages get
- * every pixel below the bar, and the browser's own pinch is never competing with
- * chrome that claims to be fixed.
+ * `menu.ts`; everything else is an icon. There is no status bar, and a document
+ * that is open says nothing at all: only a failure the reader has to answer for
+ * reaches them, in a toast, and the last render's cost is not shown either - so
+ * the pages get every pixel below the bar, and the browser's own pinch is never
+ * competing with chrome that claims to be fixed.
  *
  * The bar is the *document's* chrome, so it arrives with the first page: with
  * nothing open there is nothing for it to hold, and the empty card offers the
@@ -165,11 +166,11 @@ const coreUrl = new URL(core.url, BASE).href;
  * arithmetic and the reader is scrolling through it; the fallback is the honest
  * one, because a viewer that refuses to draw without a worker is a viewer that
  * does not work in a frame that has none. Nothing above this line knows which
- * one it got: both answer the same calls, and `rendersInWorker` is the only
- * thing that tells.
+ * one it got: both answer the same calls, and the page never asks - a reader
+ * does not care which thread has the document, so nothing here mentions it.
  */
 async function createEngine(planFonts: boolean): Promise<PdfEngineLike> {
-  const options = { coreUrl, planFonts, onWarn: (message: string) => notify(message) };
+  const options = { coreUrl, planFonts, onWarn: warn };
   const worker = await createWorkerEngine(options);
   if (worker) return worker;
   // The wasm is fetched and instantiated here and now, on this thread.
@@ -184,7 +185,7 @@ async function createEngine(planFonts: boolean): Promise<PdfEngineLike> {
 const offline = createOffline({
   engine: { url: new URL(core.wasm, BASE).href, integrity: core.integrity },
   hosted: isHosted() && window.parent !== window,
-  onWarn: (message) => notify(message),
+  onWarn: warn,
   // A newer build of the viewer, waiting for a page willing to reload into it.
   // The page says so and lets the reader decide; the alternative is a build that
   // installs and then sits there until every tab of the old one is closed.
@@ -544,17 +545,15 @@ function onViewerEvent(event: ViewerEvent): void {
       search?.refresh();
       break;
     case 'link':
-      // The viewer has already done the work - an internal link jumped, an
-      // external one opened in a new tab - so this only says what happened. A
-      // document can link to anything, and the ones a browser will not follow
-      // are worth spelling out rather than leaving as a dead click.
-      if (event.kind === 'external') {
-        if (event.openable) notify(`Opening ${event.uri} in a new tab`);
-        else notify(`This document links to ${event.uri}, which a browser cannot open`, 'error');
+      // The viewer has already done the work - an internal link jumped and an
+      // external one opened in a new tab - and neither of those needs saying: the
+      // page moved, or a tab appeared, and a line over the document telling the
+      // reader what they just watched happen is chrome. The one case that does
+      // need saying is the link a browser will not follow: nothing happened, and
+      // a click that looks broken is worth a sentence rather than silence.
+      if (event.kind === 'external' && !event.openable) {
+        notify(`This document links to ${event.uri}, which a browser cannot open`, 'error');
       }
-      break;
-    case 'drop-accepted':
-      notify(`Opening ${event.name}…`);
       break;
     case 'error':
       console.error(event.error);
@@ -569,11 +568,20 @@ function onViewerEvent(event: ViewerEvent): void {
  * The one message that does not leave on its own: a newer build is installed
  * and waiting to take over (`offline.ts` finds it). It stays until the reader
  * answers it - the button, or the × - because a deploy that nobody is told
- * about is a deploy that never arrives; anything else the page has to say is a
- * sentence that floats and goes.
+ * about is a deploy that never arrives, and unlike the failures below this one
+ * is a question rather than a statement.
  */
 let applyUpdate: (() => void) | null = null;
 
+/**
+ * What the page is willing to interrupt the reader with: a failure. A document
+ * that will not open, a document that will not be written out, a link the
+ * browser will not follow - each is something only the page can say, and each
+ * goes away on its own. Nothing else is said at all: the document's title, its
+ * page count, the tab a link opened in and whether its pages are being drawn in
+ * a worker are things the tab, the bar and the picture already carry, and a line
+ * over the pages repeating them is chrome in the reader's way.
+ */
 function notify(text: string, kind: 'info' | 'error' = 'info'): void {
   clearTimeout(toastTimer);
   applyUpdate = null;
@@ -585,6 +593,18 @@ function notify(text: string, kind: 'info' | 'error' = 'info'): void {
   toastTimer = window.setTimeout(() => {
     els.toast.hidden = true;
   }, kind === 'error' ? 8000 : 3500);
+}
+
+/**
+ * Something the machinery under the page had to say while it worked: a worker
+ * that would not boot on this browser, a document's faces that could not be
+ * planned, an offline copy that did not fit. None of it is the reader's to
+ * answer and all of it is recoverable, so none of it floats over the pages - it
+ * goes where the next person to open a console will find it, prefixed so they
+ * know which layer said it.
+ */
+function warn(message: string): void {
+  console.warn(`[webpdf] ${message}`);
 }
 
 /** Say that a newer build is waiting, and take the reader's answer to it. */
@@ -1168,7 +1188,6 @@ async function openSource(source: Source, host?: HostDocument | null): Promise<v
     // (see `documentBytes`).
     const fetched = typeof source === 'string' ? await fetchDocument(source) : null;
     const document_ = fetched ?? source;
-    let loaded: DocumentInfo;
     // An encrypted document is the one failure the reader can answer for, so the
     // question is repeated for as long as they are willing to answer it: a wrong
     // password comes back as the same error, and only Cancel ends it. The count
@@ -1177,7 +1196,7 @@ async function openSource(source: Source, host?: HostDocument | null): Promise<v
     let password: string | undefined;
     for (let tries = 0; ; tries++) {
       try {
-        loaded = await v.load(document_, password);
+        await v.load(document_, password);
         break;
       } catch (error) {
         if ((error as Error)?.name !== 'PasswordRequiredError' || tries >= 20) throw error;
@@ -1186,11 +1205,9 @@ async function openSource(source: Source, host?: HostDocument | null): Promise<v
         password = answer;
       }
     }
-    notify(
-      `${loaded.title || label} — ${loaded.pageCount} page${loaded.pageCount === 1 ? '' : 's'}` +
-        (loaded.author ? ` · ${loaded.author}` : '') +
-        (v.rendersInWorker ? ' · rendering in a worker' : ' · rendering inline'),
-    );
+    // The document says nothing for itself once it is open: its title is on the
+    // tab, its page count is on the bar, and which thread is drawing it is this
+    // page's business rather than the reader's.
     openKey = key;
     // Where this document was left, or - if it has never been read here - the
     // settings of the last one, at its first page.

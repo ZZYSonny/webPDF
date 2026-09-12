@@ -251,7 +251,9 @@ re-measure.
 
 `demo/core/bridge.ts` is the TypeScript for that protocol, `demo/core/engine.ts`
 is a `PdfEngine` over it (source reading, the sliced plan, the crop cache,
-errors), and `demo/core/client.ts` is the same engine behind a worker.
+errors), and `demo/core/client.ts` is the same engine behind a worker. Which of
+the two a page got is a detail it never mentions: both answer the same calls, and
+a reader does not care which thread holds the document.
 
 The build is `node scripts/build-core-wasm.mjs` (`npm run build:wasm`). It needs
 the Emscripten SDK, which the repository keeps in `.emsdk/`, and it writes
@@ -300,7 +302,11 @@ pages' zoom belongs to the viewer:
   what gives way to keep it there is the find box: below 560px the page count and
   the match count go, and below 460px the magnifier and the two match arrows go
   with them — a query nobody can see is worse than a control without an icon, and
-  Enter still steps the matches. Messages float in a toast instead of a status
+  Enter still steps the matches. A document that is open says nothing: its title
+  is on the tab, its page count is on the bar, and the thread drawing it is not
+  the reader's business. The one thing that floats over the pages is a failure
+  the reader has to answer for — a document that will not open, a save that will
+  not write, a link the browser will not follow — in a toast rather than a status
   bar, so the pages own every pixel below the bar.
 * **The tab names the document**: its own title if it declares one, else the
   file's name, else the URL it came from with the scheme taken off

@@ -171,8 +171,7 @@ const forgetMemory = async () => {
  * page is drawn" would therefore be answered by the page already there, and
  * every check after it would be about the wrong document - so this waits for the
  * tab's own title to change, and then for the pages to be one document (this run
- * is `IFrame → Global Font`, so a page of the new document spends its first
- * moments in a frame).
+ * is `Global Font`, so a page is drawn once, as text, when the plan lands).
  *
  * The value is embedded in the expression because `page.evaluate(fn, args)` takes
  * evaluation options as its second argument, not arguments for the function.
@@ -224,6 +223,17 @@ const open = async (value) => {
       timeout: 120000,
     },
   );
+  // And it was opened without a word about itself. The title, the page count and
+  // which thread drew it are all things the tab, the bar and the picture carry;
+  // the only toast this page still raises is a failure. The greeting at start-up
+  // is the one message that can legitimately still be in flight this early.
+  const said = await page.evaluate(() => {
+    const toast = document.getElementById('toast');
+    return toast && !toast.hidden ? (document.getElementById('toast-text')?.textContent ?? '') : '';
+  });
+  if (said && !/^Ready\b/.test(said)) {
+    fail(`opening a document should say nothing, but the page said ${JSON.stringify(said)}`);
+  }
 };
 
 /**
@@ -231,17 +241,10 @@ const open = async (value) => {
  * the app, so it is taken on the public example with a match boxed - the same
  * view a reader gets when they open the published demo.
  *
- * The toast is waited out first: it lives 3.5 s, and whether it is still up when
- * the picture is taken depends on how long the save and the print before it
- * took, which is not something the README's picture should be a race about.
+ * Nothing has to be waited out of the way first: an open document says nothing
+ * at all, so the picture is the document and the bar and nothing else.
  */
 const shot = async (file) => {
-  await page
-    .waitFor(() => document.getElementById('toast')?.hidden !== false, {
-      label: 'the toast to go',
-      timeout: 15000,
-    })
-    .catch(() => undefined);
   await page.screenshot(file);
   fs.copyFileSync(file, path.join(here, '..', '..', 'docs', 'demo.png'));
   console.log('screenshot: ' + file + ' (+ docs/demo.png)');
@@ -334,7 +337,9 @@ const landed = (page_, y) =>
       chrome: document.querySelector('.topbar')?.offsetHeight ?? 0,
       hash: location.hash,
       href: location.href,
-      url: document.getElementById('toast')?.textContent ?? '',
+      // What the page said, if anything: an open document should have nothing to
+      // say, and the one exception is the link it cannot follow.
+      toast: document.getElementById('toast')?.hidden === false ? (document.getElementById('toast-text')?.textContent ?? '') : '',
     };
   })()`);
 
@@ -997,7 +1002,10 @@ try {
       // Following a link out of the document must not navigate the page that is
       // showing it - that is the whole reason the viewer owns the click.
       if (after.href !== before.href) fail(`the page navigated away: ${before.href} -> ${after.href}`);
-      if (!/new tab/.test(after.url)) fail(`the demo should say what it did with the link, got ${JSON.stringify(after.url)}`);
+      // ...and it happened without a word about it. Following a link that works
+      // is something the reader watches happen - the tab appears - and a line
+      // announcing it is chrome the demo no longer puts over the document.
+      if (after.toast !== '') fail(`the demo should say nothing about an opened link, got ${JSON.stringify(after.toast)}`);
     }
 
     console.log('— links: one a browser cannot follow —');

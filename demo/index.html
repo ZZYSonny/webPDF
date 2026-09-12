@@ -292,11 +292,13 @@
     </main>
 
     <!--
-      The old status bar is gone: transient messages (opening a file, an error)
-      float in a toast instead, so nothing permanent is competing with the pages.
-      The one thing that stays until it is answered is a newer build waiting to
-      take over (`offline.ts` looks for one, `announceUpdate` says so) - a notice
-      with a way to take it and a way to put it down.
+      The old status bar is gone, and so is most of what used to float here: an
+      open document says nothing about itself, and the only thing left that a
+      reader is told is a failure they have to answer for - a document that will
+      not open, a save that will not write, a link no browser will follow. The
+      one thing that stays until it is answered is a newer build waiting to take
+      over (`offline.ts` looks for one, `announceUpdate` says so) - a notice with
+      a way to take it and a way to put it down.
     -->
     <div id="toast" class="toast" role="status" aria-live="polite" hidden>
       <span id="toast-text"></span>
