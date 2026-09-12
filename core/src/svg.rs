@@ -23,20 +23,32 @@
 //! ligature, whose letters the face joins with a `liga` rule - gets a `<tspan>`
 //! of its own with one position, because a shaper only joins letters it lays out
 //! together.
+//!
+//! Not every mark on a page is a path or a character. An image is a PNG data URI
+//! of the pixels MuPDF decoded, a shading is a real SVG gradient wherever SVG has
+//! one that means the same thing and MuPDF's own rasterisation where it does not,
+//! a soft mask is a `<mask>` and a tiling pattern a `<pattern>`. Those have
+//! definitions of their own, so the device has two sinks - the page and the
+//! `<defs>` it is filling - and `begin_defs`/`end_defs` say which one is live.
+//! Everything a definition draws is still drawn by this same pass: a mask's
+//! second interpretation is the interpreter's `begin_mask`, not a re-run of ours.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt::Write as _;
+use std::num::NonZero;
 use std::rc::Rc;
 use std::sync::OnceLock;
 
 use mupdf::{
-    BlendMode, ColorParams, Colorspace, Document, Error, Image, Matrix, NativeDevice, Path,
-    PathWalker, Rect, Shade, StrokeState, Text,
+    BlendMode, ColorParams, Colorspace, Device, Document, Error, Function, IRect, Image, Matrix,
+    NativeDevice, Path, PathWalker, Pixmap, Rect, Shade, StrokeState, Text,
 };
 
+use crate::ffi;
 use crate::font::plan::Plan;
 use crate::text::{is_simple_code, CharGrid, SpaceKind, SpaceMark, ANCHOR_EPSILON};
+use crate::util::base64;
 
 /// What the caller can ask of a page's SVG.
 #[derive(Debug, Clone, Default)]
@@ -67,6 +79,10 @@ pub struct PageStats {
     pub spaces: usize,
     /// `@font-face` rules embedded in this page.
     pub fonts: usize,
+    /// Images written into this page.
+    pub images: usize,
+    /// Shadings written into this page, as gradients or as rasterised meshes.
+    pub shades: usize,
 }
 
 /// A number as MuPDF's own writer prints it.
@@ -108,11 +124,8 @@ fn rgb(cs: &Colorspace, color: &[f32], cp: ColorParams) -> String {
     let converted = cs
         .convert_color(color, &rgb_cs, None, cp)
         .unwrap_or_else(|_| vec![0.0, 0.0, 0.0]);
-    let c = |i: usize| -> u8 {
-        let v = converted.get(i).copied().unwrap_or(0.0);
-        (v.clamp(0.0, 1.0) * 255.0).round() as u8
-    };
-    format!("#{:02x}{:02x}{:02x}", c(0), c(1), c(2))
+    let at = |i: usize| converted.get(i).copied().unwrap_or(0.0);
+    hex(quantise([at(0), at(1), at(2)]))
 }
 
 fn opacity(alpha: f32) -> Option<String> {
@@ -121,6 +134,39 @@ fn opacity(alpha: f32) -> Option<String> {
     } else {
         Some(num(alpha.max(0.0)))
     }
+}
+
+/// How many pixels per point a shading that has no SVG gradient is rasterised
+/// at. MuPDF's own SVG device uses one, which is visibly blocky on a mesh that
+/// covers a figure; two is still small enough to inline.
+const SHADE_RASTER_SCALE: f32 = 2.0;
+
+/// How far inside an end a stop that fades to nothing is placed, as a fraction
+/// of the gradient. A shading that was not told to extend is not painted beyond
+/// its ends, and SVG's only way to say that is a fade - so the fade is made
+/// shorter than a pixel rather than left as a ramp.
+const STOP_EPSILON: f32 = 0.0005;
+
+/// A soft mask while it is being filled in.
+struct SoftMask {
+    id: u32,
+    /// A luminosity mask wants an opaque white backdrop; an alpha mask wants a
+    /// transparent one. Either way the backdrop is what keeps SVG from
+    /// minimising a mask that would otherwise be empty.
+    luminosity: bool,
+}
+
+/// A tiling pattern while its tile is being drawn.
+struct Tile {
+    id: u32,
+    /// The area to tile, in the pattern's own space.
+    area: Rect,
+    /// The one tile the pattern repeats, in the pattern's own space.
+    view: Rect,
+    step: (f32, f32),
+    /// The transform from the pattern's space to the page, which is what the
+    /// rectangle that is filled with the pattern carries.
+    ctm: Matrix,
 }
 
 /// The CSS name for a blend mode, or none for the one SVG already does.
@@ -151,6 +197,26 @@ fn join_name(join: mupdf::LineJoin) -> &'static str {
         mupdf::LineJoin::Round => "round",
         mupdf::LineJoin::Bevel => "bevel",
         _ => "miter",
+    }
+}
+
+/// The stroke attributes, with the width the caller asks to have written.
+///
+/// The width is a parameter rather than `state.line_width()` because a glyph
+/// outline is in em units: its stroke width is in em units too, and only the
+/// caller knows how large the em came out.
+fn stroke_attrs(out: &mut String, state: &StrokeState, width: f32) {
+    let _ = write!(out, " stroke-width=\"{}\"", num(width));
+    if state.line_join() != mupdf::LineJoin::Miter {
+        let _ = write!(out, " stroke-linejoin=\"{}\"", join_name(state.line_join()));
+    }
+    if state.miter_limit() != 10.0 {
+        let _ = write!(out, " stroke-miterlimit=\"{}\"", num(state.miter_limit()));
+    }
+    let dashes = state.dashes();
+    if !dashes.is_empty() {
+        let list: Vec<String> = dashes.iter().map(|d| num(*d)).collect();
+        let _ = write!(out, " stroke-dasharray=\"{}\"", list.join(" "));
     }
 }
 
@@ -270,6 +336,18 @@ pub struct SvgDevice {
     /// The plan entries a run has named, in the order they were first used. What
     /// a standalone SVG has to embed is these faces and no others.
     used: Vec<usize>,
+    /// The page, in SVG space. A shading told to extend has no edge of its own,
+    /// and a mask needs a region, so both fall back to the page.
+    page: (f32, f32),
+    /// Prefix for every id, so two pages inlined into one host page stay apart.
+    prefix: String,
+    /// How many definitions are open. While this is not zero the markup belongs
+    /// to the innermost one rather than to the page.
+    in_defs: usize,
+    /// The soft masks that are open, outermost first.
+    masks: Vec<SoftMask>,
+    /// The tiling patterns that are open, outermost first.
+    tiles: Vec<Tile>,
     body: String,
     defs: String,
     open: Vec<Open>,
@@ -311,6 +389,8 @@ impl SvgDevice {
         fonts: Rc<HashMap<String, usize>>,
         chars: Rc<CharGrid>,
         marks: &[SpaceMark],
+        page: (f32, f32),
+        prefix: &str,
     ) -> Self {
         let mut mark_cells: HashMap<(i64, i64), Vec<usize>> = HashMap::new();
         for (i, mark) in marks.iter().enumerate() {
@@ -337,6 +417,11 @@ impl SvgDevice {
             pending: String::new(),
             run_gap: false,
             used: Vec::new(),
+            page,
+            prefix: prefix.to_string(),
+            in_defs: 0,
+            masks: Vec::new(),
+            tiles: Vec::new(),
             body: String::new(),
             defs: String::new(),
             open: Vec::new(),
@@ -347,6 +432,19 @@ impl SvgDevice {
 
     pub fn stats(&self) -> PageStats {
         self.stats
+    }
+
+    /// An id, with the host's prefix so that two pages inlined into one document
+    /// do not collide - `url(#clip_3)` resolves against the whole document, not
+    /// against the `<svg>` it sits in.
+    fn id(&self, kind: &str, n: u32) -> String {
+        format!("{}{kind}_{n}", self.prefix)
+    }
+
+    /// Take the next id of a kind.
+    fn next_id_of(&mut self, kind: &str) -> String {
+        self.ids += 1;
+        format!("{}{kind}_{}", self.prefix, self.ids)
     }
 
     /// The `@font-face` rules for the faces this page named.
@@ -444,21 +542,45 @@ impl SvgDevice {
         if self.run.is_some() {
             self.pending.push_str(text);
             self.run_gap = true;
+        } else if self.in_defs > 0 {
+            self.defs.push_str(text);
         } else {
             self.body.push_str(text);
         }
     }
 
+    /// Start a definition: a mask's contents, a pattern's tile, or anything
+    /// nested inside either.
+    ///
+    /// A run that is open is written first, because its text belongs to whatever
+    /// was live when it opened and not to the definition about to start.
+    fn begin_defs(&mut self) {
+        if self.in_defs == 0 {
+            self.flush_run();
+        }
+        self.in_defs += 1;
+    }
+
+    /// End the innermost definition. A run opened inside it is written inside it.
+    fn end_defs(&mut self) {
+        self.flush_run();
+        self.in_defs = self.in_defs.saturating_sub(1);
+    }
+
     /// A path element, with the transform MuPDF handed us and the paint the
-    /// caller asked for. `stroke` is the whole stroke state when this is a
-    /// stroke, and None when it is a fill.
+    /// caller asked for. `stroke` is the stroke state and the width to write for
+    /// it, or None when this is a fill.
+    ///
+    /// The width is passed in rather than read off the stroke state because a
+    /// glyph outline is not in user space: it is in em units, so stroking one
+    /// needs the width divided by how large an em came out on the page.
     fn path_element(
         &mut self,
         path: &Path,
         ctm: &Matrix,
         paint: &str,
         even_odd: bool,
-        stroke: Option<&StrokeState>,
+        stroke: Option<(&StrokeState, f32)>,
     ) {
         let d = path_data(path);
         if d.is_empty() {
@@ -471,23 +593,9 @@ impl SvgDevice {
             matrix_attr(ctm),
             d
         );
-        if let Some(state) = stroke {
-            let _ = write!(
-                el,
-                " fill=\"none\" stroke-width=\"{}\"",
-                num(state.line_width())
-            );
-            if state.line_join() != mupdf::LineJoin::Miter {
-                let _ = write!(el, " stroke-linejoin=\"{}\"", join_name(state.line_join()));
-            }
-            if state.miter_limit() != 10.0 {
-                let _ = write!(el, " stroke-miterlimit=\"{}\"", num(state.miter_limit()));
-            }
-            let dashes = state.dashes();
-            if !dashes.is_empty() {
-                let list: Vec<String> = dashes.iter().map(|d| num(*d)).collect();
-                let _ = write!(el, " stroke-dasharray=\"{}\"", list.join(" "));
-            }
+        if let Some((state, width)) = stroke {
+            el.push_str(" fill=\"none\"");
+            stroke_attrs(&mut el, state, width);
         } else if even_odd {
             el.push_str(" fill-rule=\"evenodd\"");
         }
@@ -503,10 +611,10 @@ impl SvgDevice {
             self.open.push(Open::Empty);
             return;
         }
-        let id = self.next_id();
+        let id = self.next_id_of("clip");
         let _ = write!(
             self.defs,
-            "<clipPath id=\"clip_{id}\"><path transform=\"{}\" d=\"{}\"",
+            "<clipPath id=\"{id}\"><path transform=\"{}\" d=\"{}\"",
             matrix_attr(ctm),
             d
         );
@@ -514,7 +622,7 @@ impl SvgDevice {
             self.defs.push_str(" clip-rule=\"evenodd\"");
         }
         self.defs.push_str("/></clipPath>");
-        self.emit(&format!("<g clip-path=\"url(#clip_{id})\">"));
+        self.emit(&format!("<g clip-path=\"url(#{id})\">"));
         self.open.push(Open::Clip);
     }
 
@@ -538,6 +646,20 @@ impl SvgDevice {
                     continue;
                 };
                 let m = trm.clone() * Matrix::new_translate(item.x(), item.y()) * ctm.clone();
+                // An outline is in em units, so a stroke width in user space has
+                // to be divided by how many units an em is on the page - the
+                // same expansion the run writer puts in `font-size`. Writing the
+                // user-space width here instead is a stem several times too
+                // thick, which is what render mode 2 text would come out as.
+                let stroke = stroke.map(|state| {
+                    let k = (m.a * m.d - m.b * m.c).abs().sqrt();
+                    let width = if k > 0.0 {
+                        state.line_width() / k
+                    } else {
+                        state.line_width()
+                    };
+                    (state, width)
+                });
                 self.stats.as_outlines += 1;
                 self.path_element(&outline, &m, paint, false, stroke);
             }
@@ -741,8 +863,12 @@ impl SvgDevice {
             self.write_run(&run);
         }
         if !self.pending.is_empty() {
-            self.body.push_str(&self.pending);
-            self.pending.clear();
+            let pending = std::mem::take(&mut self.pending);
+            if self.in_defs > 0 {
+                self.defs.push_str(&pending);
+            } else {
+                self.body.push_str(&pending);
+            }
         }
         self.run_gap = false;
     }
@@ -787,8 +913,16 @@ impl SvgDevice {
             groups.push(group);
         }
 
+        // Into the page, or into the definition being written: text inside a
+        // mask's contents belongs to the mask, and inside a pattern's tile to
+        // the pattern.
+        let sink = if self.in_defs > 0 {
+            &mut self.defs
+        } else {
+            &mut self.body
+        };
         let _ = write!(
-            self.body,
+            sink,
             "<text{} transform=\"matrix({} {} {} {} 0 0)\" font-size=\"{}\" font-family=\"{}\" \
              font-weight=\"normal\" font-style=\"normal\" text-rendering=\"geometricPrecision\" \
              xml:space=\"preserve\">",
@@ -803,13 +937,13 @@ impl SvgDevice {
         for indices in &groups {
             let x: Vec<&str> = indices.iter().map(|i| xs[*i].as_str()).collect();
             let y: Vec<&str> = indices.iter().map(|i| ys[*i].as_str()).collect();
-            let _ = write!(self.body, "<tspan x=\"{}\" y=\"{}\">", x.join(" "), y.join(" "));
+            let _ = write!(sink, "<tspan x=\"{}\" y=\"{}\">", x.join(" "), y.join(" "));
             for i in indices {
-                push_escaped(&mut self.body, &run.items[*i].text);
+                push_escaped(sink, &run.items[*i].text);
             }
-            self.body.push_str("</tspan>");
+            sink.push_str("</tspan>");
         }
-        self.body.push_str("</text>");
+        sink.push_str("</text>");
         self.stats.runs += 1;
     }
 
@@ -905,7 +1039,7 @@ impl NativeDevice for SvgDevice {
         if let Some(o) = opacity(alpha) {
             let _ = write!(paint, " stroke-opacity=\"{o}\"");
         }
-        self.path_element(path, &ctm, &paint, false, Some(stroke));
+        self.path_element(path, &ctm, &paint, false, Some((stroke, stroke.line_width())));
     }
 
     fn clip_path(&mut self, path: &Path, even_odd: bool, ctm: Matrix, _scissor: Rect) {
@@ -945,12 +1079,90 @@ impl NativeDevice for SvgDevice {
         self.text(text, &ctm, &paint, Some(stroke));
     }
 
-    fn clip_text(&mut self, _text: &Text, _ctm: Matrix, _scissor: Rect) {
-        // TODO: a clipping text object clips with its glyph outlines, which means
-        // a `<clipPath>` holding every one of them. Until that is here the stack
-        // is kept straight and nothing is written: a group with no content would
-        // clip nothing, and the text inside it is written as usual.
-        self.open.push(Open::Empty);
+    fn clip_text(&mut self, text: &Text, ctm: Matrix, _scissor: Rect) {
+        let (paths, count) = self.glyph_paths(text, &ctm, None);
+        if count == 0 {
+            // A clip with no glyphs clips everything away, and an empty
+            // `<clipPath>` is not something every renderer agrees on. The stack
+            // stays paired and nothing is written.
+            self.open.push(Open::Empty);
+            return;
+        }
+        let id = self.next_id_of("clip");
+        let _ = write!(self.defs, "<clipPath id=\"{id}\">{paths}</clipPath>");
+        self.emit(&format!("<g clip-path=\"url(#{id})\">"));
+        self.open.push(Open::Clip);
+    }
+
+    fn clip_stroke_text(
+        &mut self,
+        text: &Text,
+        stroke: &StrokeState,
+        ctm: Matrix,
+        _scissor: Rect,
+    ) {
+        let (paths, count) = self.glyph_paths(text, &ctm, Some(stroke));
+        if count == 0 {
+            self.open.push(Open::Empty);
+            return;
+        }
+        // A `<clipPath>` fills its children and can never stroke one, so a
+        // stroked text clip is a mask with the stroke drawn white in it: the
+        // same geometry by the only route SVG has.
+        let id = self.next_id_of("mask");
+        let (w, h) = self.page;
+        self.begin_defs();
+        let _ = write!(
+            self.defs,
+            "<mask id=\"{id}\" mask-type=\"alpha\" maskUnits=\"userSpaceOnUse\" \
+             maskContentUnits=\"userSpaceOnUse\" x=\"0\" y=\"0\" width=\"{}\" height=\"{}\">\
+             {paths}</mask>",
+            num(w),
+            num(h)
+        );
+        self.end_defs();
+        self.emit(&format!("<g mask=\"url(#{id})\">"));
+        self.open.push(Open::Clip);
+    }
+
+    fn clip_stroke_path(
+        &mut self,
+        path: &Path,
+        stroke: &StrokeState,
+        ctm: Matrix,
+        _scissor: Rect,
+    ) {
+        let d = path_data(path);
+        if d.is_empty() {
+            self.open.push(Open::Empty);
+            return;
+        }
+        let id = self.next_id_of("mask");
+        // The path is in user space, so its width is the page's own and no
+        // scaling is needed. The region is the stroked path's own bound, which
+        // is what MuPDF's SVG device uses too.
+        let region = path
+            .bounds(stroke, &ctm)
+            .ok()
+            .filter(|r| !r.is_empty() && !ffi::is_infinite(*r))
+            .unwrap_or(Rect::new(0.0, 0.0, self.page.0, self.page.1));
+        self.begin_defs();
+        let _ = write!(
+            self.defs,
+            "<mask id=\"{id}\" mask-type=\"alpha\" maskUnits=\"userSpaceOnUse\" \
+             maskContentUnits=\"userSpaceOnUse\" x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\">\
+             <path transform=\"{}\" d=\"{d}\" fill=\"none\" stroke=\"#ffffff\"",
+            num(region.x0),
+            num(region.y0),
+            num(region.width()),
+            num(region.height()),
+            matrix_attr(&ctm)
+        );
+        stroke_attrs(&mut self.defs, stroke, stroke.line_width());
+        self.defs.push_str("/></mask>");
+        self.end_defs();
+        self.emit(&format!("<g mask=\"url(#{id})\">"));
+        self.open.push(Open::Clip);
     }
 
     fn pop_clip(&mut self) {
@@ -984,25 +1196,650 @@ impl NativeDevice for SvgDevice {
     fn begin_mask(
         &mut self,
         _area: Rect,
-        _luminosity: bool,
+        luminosity: bool,
         _cs: &Colorspace,
         _color: &[f32],
         _cp: ColorParams,
     ) {
-        // TODO: a luminosity mask is a second pass into a `<mask>`; until it is
-        // here the group's content is drawn unmasked, which is the visible part.
+        let id = self.next_id();
+        self.masks.push(SoftMask { id, luminosity });
+        self.begin_defs();
+        let name = self.id("mask", id);
+        let (w, h) = self.page;
+        let _ = write!(self.defs, "<g id=\"{name}_contents\">");
+        // A luminosity mask is opaque white until the page says otherwise, an
+        // alpha mask transparent; and SVG shrinks a mask that has nothing in it,
+        // so either way the page is painted first. The contents are written as a
+        // definition of their own rather than inside the `<mask>`, because the
+        // mask element cannot be opened until its type is known and closed until
+        // the second pass has been drawn.
+        let paint = if luminosity {
+            " fill=\"#ffffff\""
+        } else {
+            " fill-opacity=\"0\""
+        };
+        let _ = write!(
+            self.defs,
+            "<rect x=\"0\" y=\"0\" width=\"{}\" height=\"{}\"{paint}/>",
+            num(w),
+            num(h)
+        );
     }
 
-    fn end_mask(&mut self, _f: &mupdf::Function) {}
-
-    fn fill_shade(&mut self, _shade: &Shade, _ctm: Matrix, _alpha: f32, _cp: ColorParams) {
-        // TODO: axial and radial shadings become real SVG gradients here.
+    fn end_mask(&mut self, f: &Function) {
+        let Some(mask) = self.masks.pop() else {
+            return;
+        };
+        self.flush_run();
+        self.defs.push_str("</g>");
+        let name = self.id("mask", mask.id);
+        let filter = if ffi::has_function(f) {
+            self.transfer_filter(&mask, f)
+        } else {
+            String::new()
+        };
+        let (w, h) = self.page;
+        let kind = if mask.luminosity { "luminance" } else { "alpha" };
+        let _ = write!(
+            self.defs,
+            "<mask id=\"{name}\" mask-type=\"{kind}\" maskUnits=\"userSpaceOnUse\" \
+             maskContentUnits=\"userSpaceOnUse\" x=\"0\" y=\"0\" width=\"{}\" height=\"{}\">\
+             <use xlink:href=\"#{name}_contents\"{filter}/></mask>",
+            num(w),
+            num(h)
+        );
+        self.in_defs = self.in_defs.saturating_sub(1);
+        self.emit(&format!("<g mask=\"url(#{name})\">"));
+        self.open.push(Open::Clip);
     }
 
-    fn fill_image(&mut self, _img: &Image, _ctm: Matrix, _alpha: f32, _cp: ColorParams) {
-        // TODO: images are emitted as PNG data URIs (the pixels MuPDF decoded,
-        // re-encoded here) with any soft mask as a `<mask>`.
+    fn begin_tile(
+        &mut self,
+        area: Rect,
+        view: Rect,
+        x_step: f32,
+        y_step: f32,
+        ctm: Matrix,
+        _id: Option<NonZero<i32>>,
+        _doc_id: Option<NonZero<i32>>,
+    ) -> Option<NonZero<i32>> {
+        // MuPDF warns and uses one for a pattern that cannot repeat; a step of
+        // zero would otherwise be an infinite loop here.
+        let step = |s: f32| if s == 0.0 { 1.0 } else { s.abs() };
+        let (x_step, y_step) = (step(x_step), step(y_step));
+        let id = self.next_id();
+        self.begin_defs();
+        let name = self.id("pattern", id);
+        // The tile is captured once and repeated by the `<pattern>`; the `<use>`
+        // that puts it on the page is written when the tile ends.
+        let _ = write!(self.defs, "<g id=\"{name}_tile\">");
+        self.tiles.push(Tile {
+            id,
+            area,
+            view,
+            step: (x_step, y_step),
+            ctm,
+        });
+        // Zero, so the interpreter draws the tile's contents into this device -
+        // which is what a pattern needs. Anything else says the tile is already
+        // cached and the contents are skipped.
+        None
     }
+
+    fn end_tile(&mut self) {
+        let Some(tile) = self.tiles.pop() else {
+            return;
+        };
+        self.flush_run();
+        self.defs.push_str("</g>");
+        let name = self.id("pattern", tile.id);
+        let (sw, sh) = tile.step;
+        let (vw, vh) = (tile.view.x1 - tile.view.x0, tile.view.y1 - tile.view.y0);
+
+        // A step smaller than the tile means one repeat does not cover the
+        // pattern cell, so the tile is drawn more than once inside it; a view
+        // box that is not anchored at the origin needs a clip of its own.
+        let clipped = tile.view.x0 > 0.0
+            || sw < tile.view.x1
+            || tile.view.y0 > 0.0
+            || sh < tile.view.y1;
+        let _ = write!(
+            self.defs,
+            "<pattern id=\"{name}\" patternUnits=\"userSpaceOnUse\" \
+             patternContentUnits=\"userSpaceOnUse\" x=\"0\" y=\"0\" width=\"{}\" height=\"{}\">",
+            num(sw),
+            num(sh)
+        );
+        if clipped {
+            let clip = self.next_id_of("clip");
+            let _ = write!(
+                self.defs,
+                "<clipPath id=\"{clip}\"><path d=\"M{} {}L{} {}L{} {}L{} {}Z\"/></clipPath>\
+                 <g clip-path=\"url(#{clip})\">",
+                num(tile.view.x0),
+                num(tile.view.y0),
+                num(tile.view.x1),
+                num(tile.view.y0),
+                num(tile.view.x1),
+                num(tile.view.y1),
+                num(tile.view.x0),
+                num(tile.view.y1)
+            );
+        }
+        // The tile's contents were drawn with the pattern's own transform
+        // already composed, so the repeats are placed in pattern space and the
+        // group takes that transform back off.
+        let inverse = tile.ctm.invert().unwrap_or(Matrix::IDENTITY);
+        let _ = write!(self.defs, "<g transform=\"{}\">", matrix_attr(&inverse));
+        let mut x = 0.0;
+        while x > -vw {
+            let mut y = 0.0;
+            while y > -vh {
+                let _ = write!(
+                    self.defs,
+                    "<use x=\"{}\" y=\"{}\" xlink:href=\"#{name}_tile\"/>",
+                    num(x),
+                    num(y)
+                );
+                y -= sh;
+            }
+            x -= sw;
+        }
+        self.defs.push_str("</g>");
+        if clipped {
+            self.defs.push_str("</g>");
+        }
+        self.defs.push_str("</pattern>");
+        self.end_defs();
+
+        // And the shape filled with it, in the pattern's own space - which is
+        // the space the pattern's `userSpaceOnUse` units are read in.
+        self.emit(&format!(
+            "<rect transform=\"{}\" x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\" fill=\"url(#{name})\"/>",
+            matrix_attr(&tile.ctm),
+            num(tile.area.x0),
+            num(tile.area.y0),
+            num(tile.area.x1 - tile.area.x0),
+            num(tile.area.y1 - tile.area.y0)
+        ));
+    }
+
+    /// Invisible text: render mode 3, the way a scanned page carries the text a
+    /// reader can select. Nothing is drawn, and nothing is written.
+    ///
+    /// MuPDF's own SVG device writes it as text with no opacity, but only in its
+    /// text-as-text mode; the pipeline this replaces ran in text-as-path mode,
+    /// where it wrote nothing either. What a reader searches and copies comes
+    /// from the text device, not from the page's shapes.
+    fn ignore_text(&mut self, _text: &Text, _ctm: Matrix) {}
+
+    fn fill_shade(&mut self, shade: &Shade, ctm: Matrix, alpha: f32, cp: ColorParams) {
+        if alpha == 0.0 {
+            return;
+        }
+        // A gradient where SVG has one that means the same thing, MuPDF's own
+        // rasterisation where it does not.
+        let markup = self
+            .shade_gradient(shade, &ctm, alpha, cp)
+            .or_else(|| self.shade_raster(shade, &ctm, alpha, cp));
+        if let Some(markup) = markup {
+            self.stats.shades += 1;
+            self.emit(&markup);
+        }
+    }
+
+    fn fill_image(&mut self, img: &Image, ctm: Matrix, alpha: f32, _cp: ColorParams) {
+        if alpha == 0.0 {
+            return;
+        }
+        let (w, h) = (img.width(), img.height());
+        if w == 0 || h == 0 {
+            return;
+        }
+        let Some(uri) = ffi::image_data_uri(img) else {
+            return;
+        };
+        // One user unit per pixel: the image is written at its own size and the
+        // scale is what puts it back on the page, which is how MuPDF's own SVG
+        // device places one. The `<image>` has no transform of its own, so its
+        // width and height are read in the group's space.
+        let local = Matrix::new_scale(1.0 / w as f32, 1.0 / h as f32) * ctm;
+        let mut el = String::new();
+        let _ = write!(el, "<g");
+        if let Some(o) = opacity(alpha) {
+            let _ = write!(el, " opacity=\"{o}\"");
+        }
+        let _ = write!(el, " transform=\"{}\">", matrix_attr(&local));
+        let _ = write!(
+            el,
+            "<image width=\"{}\" height=\"{}\" xlink:href=\"{uri}\"/></g>",
+            num(w as f32),
+            num(h as f32),
+        );
+        self.stats.images += 1;
+        self.emit(&el);
+    }
+
+    fn fill_image_mask(
+        &mut self,
+        img: &Image,
+        ctm: Matrix,
+        cs: &Colorspace,
+        color: &[f32],
+        alpha: f32,
+        cp: ColorParams,
+    ) {
+        if alpha == 0.0 {
+            return;
+        }
+        let (w, h) = (img.width(), img.height());
+        if w == 0 || h == 0 {
+            return;
+        }
+        let Some(uri) = ffi::image_data_uri(img) else {
+            return;
+        };
+        let (w, h) = (w as f32, h as f32);
+        let id = self.next_id_of("mask");
+        // A stencil's coverage is the grey value of the pixels it decodes to,
+        // which is what a luminance mask reads - and what SVG 1.1 defaults a
+        // mask to, so this is MuPDF's shape as well as its meaning.
+        let _ = write!(
+            self.defs,
+            "<mask id=\"{id}\" mask-type=\"luminance\" maskUnits=\"userSpaceOnUse\" \
+             maskContentUnits=\"userSpaceOnUse\" x=\"0\" y=\"0\" width=\"{}\" height=\"{}\">\
+             <image width=\"{}\" height=\"{}\" xlink:href=\"{uri}\"/></mask>",
+            num(w),
+            num(h),
+            num(w),
+            num(h),
+        );
+        let local = Matrix::new_scale(1.0 / w, 1.0 / h) * ctm;
+        let mut el = String::new();
+        let _ = write!(el, "<g transform=\"{}\">", matrix_attr(&local));
+        let _ = write!(
+            el,
+            "<rect x=\"0\" y=\"0\" width=\"{}\" height=\"{}\" fill=\"{}\"",
+            num(w),
+            num(h),
+            rgb(cs, color, cp)
+        );
+        if let Some(o) = opacity(alpha) {
+            let _ = write!(el, " fill-opacity=\"{o}\"");
+        }
+        let _ = write!(el, " mask=\"url(#{id})\"/></g>");
+        self.stats.images += 1;
+        self.emit(&el);
+    }
+
+    fn clip_image_mask(&mut self, img: &Image, ctm: Matrix, _scissor: Rect) {
+        let (w, h) = (img.width(), img.height());
+        if w == 0 || h == 0 {
+            self.open.push(Open::Empty);
+            return;
+        }
+        let Some(uri) = ffi::image_data_uri(img) else {
+            self.open.push(Open::Empty);
+            return;
+        };
+        let (w, h) = (w as f32, h as f32);
+        let id = self.next_id_of("mask");
+        let (pw, ph) = self.page;
+        // The mask is applied by a group with no transform of its own, so its
+        // content units are page units and the image is placed by the same
+        // transform the reference uses: the unit square, scaled to the image.
+        let local = Matrix::new_scale(1.0 / w, 1.0 / h) * ctm;
+        let _ = write!(
+            self.defs,
+            "<mask id=\"{id}\" mask-type=\"luminance\" maskUnits=\"userSpaceOnUse\" \
+             maskContentUnits=\"userSpaceOnUse\" x=\"0\" y=\"0\" width=\"{}\" height=\"{}\">\
+             <g transform=\"{}\"><image width=\"{}\" height=\"{}\" \
+             xlink:href=\"{uri}\"/></g></mask>",
+            num(pw),
+            num(ph),
+            matrix_attr(&local),
+            num(w),
+            num(h),
+        );
+        self.stats.images += 1;
+        self.emit(&format!("<g mask=\"url(#{id})\">"));
+        self.open.push(Open::Clip);
+    }
+}
+
+impl SvgDevice {
+    /// The glyphs of a text object as path elements, at the transform MuPDF gave
+    /// each one, and how many there were.
+    ///
+    /// A clip cannot be written as `<text>`: the browser would clip with
+    /// whatever face it actually got, and a clip is geometry. Outlines are the
+    /// same shape whatever the font does, so the clip is always outlines.
+    fn glyph_paths(
+        &self,
+        text: &Text,
+        ctm: &Matrix,
+        stroke: Option<&StrokeState>,
+    ) -> (String, usize) {
+        let mut out = String::new();
+        let mut count = 0;
+        for span in text.spans() {
+            let font = span.font();
+            let trm = span.trm();
+            for item in span.items() {
+                let gid = item.gid();
+                if gid < 0 {
+                    continue;
+                }
+                let Ok(Some(outline)) = font.outline_glyph(gid) else {
+                    continue;
+                };
+                let d = path_data(&outline);
+                if d.is_empty() {
+                    continue;
+                }
+                let m = trm.clone() * Matrix::new_translate(item.x(), item.y()) * ctm.clone();
+                let _ = write!(out, "<path transform=\"{}\" d=\"{d}\"", matrix_attr(&m));
+                if let Some(state) = stroke {
+                    // Em units, as in `text_outlines`.
+                    let k = (m.a * m.d - m.b * m.c).abs().sqrt();
+                    let width = if k > 0.0 {
+                        state.line_width() / k
+                    } else {
+                        state.line_width()
+                    };
+                    out.push_str(" fill=\"none\" stroke=\"#ffffff\"");
+                    stroke_attrs(&mut out, state, width);
+                }
+                out.push_str("/>");
+                count += 1;
+            }
+        }
+        (out, count)
+    }
+
+    /// A soft mask's transfer function as `feComponentTransfer`, written into the
+    /// definitions, and the attribute that refers to it.
+    ///
+    /// MuPDF samples a transfer function at 256 points and so does this: the
+    /// table is what `feComponentTransfer` takes, and 256 is the resolution the
+    /// rest of MuPDF's shading and mask code works at.
+    fn transfer_filter(&mut self, mask: &SoftMask, f: &Function) -> String {
+        let mut values = String::new();
+        for i in 0..256 {
+            let v = ffi::transfer(f, i as f32 / 255.0);
+            let _ = write!(values, "{} ", num(v));
+        }
+        let mut channels = String::new();
+        if mask.luminosity {
+            for channel in ["feFuncR", "feFuncG", "feFuncB"] {
+                let _ = write!(channels, "<{channel} type=\"table\" tableValues=\"{values}\"/>");
+            }
+        } else {
+            let _ = write!(channels, "<feFuncA type=\"table\" tableValues=\"{values}\"/>");
+        }
+        let name = self.id("tr", mask.id);
+        let _ = write!(
+            self.defs,
+            "<filter id=\"{name}\"><feComponentTransfer>{channels}</feComponentTransfer></filter>"
+        );
+        format!(" filter=\"url(#{name})\"")
+    }
+
+    /// A shading as a real SVG gradient, when it is one SVG can express.
+    ///
+    /// An axial shading is a `linearGradient` and a radial one whose inner
+    /// radius is zero is a `radialGradient`, exactly: the same two circles and
+    /// the same ramp. Everything else - a colour lattice, a mesh, a radial band
+    /// with a hole in it, a focal point outside its own circle - has no SVG 1.1
+    /// equivalent and is rasterised instead, which is what MuPDF's own SVG
+    /// device does with every shading there is.
+    fn shade_gradient(
+        &mut self,
+        shade: &Shade,
+        ctm: &Matrix,
+        alpha: f32,
+        cp: ColorParams,
+    ) -> Option<String> {
+        let kind = ffi::kind(shade);
+        let circles = ffi::circles(shade);
+        let ramp = ffi::ramp(shade, cp)?;
+        let stops = gradient_stops(&ramp, circles.extend);
+        let transform = matrix_attr(&ffi::matrix(shade));
+        let id = self.next_id_of("grad");
+        let body = match kind {
+            ffi::Kind::Axial => {
+                let [x0, y0, _] = circles.start;
+                let [x1, y1, _] = circles.end;
+                format!(
+                    "<linearGradient id=\"{id}\" gradientUnits=\"userSpaceOnUse\" \
+                     gradientTransform=\"{transform}\" x1=\"{}\" y1=\"{}\" x2=\"{}\" y2=\"{}\" \
+                     spreadMethod=\"pad\">{stops}</linearGradient>",
+                    num(x0),
+                    num(y0),
+                    num(x1),
+                    num(y1)
+                )
+            }
+            ffi::Kind::Radial => {
+                let [fx, fy, r0] = circles.start;
+                let [cx, cy, r1] = circles.end;
+                if r0 > 1e-4 || r1 <= 0.0 {
+                    return None;
+                }
+                if ((fx - cx).powi(2) + (fy - cy).powi(2)).sqrt() >= r1 {
+                    return None;
+                }
+                format!(
+                    "<radialGradient id=\"{id}\" gradientUnits=\"userSpaceOnUse\" \
+                     gradientTransform=\"{transform}\" cx=\"{}\" cy=\"{}\" r=\"{}\" \
+                     fx=\"{}\" fy=\"{}\" spreadMethod=\"pad\">{stops}</radialGradient>",
+                    num(cx),
+                    num(cy),
+                    num(r1),
+                    num(fx),
+                    num(fy)
+                )
+            }
+            _ => return None,
+        };
+        self.defs.push_str(&body);
+
+        // The area covered is the shading's own bound - which, for a shading
+        // told to extend, is no bound at all. The page is then the only edge
+        // there is, and the clip already in force is what really shapes it.
+        let bound = ffi::bound(shade, &Matrix::IDENTITY);
+        let region = if ffi::is_infinite(bound) {
+            let page = Rect::new(0.0, 0.0, self.page.0, self.page.1);
+            match ctm.invert() {
+                Some(inverse) => page.transform(&inverse),
+                None => page,
+            }
+        } else {
+            bound
+        };
+        let mut el = String::new();
+        let _ = write!(el, "<g");
+        if let Some(o) = opacity(alpha) {
+            let _ = write!(el, " opacity=\"{o}\"");
+        }
+        // The rectangle is in the shading's own space and the group carries the
+        // page's transform, so the gradient's `gradientTransform` - the
+        // shading's matrix - is the only transform between the two.
+        let _ = write!(
+            el,
+            " transform=\"{}\"><rect x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\" \
+             fill=\"url(#{id})\"/></g>",
+            matrix_attr(ctm),
+            num(region.x0),
+            num(region.y0),
+            num(region.width()),
+            num(region.height())
+        );
+        Some(el)
+    }
+
+    /// A shading SVG has no gradient for, drawn by MuPDF into a pixmap and
+    /// inlined as a PNG.
+    ///
+    /// MuPDF bounds the shading and clips it to the device scissor; the page is
+    /// the part of that this device can see, and the clip in force is already in
+    /// the markup. The result is MuPDF's own rendering of the mesh, at a finer
+    /// resolution than its SVG device uses.
+    fn shade_raster(
+        &mut self,
+        shade: &Shade,
+        ctm: &Matrix,
+        alpha: f32,
+        cp: ColorParams,
+    ) -> Option<String> {
+        let page = Rect::new(0.0, 0.0, self.page.0, self.page.1);
+        let visible = ffi::bound(shade, ctm).intersect(&page);
+        if visible.is_empty() {
+            return None;
+        }
+        let scale = SHADE_RASTER_SCALE;
+        let bbox = IRect::new(
+            (visible.x0 * scale).floor() as i32,
+            (visible.y0 * scale).floor() as i32,
+            (visible.x1 * scale).ceil() as i32,
+            (visible.y1 * scale).ceil() as i32,
+        );
+        if bbox.is_empty() {
+            return None;
+        }
+        let mut pixmap = Pixmap::new_with_rect(&Colorspace::device_rgb(), bbox, true).ok()?;
+        pixmap.clear().ok()?;
+        {
+            let device = Device::from_pixmap(&pixmap).ok()?;
+            // A draw device renders into the pixmap's own coordinates, so a
+            // post-scale is all it takes to land the shading there: the scale
+            // goes on the *outside* of the page transform, so that a device
+            // coordinate is the page's own multiplied by it. Scaling the other
+            // way round scales the page's space instead, which moves everything
+            // by the page height - MuPDF's own `fz_post_scale`. The pixmap's
+            // origin is MuPDF's business, not the transform's.
+            let into_pixels = ctm.clone() * Matrix::new_scale(scale, scale);
+            device.fill_shade(shade, &into_pixels, 1.0, cp).ok()?;
+        }
+        let mut png = Vec::new();
+        pixmap.write_to(&mut png, mupdf::ImageFormat::PNG).ok()?;
+        let mut el = String::new();
+        let _ = write!(el, "<g");
+        if let Some(o) = opacity(alpha) {
+            let _ = write!(el, " opacity=\"{o}\"");
+        }
+        let _ = write!(
+            el,
+            "><image x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\" \
+             xlink:href=\"data:image/png;base64,{}\"/></g>",
+            num(bbox.x0 as f32 / scale),
+            num(bbox.y0 as f32 / scale),
+            num(bbox.width() as f32 / scale),
+            num(bbox.height() as f32 / scale),
+            base64(&png)
+        );
+        Some(el)
+    }
+}
+
+/// The stops of a gradient, from the shading's own colour table.
+///
+/// MuPDF samples the shading function into 256 colours, and the stops are the
+/// fewest that stay within one 8-bit step of that table. A shading whose
+/// function is the linear one PDF shadings almost always carry collapses to its
+/// two endpoint colours - which is exactly what MuPDF's own rasteriser
+/// interpolates between - while a curved one keeps the shape PDF gives it
+/// instead of the straight line.
+///
+/// A side that was not told to extend is not painted beyond, and a stop that
+/// fades to nothing over a fraction of a pixel is how SVG says that.
+fn gradient_stops(ramp: &[[f32; 3]], extend: [bool; 2]) -> String {
+    let samples: Vec<[u8; 3]> = ramp.iter().map(|c| quantise(*c)).collect();
+    let last = samples.len().saturating_sub(1);
+    if last == 0 {
+        return format!("<stop offset=\"0\" stop-color=\"{}\"/>", hex(samples[0]));
+    }
+    let offset = |i: usize| num(i as f32 / last as f32);
+    let mut out = String::new();
+    if extend[0] {
+        let _ = write!(out, "<stop offset=\"0\" stop-color=\"{}\"/>", hex(samples[0]));
+    } else {
+        let _ = write!(
+            out,
+            "<stop offset=\"0\" stop-color=\"{}\" stop-opacity=\"0\"/>",
+            hex(samples[0])
+        );
+        let _ = write!(
+            out,
+            "<stop offset=\"{}\" stop-color=\"{}\"/>",
+            num(STOP_EPSILON),
+            hex(samples[0])
+        );
+    }
+
+    let mut from = 0;
+    let mut at = 1;
+    while at < last {
+        if !fits_line(&samples, from, at + 1) {
+            let _ = write!(
+                out,
+                "<stop offset=\"{}\" stop-color=\"{}\"/>",
+                offset(at),
+                hex(samples[at])
+            );
+            from = at;
+        }
+        at += 1;
+    }
+
+    if extend[1] {
+        let _ = write!(out, "<stop offset=\"1\" stop-color=\"{}\"/>", hex(samples[last]));
+    } else {
+        let _ = write!(
+            out,
+            "<stop offset=\"{}\" stop-color=\"{}\"/>",
+            num(1.0 - STOP_EPSILON),
+            hex(samples[last])
+        );
+        let _ = write!(
+            out,
+            "<stop offset=\"1\" stop-color=\"{}\" stop-opacity=\"0\"/>",
+            hex(samples[last])
+        );
+    }
+    out
+}
+
+/// Whether every sample between two of them lies within one 8-bit step of the
+/// straight line joining those two.
+fn fits_line(samples: &[[u8; 3]], from: usize, to: usize) -> bool {
+    if to <= from + 1 {
+        return true;
+    }
+    let span = (to - from) as f32;
+    for i in (from + 1)..to {
+        let t = (i - from) as f32 / span;
+        for channel in 0..3 {
+            let a = samples[from][channel] as f32;
+            let b = samples[to][channel] as f32;
+            let line = a + (b - a) * t;
+            if (samples[i][channel] as f32 - line).abs() > 1.0 {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// A colour as the 8-bit sRGB a browser reads.
+fn quantise(color: [f32; 3]) -> [u8; 3] {
+    let channel = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+    [channel(color[0]), channel(color[1]), channel(color[2])]
+}
+
+/// A colour as `#rrggbb`.
+fn hex(color: [u8; 3]) -> String {
+    format!("#{:02x}{:02x}{:02x}", color[0], color[1], color[2])
 }
 
 /// Render one page to SVG, in one pass, with MuPDF's own interpreter.
@@ -1030,6 +1867,8 @@ pub fn render_page_svg(
         Rc::new(fonts),
         Rc::new(CharGrid::new(&chars)),
         &marks,
+        (width, height),
+        &opts.id_prefix,
     )));
     {
         let target = mupdf::Device::from_native(device.clone())?;
@@ -1060,11 +1899,89 @@ impl SvgDevice {
             pending: std::mem::take(&mut self.pending),
             run_gap: self.run_gap,
             used: std::mem::take(&mut self.used),
+            page: self.page,
+            prefix: std::mem::take(&mut self.prefix),
+            in_defs: self.in_defs,
+            masks: std::mem::take(&mut self.masks),
+            tiles: std::mem::take(&mut self.tiles),
             body: std::mem::take(&mut self.body),
             defs: std::mem::take(&mut self.defs),
             open: std::mem::take(&mut self.open),
             ids: self.ids,
             stats: self.stats,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A device with nothing in it, for the parts that do not need a page.
+    fn device(prefix: &str) -> SvgDevice {
+        SvgDevice::new(
+            Rc::new(Plan::new()),
+            Rc::new(HashMap::new()),
+            Rc::new(CharGrid::new(&[])),
+            &[],
+            (400.0, 300.0),
+            prefix,
+        )
+    }
+
+    /// An id from one page inlined into a host page must not collide with the
+    /// same id from another, so every one of them carries the host's prefix.
+    #[test]
+    fn ids_carry_the_host_prefix() {
+        let plain = device("");
+        assert_eq!(plain.id("clip", 7), "clip_7");
+
+        let mut prefixed = device("p3-");
+        assert_eq!(prefixed.next_id_of("mask"), "p3-mask_1");
+        assert_eq!(prefixed.next_id_of("grad"), "p3-grad_2");
+        assert_eq!(prefixed.id("pattern", 9), "p3-pattern_9");
+    }
+
+    /// The ramp is sampled 256 times and written as fewest stops that stay
+    /// within an 8-bit step of it: a straight ramp is its two ends, whatever
+    /// the table's length.
+    #[test]
+    fn a_linear_ramp_is_two_stops() {
+        let ramp: Vec<[f32; 3]> = (0..256)
+            .map(|i| {
+                let t = i as f32 / 255.0;
+                [t, 0.0, 1.0 - t]
+            })
+            .collect();
+        let stops = gradient_stops(&ramp, [true, true]);
+        assert_eq!(stops.matches("<stop").count(), 2, "{stops}");
+        assert!(stops.contains("stop-color=\"#0000ff\""), "{stops}");
+        assert!(stops.contains("stop-color=\"#ff0000\""), "{stops}");
+    }
+
+    /// A curve is kept: the samples that a straight line would miss each get a
+    /// stop of their own.
+    #[test]
+    fn a_curved_ramp_keeps_its_shape() {
+        let ramp: Vec<[f32; 3]> = (0..256)
+            .map(|i| {
+                let t = i as f32 / 255.0;
+                [t * t, 0.0, 0.0]
+            })
+            .collect();
+        let stops = gradient_stops(&ramp, [true, true]);
+        assert!(stops.matches("<stop").count() > 8, "{stops}");
+    }
+
+    /// A shading that was not told to extend is not painted beyond its ends, so
+    /// the first and last stops fade to nothing.
+    #[test]
+    fn an_end_that_does_not_extend_fades_out() {
+        let ramp = vec![[1.0, 0.0, 0.0], [0.0, 0.0, 1.0]];
+        let open = gradient_stops(&ramp, [true, true]);
+        assert_eq!(open.matches("stop-opacity").count(), 0, "{open}");
+
+        let closed = gradient_stops(&ramp, [false, false]);
+        assert_eq!(closed.matches("stop-opacity=\"0\"").count(), 2, "{closed}");
     }
 }

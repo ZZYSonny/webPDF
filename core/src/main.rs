@@ -64,14 +64,17 @@ fn main() {
         )
         .expect("write text");
         println!(
-            "  page {p}: {} bytes in {:?} - {} glyphs, {} text, {} outlines, {} runs, {} spaces",
+            "  page {p}: {} bytes in {:?} - {} glyphs, {} text, {} outlines, {} runs, {} spaces, \
+             {} images, {} shadings",
             svg.len(),
             started.elapsed(),
             stats.glyphs,
             stats.as_text,
             stats.as_outlines,
             stats.runs,
-            stats.spaces
+            stats.spaces,
+            stats.images,
+            stats.shades
         );
     }
 }

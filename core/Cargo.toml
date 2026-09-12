@@ -14,6 +14,10 @@ path = "src/main.rs"
 
 [dependencies]
 mupdf = "0.8"
+# The same MuPDF the safe wrapper links, for the calls it does not expose: a
+# shading's own geometry and colour ramp, and a soft mask's transfer function.
+# See `src/ffi.rs` for why those cannot be reached through `mupdf` alone.
+mupdf-sys = "0.8"
 # WOFF is a zlib stream per table. A pure-Rust deflate keeps the build free of C
 # beyond MuPDF's own, which is what lets the same crate compile to wasm.
 miniz_oxide = "0.8"
