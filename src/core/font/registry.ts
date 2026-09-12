@@ -22,7 +22,8 @@ export interface FontAsset {
   family: string;
   /** A complete `@font-face` rule, sans the surrounding `<style>` element. */
   css: string;
-  format: 'woff' | 'truetype';
+  /** Container the bytes are in: `woff`, or the raw OpenType/CFF font. */
+  format: 'woff' | 'opentype';
   /** Size of the encoded font in bytes. */
   bytes: number;
   glyphCount: number;
@@ -239,27 +240,31 @@ export class FontRegistry {
 
   private async compile(family: string, glyphs: OutlineGlyph[]): Promise<FontAsset> {
     debug('compile: build', family, glyphs.length, 'glyphs');
-    const ttf = buildFontFromOutlines(glyphs, { familyName: family });
-    debug('compile: built', ttf.data.byteLength, 'bytes');
-    const ttfBytes = new Uint8Array(ttf.data);
+    const sfnt = buildFontFromOutlines(glyphs, { familyName: family });
+    debug('compile: built', sfnt.data.byteLength, 'bytes');
+    const sfntBytes = new Uint8Array(sfnt.data);
 
-    let format: FontAsset['format'] = 'truetype';
-    let payload: Uint8Array = ttfBytes;
+    let format: FontAsset['format'] = 'opentype';
+    let payload: Uint8Array = sfntBytes;
 
     if (!this.opts.disableCompression) {
       try {
-        const woff = await encodeWoff(ttfBytes);
-        if (woff && woff.data.length < ttfBytes.length) {
+        const woff = await encodeWoff(sfntBytes);
+        if (woff && woff.data.length < sfntBytes.length) {
           payload = woff.data;
           format = 'woff';
         }
       } catch (err) {
-        this.opts.onWarn?.(`WOFF compression failed, embedding TrueType: ${String(err)}`);
+        this.opts.onWarn?.(`WOFF compression failed, embedding raw OpenType: ${String(err)}`);
       }
     }
 
     debug('compile: payload', payload.length, format);
-    const mime = format === 'woff' ? 'font/woff' : 'font/ttf';
+    // What opentype.js writes is an `OTTO` sfnt - CFF charstrings in an
+    // OpenType wrapper - so the uncompressed spelling is `font/otf` and
+    // `format('opentype')`, not `truetype`. The bytes decide; the label only
+    // has to agree with them.
+    const mime = format === 'woff' ? 'font/woff' : 'font/otf';
     const css =
       `@font-face{font-family:'${family}';` +
       `src:url(data:${mime};base64,${toBase64(payload)}) format('${format}');` +

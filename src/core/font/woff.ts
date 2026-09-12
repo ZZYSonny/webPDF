@@ -74,7 +74,7 @@ function pad4(n: number): number {
  * Re-wrap a TrueType/OpenType font as WOFF.
  *
  * Falls back to returning the original bytes when `CompressionStream` is not
- * available (older runtimes); the caller then declares the font as `truetype`.
+ * available (older runtimes); the caller then declares the font as `opentype`.
  */
 export async function encodeWoff(ttf: Uint8Array): Promise<WoffEncodeResult | null> {
   const { flavor, tables } = parseSfnt(ttf);

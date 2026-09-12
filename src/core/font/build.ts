@@ -1,16 +1,15 @@
 /**
- * Build a real TrueType font from glyph outlines harvested out of MuPDF.
+ * Build a web font from glyph outlines harvested out of MuPDF.
  *
  * The PDF pipeline never parses embedded font programs. Instead MuPDF (via
  * FreeType) resolves every font - embedded CFF/Type1/TrueType, substituted
  * base-14 faces, CJK - into normalised outlines whose coordinates we can read
- * straight out of the generated SVG. Re-emitting those outlines as a `glyf`
- * font guarantees that the browser draws *exactly* the same shape that MuPDF
- * would have drawn as a path.
+ * straight out of the generated SVG. Re-emitting those outlines as a CFF
+ * charstring guarantees that the browser draws *exactly* the same shape that
+ * MuPDF would have drawn as a path.
  */
 
 import * as opentypeModule from 'opentype.js';
-import { cubicsToQuadratics } from './quadratic.ts';
 import { parseSvgPath, pathBounds, type PathCommand } from './svg-path.ts';
 
 /**
@@ -56,8 +55,6 @@ export interface BuildFontOptions {
   familyName: string;
   styleName?: string;
   unitsPerEm?: number;
-  /** Bounding box of the source em square, used for sanity only. */
-  toleranceEm?: number;
 }
 
 export interface BuiltFontData {
@@ -91,14 +88,23 @@ function toPath(commands: readonly PathCommand[], scale: number): opentype.Path 
 }
 
 /**
- * Compile outlines into a TrueType font.
+ * Compile outlines into an OpenType font.
+ *
+ * opentype.js 2.x writes a `CFF ` table: its charstrings are cubic, so MuPDF's
+ * cubics go in *as they are* and come back out as the same curve, rounded to
+ * the 1/1000 em grid. Nothing here approximates anything.
+ *
+ * (It used to convert every cubic to a quadratic first, from when this wrote a
+ * `glyf` table. Against a CFF writer that is a pure loss - the quadratic is
+ * re-expanded to a cubic on the way out - and it cost up to 0.035 em of shape
+ * on a single curve. `tests/font-outline.test.ts` measures the round trip so
+ * that cannot come back.)
  *
  * Throws if the input cannot be represented; callers treat that as "this font
  * stays as outlines in the SVG", which is always a correct fallback.
  */
 export function buildFontFromOutlines(glyphs: readonly OutlineGlyph[], opts: BuildFontOptions): BuiltFontData {
   const unitsPerEm = opts.unitsPerEm ?? 1000;
-  const tolerance = (opts.toleranceEm ?? 0.35 / unitsPerEm) * unitsPerEm;
 
   const fontGlyphs: opentype.Glyph[] = [];
   // glyph 0 must be .notdef
@@ -122,11 +128,10 @@ export function buildFontFromOutlines(glyphs: readonly OutlineGlyph[], opts: Bui
       // A glyph we cannot parse becomes blank rather than corrupting the font.
       commands = [];
     }
-    const quads = cubicsToQuadratics(commands, tolerance);
-    const path = toPath(quads, unitsPerEm);
+    const path = toPath(commands, unitsPerEm);
 
-    for (const k of quads) {
-      if (k.c === 'M' || k.c === 'L' || k.c === 'Q') {
+    for (const k of commands) {
+      if (k.c === 'M' || k.c === 'L' || k.c === 'Q' || k.c === 'C') {
         if (k.y < minY) minY = k.y;
         if (k.y > maxY) maxY = k.y;
       }

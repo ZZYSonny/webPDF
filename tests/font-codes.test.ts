@@ -1,9 +1,11 @@
 /**
  * The generated fonts must be able to reach every glyph we ask them to render.
  *
- * This is the regression test for a real bug: private-use code points outside
- * the Basic Multilingual Plane were dropped from the `cmap` by the font writer,
- * so ligature glyphs (which have no Unicode of their own) rendered as blanks.
+ * This is the regression test for a real bug: private-use code points above the
+ * Basic Multilingual Plane were dropped from the `cmap` by the font writer, so
+ * every glyph that mattered in a font without a Unicode of its own rendered as
+ * a blank. (It is also why the fonts are limited to the BMP PUA: the writer
+ * builds `cmap` with 16-bit segment arithmetic.)
  */
 
 import test from 'node:test';
@@ -30,7 +32,7 @@ test('every code point in a built font resolves to its glyph', async () => {
   for (const g of glyphs) {
     for (const code of g.codes) {
       const glyph = ttf.glyphForCodePoint(code);
-      assert.notEqual(glyph.id, 0, `U+${code.toString(16)} missing from the TrueType cmap`);
+      assert.notEqual(glyph.id, 0, `U+${code.toString(16)} missing from the cmap`);
       assert.ok(glyph.path.commands.length > 0, `U+${code.toString(16)} has an empty outline`);
     }
   }

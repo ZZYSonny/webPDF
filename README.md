@@ -45,7 +45,7 @@ PDF page
                                                   ↑ MuPDF hands us the character
    │
    │  per font: build a web font
-   │    outlines → cubic→quadratic → TrueType → WOFF → @font-face
+   │    outlines → OpenType/CFF charstrings → WOFF → @font-face
    │
    │  rewrite: <use> runs ─────────────────────►  <text> runs
    │
@@ -58,10 +58,14 @@ SVG with real text, plus outlines kept for whatever could not be converted
 * **No font parsing.** The PDF's embedded font program is never touched. MuPDF
   (through FreeType) has already resolved every font — embedded CFF, raw Type 1
   PFB/PFA, TrueType, substituted base-14 faces, CJK — into normalised outlines.
-  Re-emitting those outlines as a `glyf`-free CFF/OpenType font means the
-  browser draws *exactly* the shape MuPDF would have drawn as a path. The
-  verification suite measures this: **100.00% of the reference ink is
-  reproduced**, within a one-pixel neighbourhood.
+  Those outlines go into the generated font *as they are*: opentype.js writes a
+  `CFF ` table, whose charstrings are cubic like MuPDF's, so there is no
+  approximation step at all and the browser draws the same curve MuPDF would
+  have drawn as a path — to the 1/1000 em grid the coordinates are rounded onto.
+  Measured over the 40 most curved glyphs of a page of *Attention Is All You
+  Need*, the worst moves **1.5/1000 em** (0.02 px at 12 pt); the verification suite
+  reproduces **100.00% of the reference ink**, within a one-pixel
+  neighbourhood.
 * **Type 1 is not a special case.** A PFB is simply a font whose outlines MuPDF
   read for us. The LaTeX paper the tests render embeds five `/FontFile` Type 1
   fonts and converts all of them - as does the pdfTeX paper the demo opens from
@@ -124,9 +128,9 @@ their public URLs (`demo/papers.mjs`):
 
 | document | outline SVG | with real text | glyphs as text | fonts (WOFF) |
 | --- | --- | --- | --- | --- |
-| *Attention Is All You Need*, 1 page (6 Type 1/PFB fonts) | 373 KB | 74 KB (**20%**) | 2464 / 2464 | 6 (21 KB) |
+| *Attention Is All You Need*, 1 page (6 Type 1/PFB fonts) | 373 KB | 74 KB (**20%**) | 2464 / 2464 | 6 (20 KB) |
 | *Deep Residual Learning*, 1 page (9 fonts, bitmap figures) | 579 KB | 117 KB (**20%**) | 3630 / 3630 | 9 (33 KB) |
-| *GPT-4 Technical Report*, 1 page (6 fonts) | 398 KB | 89 KB (**22%**) | 2917 / 2917 | 6 (19 KB) |
+| *GPT-4 Technical Report*, 1 page (6 fonts) | 398 KB | 89 KB (**22%**) | 2917 / 2917 | 6 (18 KB) |
 
 The same paper over 3 pages: 1260 KB of outlines become 458 KB (36%) across 18
 distinct faces, 51 KB of WOFF.
@@ -137,10 +141,16 @@ extra 1–7 KB buys: one anchor and one transparent rectangle per link annotatio
 first three pages of *Attention Is All You Need*, and none at all on its title
 page). `links: false` drops them again.
 
-Ink coverage of the text render against MuPDF's own outline render: **100.000%**
-(page 1 of *Attention Is All You Need*), 99.5–99.9% across the other pages
-tested. The residue is antialiasing and stem darkening, not missing or misplaced
-glyphs.
+Ink coverage of the text render against MuPDF's own outline render: **100.000%**,
+on page 1 of each paper and on pages 2, 3 and 7 of *Attention Is All You Need*
+(the pages with the most glyphs, and the one page that keeps a glyph as an
+outline). Coverage is the strict measure — every pixel of reference ink has text
+ink on it — and the residue the other way is antialiasing and stem darkening:
+the text render carries 0.1–0.9% *more* ink than the reference, around the same
+curves. Those curves are the same curve: round-tripped through the font and
+measured glyph by glyph, the worst of a page's 40 most curved outlines is
+**1.5/1000 of an em** from the cubic MuPDF drew (0.02 px at 12 pt), which is the
+1/1000 em grid the coordinates are rounded onto.
 
 ---
 
@@ -1058,9 +1068,8 @@ src/
       package.ts            id namespacing, root rewriting, font embedding
     font/
       svg-path.ts           SVG path data parser (M/L/H/V/C/Z + implicit repeats)
-      quadratic.ts          cubic → quadratic conversion
-      build.ts              outlines + cmap → TrueType
-      woff.ts               TrueType → WOFF (zlib via CompressionStream)
+      build.ts              outlines + cmap → OpenType/CFF (opentype.js)
+      woff.ts               sfnt → WOFF (zlib via CompressionStream)
       registry.ts           per-page planning, caching, @font-face rules
   worker/
     pdf.worker.ts           engine host; installs onmessage before awaiting wasm
@@ -1112,6 +1121,9 @@ tests/
   memory.test.ts            the viewer's memory, in Node (no browser, no extension)
   engine-save.test.ts       writing a document out, encrypted documents included
   engine-wasm.test.ts       which wasm source is used, and what a wrong one costs
+  font-outline.test.ts      a glyph's curve survives the font it is written into,
+                            and the asset's format label matches its bytes
+  font-programs.mjs         what the corpus embeds, and what a browser takes
   pdf-cache.mjs             fetches the corpus, lists it, clears it
   browser/                  headless-Chromium verification over CDP
     demo.mjs                the built demo, driven through its own UI
@@ -1279,9 +1291,25 @@ the workflow to point that somewhere else, or to nothing at all.
   reader who outruns the renderer sees the empty white box until it lands. The
   window and the preparation ahead are sized so that this needs a flick of a
   whole screen or more, and the page being looked at is always rendered first.
-* **Fonts are not hinted.** Outlines are re-emitted from MuPDF's, so the
-  original bytecode hints are gone. This is mostly irrelevant for SVG at
-  arbitrary zoom, but it is a real difference from embedding the original font.
+* **Fonts are not hinted, and the document's own font program is not served.**
+  Outlines are re-emitted from MuPDF's, so any bytecode hints the producer's font
+  carried are gone. Serving the program instead is possible — MuPDF's PDF API
+  hands over `/FontFile`, `/FontFile2` and `/FontFile3`, and FreeType read all 52
+  distinct programs across the first eight pages of the corpus — but an embedded
+  font program is not a web font, and each container takes different work.
+  Measured with `tests/font-programs.mjs` in this Chromium: a Type 1 program
+  (`/FontFile`; 49 of the 52 here) is refused, and CSS Fonts has no format for
+  one; a bare CFF table (`/FontFile3/Type1C`) is refused until it is wrapped in
+  an sfnt; and a TrueType subset (`/FontFile2`) is refused because a producer's
+  subset usually has no `cmap` at all — write one in, plus the `post` the
+  sanitizer also insists on, and the same bytes load with their `glyf`, `loca`,
+  `hmtx` and the `cvt`, `fpgm` and `prep` hinting tables untouched. So it is a
+  pipeline per container rather than a shortcut, and on this corpus it would
+  serve one document font out of 52. The SVG would not have to change for it —
+  it names a family and a character, never a font — but what it buys is hinting
+  at small sizes, and these runs are positioned per character with
+  `text-rendering="geometricPrecision"`: exact outlines at subpixel positions,
+  which is what hinting is there to override.
 * **Synthetic bold/italic is not reproduced.** When a PDF has no bold face and
   the producer relies on stroke-based faux bold, outline mode and text mode
   differ slightly.
