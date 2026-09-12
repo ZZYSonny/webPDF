@@ -20,6 +20,7 @@
     "build:lib": "vite build",
     "build:demo": "vite build --config vite.demo.config.ts",
     "build:pages": "npm run build:lib && npm run build:demo && node scripts/no-jekyll.mjs dist/demo",
+    "build:extension": "vite build --config vite.ext.config.ts && node scripts/build-extension.mjs",
     "preview": "vite preview --config vite.demo.config.ts",
     "typecheck": "tsc --noEmit",
     "pdfs": "node tests/pdf-cache.mjs",

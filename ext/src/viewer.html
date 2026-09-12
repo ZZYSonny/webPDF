@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <!--
+      The extension's whole user interface: the viewer, and nothing else.
+
+      There is deliberately no title bar, no toolbar, no file list and no welcome
+      card here. A document arrives because the reader opened one, and the page
+      they land on is the document: everything they can *do* is in the viewer's
+      own bar, inside the frame, exactly as it is on the published site. What is
+      left out here is a progress line and a card for the two things that can go
+      wrong before there is a document to show - the response could not be read,
+      or the viewer itself could not be loaded.
+    -->
+    <title>webPDF</title>
+    <link rel="icon" href="icons/icon.png" />
+    <link rel="stylesheet" href="viewer.css" />
+  </head>
+  <body>
+    <iframe
+      id="app"
+      title="The document"
+      allow="clipboard-read; clipboard-write"
+      referrerpolicy="no-referrer"
+    ></iframe>
+
+    <!-- How far the document has been fetched: the only thing worth showing
+         while there is nothing to read yet. -->
+    <div id="loading" hidden><div id="loading-bar"></div></div>
+
+    <div id="note" hidden>
+      <div class="note-card">
+        <h1 id="note-title">The document could not be opened</h1>
+        <p id="note-text"></p>
+        <div class="note-actions">
+          <button id="note-retry" type="button" class="primary">Try again</button>
+          <button id="note-save" type="button">Save the file instead</button>
+        </div>
+        <p class="note-hint">Ctrl+S saves the document at any time; Ctrl+F finds text in it.</p>
+      </div>
+    </div>
+
+    <!-- Ctrl+O: a local file, read here and handed to the viewer. Nothing on
+         this page offers a file - a document is opened the way it always was -
+         but a reader who asks for one gets one. -->
+    <input id="file" type="file" accept="application/pdf,.pdf" hidden />
+    <script type="module" src="viewer.js"></script>
+  </body>
+</html>

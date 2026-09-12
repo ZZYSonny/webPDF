@@ -52,6 +52,14 @@ export async function launch(options = {}) {
     `--remote-debugging-port=${port}`,
     'about:blank',
   ];
+  // A browser that is asked to carry extensions must not also be told to disable
+  // them: the two flags are opposites, and the last one on the command line wins.
+  if (options.extensions?.length) {
+    const at = args.indexOf('--disable-extensions');
+    if (at >= 0) args.splice(at, 1);
+    args.push(`--disable-extensions-except=${options.extensions.join(',')}`, `--load-extension=${options.extensions.join(',')}`);
+  }
+  if (options.args) args.push(...options.args);
   const child = spawn(binary, args, { stdio: ['ignore', 'ignore', 'pipe'] });
   let stderr = '';
   child.stderr.on('data', (d) => (stderr += d.toString()));
@@ -82,7 +90,7 @@ export async function launch(options = {}) {
     async newPage() {
       const res = await fetch(`http://127.0.0.1:${port}/json/new?about:blank`, { method: 'PUT' });
       const target = await res.json();
-      return connect(target.webSocketDebuggerUrl);
+      return connect(target.webSocketDebuggerUrl, { port, targetId: target.id });
     },
     async close() {
       try {
@@ -102,7 +110,16 @@ export async function launch(options = {}) {
   return browser;
 }
 
-async function connect(wsUrl) {
+/**
+ * Talk to any target by its debugger URL - a page, a service worker, or (for a
+ * cross-origin frame, which is a target of its own under site isolation) the
+ * frame itself. `browser.newPage()` is this plus a tab.
+ */
+export async function attach(wsUrl) {
+  return await connect(wsUrl);
+}
+
+async function connect(wsUrl, tab = null) {
   const ws = new WebSocket(wsUrl);
   await new Promise((resolve, reject) => {
     ws.addEventListener('open', resolve, { once: true });
@@ -127,11 +144,11 @@ async function connect(wsUrl) {
     for (const l of listeners) l(msg);
   });
 
-  const send = (method, params = {}) =>
+  const send = (method, params = {}, sessionId = undefined) =>
     new Promise((resolve, reject) => {
       const id = nextId++;
       pending.set(id, { resolve, reject });
-      ws.send(JSON.stringify({ id, method, params }));
+      ws.send(JSON.stringify(sessionId ? { id, method, params, sessionId } : { id, method, params }));
     });
 
   await send('Page.enable');
@@ -173,6 +190,8 @@ async function connect(wsUrl) {
     send,
     evaluate,
     consoleMessages,
+    /** The tab this connection is, when it is one - `close()` closes the tab. */
+    targetId: tab?.targetId ?? null,
     /** Subscribe to raw CDP events: `page.on('Tracing.dataCollected', (params) => …)`. */
     on(method, handler) {
       const listener = (msg) => {
@@ -227,6 +246,16 @@ async function connect(wsUrl) {
         ws.close();
       } catch {
         /* ignore */
+      }
+      // Detaching leaves the tab - and the viewer frame inside it - alive and
+      // reporting, which a test that is done with a tab does not expect. A frame
+      // connection has no tab, and closing one is only closing the socket.
+      if (tab) {
+        try {
+          await fetch(`http://127.0.0.1:${tab.port}/json/close/${tab.targetId}`);
+        } catch {
+          /* already gone */
+        }
       }
     },
   };

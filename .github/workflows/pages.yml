@@ -14,6 +14,18 @@
 # carries no documents of its own: every paper it offers is fetched from its
 # public URL. Nothing in this repository is a PDF, so there is no corpus for the
 # build to ship, and the PDF cache the tests use is not consulted here at all.
+#
+# The extension is the second job, and it is a *build*: it produces the signed
+# `.crx` and uploads it as an artifact. Nothing is released and nothing is
+# published to the Chrome Web Store - the artifact is the deliverable, and anyone
+# who wants the extension takes it from the run.
+#
+# The extension is a shell around the published site: it frames the viewer at
+# github.io, which is why this job does not need the Pages artifact, or anything
+# else built locally. Set the `WEBPDF_EXT_KEY` secret to a PEM private key to keep
+# the extension id stable from one run to the next (and therefore the reader's
+# remembered positions with it); without it each run generates a key, prints the
+# id it produced, and produces an extension the browser sees as a new one.
 
 name: Pages
 
@@ -62,3 +74,34 @@ jobs:
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
+
+  extension:
+    name: Build the extension
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      # A type error means the extension would be built from source that does not
+      # compile as written, and the worker and the viewer page are TypeScript.
+      - run: npm run typecheck
+      # Compiles the worker and the viewer page, then stages and signs the
+      # extension: dist/ext/webpdf, with a .zip and a .crx beside it. The viewer
+      # it frames is the published site, so nothing here depends on the deploy job.
+      - run: npm run build:extension
+        env:
+          # Empty when the secret is not set, which the build reads as "make one
+          # for this run" - the id it produced is printed in the log either way.
+          WEBPDF_EXT_KEY: ${{ secrets.WEBPDF_EXT_KEY }}
+      - uses: actions/upload-artifact@v5
+        with:
+          name: webpdf-extension
+          # The crx is the artifact: it is the signed, installable extension. The
+          # staged directory and the zip stay on the runner (a zip of a crx is not
+          # what a browser installs).
+          path: dist/ext/*.crx
+          if-no-files-found: error
+          retention-days: 14

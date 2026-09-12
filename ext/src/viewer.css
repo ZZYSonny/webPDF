@@ -1,0 +1,128 @@
+/*
+ * The extension page's own few rules.
+ *
+ * Nothing here styles the document: the pages, the bar and the panels are all
+ * inside the frame, drawn by the viewer that the published site serves. This is
+ * only the frame, the fetch line above it, and the card for what can go wrong
+ * before there is a document at all.
+ */
+
+:root {
+  color-scheme: dark;
+  --bg: #171a21;
+  --text: #e8eaf0;
+  --muted: #9aa2b6;
+  --accent: #6f8cff;
+  --line: #2b3040;
+  --card: #1e222c;
+}
+
+html,
+body {
+  margin: 0;
+  height: 100%;
+  background: var(--bg);
+  color: var(--text);
+  font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+/* The document fills the tab. It is the page; there is no chrome around it. */
+#app {
+  display: block;
+  width: 100%;
+  height: 100%;
+  border: 0;
+  background: transparent;
+}
+
+/*
+ * The fetch line: three pixels at the very top of the tab, above the frame, so
+ * that a document that is still arriving says so without covering anything. The
+ * width is the fraction of the response that has been read, set from the script.
+ */
+#loading {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 3px;
+  background: rgba(111, 140, 255, 0.18);
+  z-index: 2;
+}
+
+#loading-bar {
+  height: 100%;
+  width: 0;
+  background: var(--accent);
+  transition: width 120ms linear;
+}
+
+/*
+ * The switch for both overlays is the `hidden` attribute, and a rule that sets
+ * `display` wins over it: without this, a card that is meant to be out of the way
+ * would sit over the document forever.
+ */
+#note[hidden],
+#loading[hidden] {
+  display: none;
+}
+
+/* Only shown for something that went wrong before a document was on screen. */
+#note {
+  position: fixed;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: var(--bg);
+  z-index: 3;
+}
+
+.note-card {
+  max-width: 460px;
+  text-align: center;
+}
+
+.note-card h1 {
+  font-size: 18px;
+  margin: 0 0 8px;
+  letter-spacing: -0.01em;
+}
+
+.note-card p {
+  color: var(--muted);
+  margin: 0 0 16px;
+  overflow-wrap: anywhere;
+}
+
+.note-actions {
+  display: flex;
+  gap: 8px;
+  justify-content: center;
+}
+
+.note-actions button {
+  font: inherit;
+  padding: 7px 14px;
+  border-radius: 7px;
+  border: 1px solid var(--line);
+  background: var(--card);
+  color: var(--text);
+  cursor: pointer;
+}
+
+.note-actions button.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #0e1117;
+}
+
+.note-actions button:hover {
+  filter: brightness(1.12);
+}
+
+.note-hint {
+  margin-top: 18px;
+  font-size: 12px;
+  color: var(--muted);
+}

@@ -1,0 +1,28 @@
+{
+  "manifest_version": 3,
+  "name": "webPDF",
+  "version": "0.1.0",
+  "description": "Open PDFs in a viewer that draws every page as SVG with real, selectable text — drawn by the published viewer at zzysonny.github.io/webPDF/, which the browser caches.",
+  "minimum_chrome_version": "115",
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "action": {
+    "default_title": "webPDF — open the document you were reading"
+  },
+  "icons": {
+    "128": "icons/icon.png"
+  },
+  "permissions": [
+    "storage",
+    "declarativeNetRequestWithHostAccess",
+    "webRequest",
+    "webNavigation",
+    "downloads"
+  ],
+  "host_permissions": ["<all_urls>"],
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'self'"
+  }
+}

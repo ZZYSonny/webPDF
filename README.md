@@ -643,7 +643,143 @@ Link hit areas are included by default, so the exported SVG is clickable where
 it is opened as a document; `links: false` leaves them out, and `page.links` is
 data either way.
 
-### Browser extension notes
+## The browser extension
+
+`ext/` is a Chrome extension that opens PDFs in this viewer. It is deliberately
+thin: it notices a document being opened, gives the tab to the viewer, and
+remembers where the reader was. There is no welcome page, no document list, no
+"open a file" button and no sample paper on it, because a document arrives the
+way it always did — clicked, typed, dropped or opened from the file manager.
+
+```sh
+npm run build:extension        # → dist/ext/webpdf/, with a .zip and a .crx beside it
+```
+
+It draws documents with the *published* viewer — the site this repository
+publishes to GitHub Pages — framed by the extension page and cached by the
+browser. So the extension is 34 KB, and a fix to the viewer arrives with the next
+deploy rather than with the next `.crx`. The price is that the viewer has to be
+fetched once per cache window; `viewer.json`, written by the build, is the one
+line that says where it is, and `--remote URL` points it somewhere else (which is
+what the browser test does, so that what it exercises is the published
+arrangement and not the published network).
+
+Install it by loading `dist/ext/webpdf` as an unpacked extension
+(`chrome://extensions` → *Developer mode* → *Load unpacked*), or install the
+`.crx` the build writes beside it. Chrome refuses off-store CRX installs on
+Windows and macOS; on Linux, developer mode plus a drag onto `chrome://extensions`
+is enough. The build prints the extension id it produced, which is what
+`chrome-extension://<id>/…` URLs need — and the id is where the browser files the
+reader's remembered positions, so `ext/key.pem` (gitignored, made on the first
+build), `--key FILE` or `$WEBPDF_EXT_KEY` is what keeps them across builds. CI
+passes the secret if it is set, and prints the id it made when it is not.
+
+Two tests keep the `.crx` honest: `tests/extension.test.ts` checks the CRX3 layout
+and that the signature covers the archive it was built from, and the last part of
+`tests/browser/extension.mjs` packs the same directory with Chromium's own
+`--pack-extension` and verifies *that* file with the reader this repository
+writes — which is only possible if the layout, the signature context and the
+signing scheme are Chrome's.
+
+### What it intercepts, and what it does not
+
+Three mechanisms, in order of how early they act:
+
+* **a redirect rule, stored in the profile.** A `.pdf` path is rewritten to the
+  viewer before a single byte of the document is requested — so a 50 MB paper is
+  fetched once, by the extension, instead of once by Chrome and then again by the
+  viewer. The rule is *dynamic* rather than a session rule on purpose: Chrome
+  stops an idle service worker, and the events that would wake it are not always
+  delivered, so a rule that lives in the worker is a rule that is missing exactly
+  when it is first needed. `tests/browser/extension.mjs` stops the worker and
+  opens a PDF to check that it does not matter.
+* **the content type.** `arxiv.org/pdf/1706.03762v7` has no extension to match, so
+  a response that *is* `application/pdf` takes the tab over as soon as the headers
+  are in. A response meant to be saved (`Content-Disposition: attachment`) is left
+  alone — that is a download, not a document to read.
+* **the commit watch.** Anything that still committed as a PDF URL (a `file://`
+  document, a rule the browser would not take) is taken over a moment later, which
+  is the difference between "opens in webPDF" and "opens in Chrome's viewer".
+
+The gaps, honestly: a PDF opened in the second between installing the extension
+and the worker's first start (the rule is written then) lands in Chrome's viewer,
+and reloading it works; a link with a `download` attribute is opened rather than
+saved, so Ctrl+S — which downloads the document again, at its URL — is the way to
+save one; and a PDF inside another extension's sandboxed viewer is not a
+navigation this extension can see.
+
+### The memory
+
+One entry per document, and it is the reader's own: the position (a page, and a
+point on it in the document's units), the zoom (a level, and whether it was a fit
+mode), the crop rules and padding, the bionic fade, whether the outline was open,
+the title, the page count, and when it was opened and last touched. Nothing else
+— no bytes, no text, no titles beyond the document's own.
+
+* A document is identified by its URL, minus the fragment (Chrome uses that for
+  its own page number and it never reaches a server), or by name and size for a
+  file that has no URL.
+* Its position is in *page units*, so it survives a zoom, a resize and a
+  different screen; the crop is accounted for, so a position means the same thing
+  cropped and uncropped, and a crop arriving under the reader no longer moves
+  them (they stay on the sentence, the page gets shorter around it).
+* The list is the recency order: `chrome.storage.local` holds the last hundred
+  documents and the oldest falls off the end.
+* A document that has never been read opens at its first page with the settings
+  of the last one. The *position* is deliberately not inherited.
+
+The viewer's `place()` is what makes this exact — the page and the point in the
+document's own coordinates, which is also what `goToDestination(page, y)` takes:
+
+```ts
+const viewer = await createViewer({ container: '#view', source: file });
+addEventListener('beforeunload', () => localStorage.setItem('where', JSON.stringify(viewer.place())));
+// …next time
+const where = JSON.parse(localStorage.getItem('where') ?? 'null');
+if (where) viewer.goToDestination(where.page, where.y);
+```
+
+### CORS, and why the fetching happens where it does
+
+The extension frames a page at `zzysonny.github.io`, and the document it is asked
+to show is usually somewhere else entirely. A page at one origin cannot
+fetch a PDF at another: CORS applies, and PDF servers overwhelmingly do not send
+`Access-Control-Allow-Origin`. (GitHub Pages itself does — `curl -sI` on the
+published site shows `access-control-allow-origin: *` — and so does arXiv; a
+departmental web server, a publisher, a repository behind a login: no.)
+
+So the fetch does not happen in the framed page. It happens in the extension
+page, which is a `chrome-extension://` document with `<all_urls>` in
+`host_permissions`, and an extension's fetches are not subject to another site's
+CORS policy. The bytes are then handed to the frame as an `ArrayBuffer` over
+`postMessage` — transferred, not copied — and the frame draws them. CORS therefore
+does not make this extension impossible: it is the reason the extension page exists
+at all. (It is also why the framed page needs nobody's permission to read the
+document, and why the viewer can be served from Pages.) What the extension does
+need the network for is the viewer's own code, which GitHub Pages serves with
+`cache-control: max-age=600` and content-hashed asset names, so the browser keeps
+it.
+
+Three consequences worth knowing:
+
+* **Nothing is proxied and nothing is uploaded.** The bytes go from the server to
+  the tab, which is where they were going. The viewer code is the only thing the
+  extension asks anyone else for.
+* **A cross-site extension fetch is still cross-site.** Cookies that are
+  `SameSite=Strict` may not be attached, so a PDF behind a strict-cookie login can
+  answer 403 where Chrome's own viewer would have shown it. The error card says
+  so, and a viewer carried inside the extension would behave the same way.
+* **`file://` needs the switch.** PDFs on disk are read only when *Allow access to
+  file URLs* is on for the extension in `chrome://extensions`; the extension says
+  so in the error card when a local file cannot be read.
+
+The handover is guarded by a token: the redirect the browser performs cannot know
+which tab it was for, so the viewer URL carries a secret kept in the extension's
+own storage, and the worker resolves a document only for a page that presents it.
+A web page that frames or opens `viewer.html` therefore gets nothing back — it
+cannot guess the token, and the page it framed only ever talks to its own parent.
+
+### Notes for any embedder
 
 The library was written with content scripts in mind:
 
@@ -743,16 +879,32 @@ demo/                       the demo application
   panels.ts                 scrolling a panel without moving the document
   styles.css                the chrome's own stylesheet
   icon.svg, icon.png        the site icon: a page, held at the front and faded
+demo/                       (continued)
+  host.ts                   the host bridge: open this document, where is the reader
+  host-mode.js              the one thing that must happen before the first paint
+ext/
+  manifest.json             MV3 manifest; the build adds the version and the key
+  src/
+    background.ts           the worker: interception, the handover, the memory
+    viewer.ts               the extension page: fetch, hand over, remember, keys
+    viewer.html, viewer.css the shell: one frame, a progress line, one error card
+    lib/history.ts          the hundred most recent documents (pure, so testable)
+    chrome.d.ts             the two dozen API members this extension uses, typed
 tests/
   *.test.ts                 Node tests (real PDFs through the real wasm)
+  extension.test.ts         the memory, and the crx format, in Node
   pdf-cache.mjs             fetches the corpus, lists it, clears it
   browser/                  headless-Chromium verification over CDP
     demo.mjs                the built demo, driven through its own UI
     frames.mjs              a page as a document: selection, clipboard, keys, wheel
     pinch.mjs               the pinch/zoom contract
+    extension.mjs           the extension itself, loaded into Chrome
     compare.mjs, diff.mjs   text-vs-outlines fidelity, with a difference map
 scripts/
   no-jekyll.mjs             marks the Pages artifact as pre-built
+  build-extension.mjs       stages the extension, zips it, packs the crx
+  crx.mjs                   CRX3, written and read: the artifact Chrome installs
+vite.ext.config.ts          the extension's two entry points
 ```
 
 Rendering never touches the DOM, which is why the same `PdfEngine` runs inline,
@@ -768,7 +920,19 @@ npm test             # Node tests: font pipeline over the real papers
 npm run test:browser # builds the demo, serves it, verifies in headless Chromium
 npm run verify       # typecheck + both test suites
 npm run build:pages  # the published site, in dist/demo
+npm run build:extension  # the extension, in dist/ext
 ```
+
+`npm run build:extension` compiles the worker and the viewer page with Vite and
+then stages, zips and signs the extension, which is small because it carries no
+viewer of its own. `--remote URL` points it at a server other than github.io,
+which is what the browser test uses so that what it exercises is the published
+arrangement and not the published network. The
+signing key comes from `--key`, from `$WEBPDF_EXT_KEY` (a path or the PEM itself)
+or from `ext/key.pem`, which is gitignored and made on the first build; with none
+of those, a key is made for that build alone and the extension id changes with it.
+Keep one — locally or as a repository secret — if the id is meant to survive,
+because the browser files a reader's remembered positions under it.
 
 ### The test corpus
 
@@ -810,6 +974,14 @@ tab). It deliberately does **not** run the test suites: rendering a paper and
 rasterising pages is a fine thing to do on a developer's machine and a poor gate
 between a commit and the published site. It does not fetch the corpus either -
 the published build has no use for it.
+
+The same workflow builds the extension in a **separate job** and uploads the two
+signed `.crx` files as artifacts. It does not create a release and does not
+publish to the Chrome Web Store: the artifact is the deliverable. That job does
+typecheck, because the worker and the viewer page are TypeScript and a type error
+means the artifact would be built from source that does not compile as written.
+Set the `WEBPDF_EXT_KEY` secret to a PEM private key to keep the extension id — and
+with it every reader's remembered positions — stable from one run to the next.
 
 Pages has to be set to **Source: GitHub Actions** in the repository settings —
 there is no `gh-pages` branch and nothing to commit back to the repository. The
@@ -888,6 +1060,23 @@ is referenced relatively.
   margin - a page number, say - is still found and still boxed, but the box is
   outside the window the page is showing, so jumping to it shows nothing. Removing
   the marks instead would break every coordinate the SVG shares with the page.
+* **The extension's first second is Chrome's.** The redirect rule that turns a
+  `.pdf` navigation into the viewer is written into the profile the first time the
+  worker starts, which is a moment after the extension is installed. A PDF opened
+  inside that moment lands in Chrome's viewer; reloading it is enough. Every run
+  after that has the rule already, whether or not the worker is running.
+* **The extension does not touch downloads.** A link with a `download` attribute
+  (or a `Content-Disposition: attachment` response for a URL that ends in `.pdf`)
+  is opened rather than saved, and Ctrl+S in the viewer saves the document at its
+  URL. That is the price of intercepting before the request: whether a navigation
+  is a download is not something a redirect rule can see.
+* **The extension's viewer comes over the network.** The extension carries the
+  interception, the handover and the memory, not the viewer: it frames the
+  published page, so the first document after the browser's cache goes cold needs
+  a connection, and a PDF opened with no connection at all shows the error card
+  instead of the viewer. Carrying the viewer would mean ~10 MB more in the package
+  and `'wasm-unsafe-eval'` in the extension's policy — a deliberate trade for a
+  viewer that can be fixed without shipping a new `.crx`.
 * **The worker path is verified in Chromium only.** It relies on module workers
   and `CompressionStream`, both of which are widely available, but the fallback
   exists precisely because worker startup can be blocked by a host's CSP.

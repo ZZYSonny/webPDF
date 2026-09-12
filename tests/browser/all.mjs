@@ -39,6 +39,13 @@ await ensurePapers(
 console.log('› building demo');
 await run([vite, 'build', '--config', 'vite.demo.config.ts']);
 
+// The extension too: it is pointed at this server rather than at github.io, so
+// that what is tested is the same extension with the same handover, the same
+// cross-origin frame and no network in the way.
+console.log('› building the extension');
+await run([vite, 'build', '--config', 'vite.ext.config.ts']);
+await run([path.join(root, 'scripts/build-extension.mjs'), '--out', 'dist/ext', '--remote', url]);
+
 console.log(`› serving on ${url}`);
 const server = spawn(vite, ['preview', '--config', 'vite.demo.config.ts', '--port', String(port), '--host', '127.0.0.1'], {
   cwd: root,
@@ -85,6 +92,9 @@ try {
 
   console.log('\n› pinch / zoom contract');
   await run([path.join(here, 'pinch.mjs'), url], { stdio: 'inherit' });
+
+  console.log('\n› the extension, loaded in a browser');
+  await run([path.join(here, 'extension.mjs'), url], { stdio: 'inherit' });
 } catch (err) {
   failed = true;
   console.error(err);
