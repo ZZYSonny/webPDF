@@ -1068,6 +1068,7 @@ src/
       package.ts            id namespacing, root rewriting, font embedding
     font/
       svg-path.ts           SVG path data parser (M/L/H/V/C/Z + implicit repeats)
+      program.ts            a glyph read out of the PDF's own font program, by id
       build.ts              outlines + cmap → OpenType/CFF (opentype.js)
       woff.ts               sfnt → WOFF (zlib via CompressionStream)
       registry.ts           per-page planning, caching, @font-face rules
@@ -1123,6 +1124,8 @@ tests/
   engine-wasm.test.ts       which wasm source is used, and what a wrong one costs
   font-outline.test.ts      a glyph's curve survives the font it is written into,
                             and the asset's format label matches its bytes
+  font-program.test.ts      a glyph drawn from the PDF's own font program is the
+                            outline the page drew, glyph for glyph
   font-programs.mjs         what the corpus embeds, and what a browser takes
   pdf-cache.mjs             fetches the corpus, lists it, clears it
   browser/                  headless-Chromium verification over CDP
@@ -1291,25 +1294,25 @@ the workflow to point that somewhere else, or to nothing at all.
   reader who outruns the renderer sees the empty white box until it lands. The
   window and the preparation ahead are sized so that this needs a flick of a
   whole screen or more, and the page being looked at is always rendered first.
-* **Fonts are not hinted, and the document's own font program is not served.**
+* **Fonts are not hinted, and the document's own font program is not used yet.**
   Outlines are re-emitted from MuPDF's, so any bytecode hints the producer's font
-  carried are gone. Serving the program instead is possible — MuPDF's PDF API
-  hands over `/FontFile`, `/FontFile2` and `/FontFile3`, and FreeType read all 52
-  distinct programs across the first eight pages of the corpus — but an embedded
-  font program is not a web font, and each container takes different work.
-  Measured with `tests/font-programs.mjs` in this Chromium: a Type 1 program
-  (`/FontFile`; 49 of the 52 here) is refused, and CSS Fonts has no format for
-  one; a bare CFF table (`/FontFile3/Type1C`) is refused until it is wrapped in
-  an sfnt; and a TrueType subset (`/FontFile2`) is refused because a producer's
-  subset usually has no `cmap` at all — write one in, plus the `post` the
-  sanitizer also insists on, and the same bytes load with their `glyf`, `loca`,
-  `hmtx` and the `cvt`, `fpgm` and `prep` hinting tables untouched. So it is a
-  pipeline per container rather than a shortcut, and on this corpus it would
-  serve one document font out of 52. The SVG would not have to change for it —
-  it names a family and a character, never a font — but what it buys is hinting
-  at small sizes, and these runs are positioned per character with
-  `text-rendering="geometricPrecision"`: exact outlines at subpixel positions,
-  which is what hinting is there to override.
+  carried are gone, and a page's font is built from the glyphs that page drew —
+  which is why a page brings a new `@font-face` with it.
+  Serving the program directly is a different matter. Handing the bytes to a
+  browser does not work — measured with `tests/font-programs.mjs`, this Chromium
+  refuses a Type 1 program (49 of the corpus's 52, and CSS Fonts has no format
+  for one), a bare CFF table until it is wrapped in an sfnt, and a TrueType
+  subset until the `cmap` and `post` its producer left out are written in — but
+  nothing has to be handed over. MuPDF will draw a glyph straight out of an
+  embedded program, by id, with no page involved, and what comes back is the
+  outline the page itself drew: `tests/font-program.test.ts` holds 1029 glyphs
+  across the first pages of the corpus to a byte-for-byte match. That is what
+  makes one font per *document* font possible, and with it one `@font-face` for
+  the whole document instead of one per page — the viewer's per-page frames exist
+  only because registering a face re-lays-out the document it lands in.
+  What it does not buy is hinting: these runs are positioned per character with
+  `text-rendering="geometricPrecision"`, exact outlines at subpixel positions,
+  which is what hints are there to override.
 * **Synthetic bold/italic is not reproduced.** When a PDF has no bold face and
   the producer relies on stroke-based faux bold, outline mode and text mode
   differ slightly.
