@@ -44,8 +44,14 @@ export class WorkerEngine implements PdfEngineLike {
     const sources = engineWasmSources();
     // The same message carries how the engine is to be built: a worker cannot see
     // the host's options any more than it can see its modules, and the options are
-    // read once, when the engine is.
-    if (sources.length || options) this.worker.postMessage({ wpdf: 'engine', sources, options });
+    // read once, when the engine is. Only the ones that survive a structured
+    // clone go: `onWarn` is a function, and a function cannot be posted - posting
+    // one throws, and a viewer that quietly fell back to the main thread because
+    // a host passed a warning sink would be a trap.
+    const sent = options
+      ? { disableCompression: options.disableCompression, preplanPages: options.preplanPages }
+      : undefined;
+    if (sources.length || sent) this.worker.postMessage({ wpdf: 'engine', sources, options: sent });
     this.worker.addEventListener('message', (event: MessageEvent) => {
       const { id, ok, result, error } = event.data as {
         id: number;

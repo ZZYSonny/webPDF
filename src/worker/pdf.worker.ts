@@ -37,7 +37,8 @@ interface Request {
 /** Where to get the engine, and how to build it, sent by whoever created this worker. */
 interface EngineMessage extends EngineWasmConfig {
   wpdf: 'engine';
-  options?: EngineOptions;
+  /** The engine options that survive a structured clone - never `onWarn`. */
+  options?: Pick<EngineOptions, 'disableCompression' | 'preplanPages'>;
 }
 
 function isEngineMessage(data: unknown): data is EngineMessage {

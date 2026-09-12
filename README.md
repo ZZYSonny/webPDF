@@ -201,6 +201,7 @@ createViewer({
   keepPages: 1,           // pages either side of the viewport that stay in the DOM
   overscanViewports: 1,   // how far past the viewport the rendered window reaches
   prepareAhead: 3,        // pages past the window rendered while nothing else is happening
+  preplanPages: 64,       // pages worth planning the fonts for before the first is drawn
 });
 ```
 

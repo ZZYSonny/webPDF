@@ -3,8 +3,11 @@
  *
  * A page's font is built from the glyphs that page drew, so every page mints a
  * new family and every page registers a new `@font-face`. Registering a face
- * re-lays-out the document it lands in - measured at 3347 nodes for a single
- * boundary-crossing gesture - which is why every page is drawn in its own frame.
+ * re-lays-out the document it lands in: Blink's font-update invalidation walks
+ * the whole document, measured at 112.9 ms and 3347 "fonts changed" nodes for a
+ * single face added to a document holding a 15-page paper. That is what used to
+ * force every page into a frame of its own, and with the frame went selection
+ * across pages, find-in-page over the paper, and a caret.
  *
  * A font built from the program is not limited that way: it can hold every glyph
  * the font has (see `program.ts`), so one face serves the whole document. What a
@@ -13,17 +16,17 @@
  * document once - text only, drawing nothing - and collects, per program, the
  * glyph ids, the codes they were drawn for, and the letters behind any ligature.
  *
- * The walk is cheap (measured: 4.3 ms a page on a 756-page specification, and
- * 12-19 ms a page on the papers) but it is not free, so a document is planned in
- * one of two ways:
+ * The walk is cheap (measured: 4.3 ms a page on a 756-page specification, 12-19
+ * on the papers) but it is not free, so a document is planned in one of two ways:
  *
- *   - small enough to afford it (`preplanPages`), and the whole document is
- *     walked and every face built *before the first page is laid out*, which is
- *     the case the viewer needs in order to be a single document;
+ *   - small enough to afford it (`preplanPages`, 64 by default), and the whole
+ *     document is walked and every face built *before the first page is laid
+ *     out*. Nothing registers after that, which is what lets the pages be one
+ *     document.
  *   - otherwise the plan is kept a window ahead of whatever is being rendered,
- *     and a font met for the first time later registers then. That is still one
- *     registration per font and not per page; a 756-page specification spends
- *     its first page on page 1 either way.
+ *     and a face met for the first time later is built then - still one per
+ *     *font* and not per page, and still before the page that needs it. Its cost
+ *     arrives alongside the render rather than as a wait at open.
  */
 
 import * as mupdf from 'mupdf';
@@ -347,7 +350,12 @@ export class DocumentFontPlan {
     // encodings can name the same code for two different glyphs, and a cmap that
     // guessed would draw the wrong letter. Decided from scratch, so a font that
     // grew is a font that is encoded again rather than one carrying the answers
-    // of an earlier, smaller self.
+    // of an earlier, smaller self. One code really can be claimed by two glyphs
+    // over a document's life; the one that loses is left with a private-use code,
+    // so its *shape* is right and its character is not - which is the most a
+    // single face can do for a document whose producer gave one font two
+    // encodings, and is why the text of such a page is the thing to distrust
+    // rather than the drawing.
     entry.codeOf.clear();
     const assigned = new Set<number>();
     for (const [code, gid] of entry.byCode) {
