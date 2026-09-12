@@ -19,7 +19,7 @@
  * band per line of the match, and nothing in the page's markup is restyled.
  */
 
-import type { PdfViewer } from '../src/index.ts';
+import type { PdfViewer } from './viewer.ts';
 
 export interface SearchHit {
   /** 1-based page number. */

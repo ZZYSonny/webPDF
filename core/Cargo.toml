@@ -6,7 +6,13 @@ license = "AGPL-3.0-or-later"
 description = "The PDF core of webPDF: MuPDF in Rust, emitting the page's final SVG itself"
 
 [lib]
-crate-type = ["cdylib", "rlib"]
+# `rlib` only, and deliberately: the browser build is a *binary*
+# (`src/bin/engine.rs`), because Emscripten links a binary as a main module and a
+# `cdylib` as a side module - and only a main module can be started by the glue
+# that sets this crate's C runtime up. A `cdylib` here is not merely unused, it
+# is unbuildable: a side module wants position-independent code and MuPDF's C is
+# not compiled with `-fPIC`, so the link fails the moment anything references it.
+crate-type = ["rlib"]
 
 [[bin]]
 name = "webpdf-core"

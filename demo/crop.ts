@@ -4,8 +4,9 @@
  * Cropping a page to its content is the one thing in this reader that changes
  * what a document looks like, so it is opt-in twice over: it does nothing at
  * all until a rule is checked, and every rule can be switched on and off
- * individually. The rules are PaperCutter's (`src/core/crop.ts` names each one
- * after the line it came from); what they remove is the *marks* - a publisher's
+ * individually. The rules are PaperCutter's (`core/src/crop.rs` names each one
+ * after the line it came from, and `./core/rules.ts` here is the same list for
+ * the panel to draw); what they remove is the *marks* - a publisher's
  * footer, an arXiv stamp, a bare page number - so that a box built from what
  * remains is the content and not the margins those marks needed.
  *
@@ -15,9 +16,10 @@
  * script's own behaviour; "Disable all" is how a reader gets their page back.
  */
 
-// The rules come from the module that defines them rather than from the package
-// entry, which re-exports them alongside the engine: see the note in `main.ts`.
-import { CROP_RULES, type CropRuleId, type CropRule } from '../src/core/crop.ts';
+// The list the panel draws is the page's copy of the core's own: the ids and the
+// wording travel together, and the core answers for what each one measures.
+import { CROP_RULES } from './core/rules.ts';
+import type { CropRule, CropRuleId } from './core/types.ts';
 import { scrollIntoPanel } from './panels.ts';
 
 export interface CropMenuOptions {

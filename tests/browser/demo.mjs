@@ -17,12 +17,12 @@ const url = process.argv[2] ?? 'http://127.0.0.1:5175/';
 /**
  * The rendering mode this run is about.
  *
- * The demo starts in the frame mode - a page and its own fonts per frame (see
- * `RenderMode`) - and the checks below are about the *planned* document: one
- * document, one face per font, every face before the first page and none after
- * it. So this run asks for the mode that ends there and lets the switch happen
- * before it starts. The frame half of the story, and the mode that never leaves
- * a frame, are `modes.mjs`.
+ * The demo starts in the progressive mode - a page at once, then the document's
+ * faces (see `RenderMode`) - and the checks below are about the *planned*
+ * document: one document, one face per font, every face before the first page
+ * and none after it. So this run asks for that mode explicitly and lets the
+ * switch happen before it starts. The three modes themselves, and what each one
+ * is drawn in while the plan is walking, are `modes.mjs`.
  */
 const at = `${url}${url.includes('?') ? '&' : '?'}mode=progressive`;
 const out = process.argv[3] ?? path.join(here, 'out', 'demo.png');
@@ -433,9 +433,9 @@ try {
   // are being planned. A star here is a recommendation and not a state - the
   // crop menu's is the same - so the starred row is the recommended mode, and
   // the row in force is the one the menu marks as selected. This run asks for
-  // `IFrame → Global Font` on the URL, so that is the choice; the mode a reader
-  // gets with no URL at all, and the one they are remembered as having chosen,
-  // are `modes.mjs`.
+  // `progressive` on the URL, so that is the choice; the mode a reader gets with
+  // no URL at all, and the one they are remembered as having chosen, are
+  // `modes.mjs`.
   const chosenMode = await page.evaluate('window.webpdf.mode()');
   const modes = await page.evaluate(() => {
     document.getElementById('mode-btn').click();
@@ -449,7 +449,7 @@ try {
   const starred = modes.filter((row) => row.starred).map((row) => row.mode);
   const selected = modes.filter((row) => row.selected).map((row) => row.mode);
   if (modes.length !== 3) fail(`the rendering mode should offer three modes, got ${JSON.stringify(modes)}`);
-  if (starred.join() !== 'frames') fail(`the card should star the recommended mode, got ${JSON.stringify(starred)}`);
+  if (starred.join() !== 'progressive') fail(`the card should star the recommended mode, got ${JSON.stringify(starred)}`);
   if (selected.join() !== chosenMode) fail(`the card should mark the mode in force (${chosenMode}), got ${JSON.stringify(selected)}`);
   if (beforeLoad.gone.length) fail(`the bar still carries ${beforeLoad.gone.join(', ')}`);
   if (!beforeLoad.options.includes(PUBLIC_EXAMPLE)) {

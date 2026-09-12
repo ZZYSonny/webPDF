@@ -67,9 +67,22 @@ pub struct RenderOptions {
     /// the rest, so the eye has a fixation point to land on (`bionic.rs`). Off by
     /// default, and off for a page whose text the two devices disagree about.
     pub bionic: bool,
+    /// Append a clickable hit area for every link annotation (`links.rs`). Off by
+    /// default: they are invisible, so this costs bytes rather than fidelity, and
+    /// a host that draws the page as a picture has no use for them.
+    pub links: bool,
     /// How much of its strength the faded part of a word keeps, 0..1.
     /// `BIONIC_DIM` (a half) when unset; only meaningful while `bionic` is on.
     pub bionic_dim: Option<f32>,
+    /// The window onto the page: `(x, y, width, height)` in page units, which
+    /// becomes the root's `viewBox` and its size.
+    ///
+    /// A crop in the PDF sense - a smaller window onto the same page, never a
+    /// deletion of the marks outside it. Every element is still written at the
+    /// page's own coordinates, so a cropped page is still the whole page's text,
+    /// selectable and searchable, and its link hit areas are where they were.
+    /// `None` is the page as it is.
+    pub view_box: Option<(f32, f32, f32, f32)>,
 }
 
 /// What one page's render cost, and what it became.
@@ -462,18 +475,22 @@ impl SvgDevice {
         format!("{}{kind}_{}", self.prefix, self.ids)
     }
 
-    /// The `@font-face` rules for the faces this page named.
-    fn font_css(&self) -> String {
+    /// The `@font-face` rules for the faces this page named, and how many there
+    /// were - which is what `PageStats::fonts` reports, and the only place that
+    /// knows: the rules are written here and nowhere else.
+    fn font_css(&self) -> (String, usize) {
         let mut seen = String::new();
+        let mut count = 0;
         for entry in &self.used {
             if let Some(css) = self.plan.face_css(*entry) {
                 if !seen.is_empty() {
                     seen.push('\n');
                 }
                 seen.push_str(css);
+                count += 1;
             }
         }
-        seen
+        (seen, count)
     }
 
     fn next_id(&mut self) -> u32 {
@@ -1037,12 +1054,18 @@ impl SvgDevice {
         while !self.open.is_empty() {
             self.close_one();
         }
-        let embedded = if opts.embed_fonts {
+        let (embedded, faces) = if opts.embed_fonts {
             self.font_css()
         } else {
-            String::new()
+            (String::new(), 0)
         };
+        self.stats.fonts = faces;
         let font_css = embedded.as_str();
+        // The window onto the page: a crop when the host asked for one, the
+        // page's own box otherwise. The elements inside were written at the
+        // page's coordinates either way, so this only decides how much of them
+        // is shown.
+        let (vx, vy, vw, vh) = opts.view_box.unwrap_or((0.0, 0.0, width, height));
         let mut svg = String::with_capacity(self.body.len() + self.defs.len() + 512);
         svg.push_str(
             "<svg xmlns=\"http://www.w3.org/2000/svg\" xmlns:xlink=\"http://www.w3.org/1999/xlink\" \
@@ -1051,9 +1074,16 @@ impl SvgDevice {
         if opts.responsive {
             let _ = write!(svg, " preserveAspectRatio=\"xMidYMid meet\" width=\"100%\" height=\"100%\"");
         } else {
-            let _ = write!(svg, " width=\"{}\" height=\"{}\"", num(width), num(height));
+            let _ = write!(svg, " width=\"{}\" height=\"{}\"", num(vw), num(vh));
         }
-        let _ = write!(svg, " viewBox=\"0 0 {} {}\"", num(width), num(height));
+        let _ = write!(
+            svg,
+            " viewBox=\"{} {} {} {}\"",
+            num(vx),
+            num(vy),
+            num(vw),
+            num(vh)
+        );
         if let Some(class) = &opts.class_name {
             let _ = write!(svg, " class=\"{class}\"");
         }
@@ -1924,12 +1954,24 @@ fn hex(color: [u8; 3]) -> String {
 }
 
 /// Render one page to SVG, in one pass, with MuPDF's own interpreter.
+/// One page's SVG, and the box a host should lay it out in.
+///
+/// `width`/`height` are the crop's when there is one and the page's otherwise -
+/// which is what a viewer positions pages by, so it is the window's size and not
+/// the page's.
+pub struct RenderedPage {
+    pub svg: String,
+    pub width: f32,
+    pub height: f32,
+    pub stats: PageStats,
+}
+
 pub fn render_page_svg(
     doc: &Document,
     page_no: i32,
     opts: &RenderOptions,
     plan: Rc<Plan>,
-) -> Result<(String, PageStats), Error> {
+) -> Result<RenderedPage, Error> {
     let plan = plan;
     let page = mupdf::pdf::PdfPage::try_from(doc.load_page(page_no)?)?;
     let bounds = page.bounds()?;
@@ -1962,7 +2004,16 @@ pub fn render_page_svg(
     };
     let stats = device.stats();
     let svg = device.finish(width, height, opts);
-    Ok((svg, stats))
+    let (vw, vh) = match opts.view_box {
+        Some((_, _, w, h)) => (w, h),
+        None => (width, height),
+    };
+    Ok(RenderedPage {
+        svg,
+        width: vw,
+        height: vh,
+        stats,
+    })
 }
 
 impl SvgDevice {

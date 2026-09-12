@@ -15,9 +15,9 @@ import { defineConfig, type Connect, type Plugin } from 'vite';
  * dev server and the preview server alike. A miss is a 404, so a cache that is
  * empty simply means the tests fetch the URLs instead.
  *
- * `mupdf` is excluded from dependency pre-bundling so that Vite keeps its
- * `new URL('mupdf-wasm.wasm', import.meta.url)` reference intact and emits the
- * wasm binary as a real asset.
+ * The Rust core's wasm is not part of the module graph: its glue is loaded by
+ * URL at runtime and its binary fetched by that glue, so the `core()` plugin
+ * below is what puts both next to the page.
  */
 
 /** The module the demo imports to learn which papers have a local copy. */
@@ -161,105 +161,84 @@ function hostMode(): Plugin {
   };
 }
 
-/* ------------------------------------------------------------------- engine */
+/* --------------------------------------------------------------------- core */
 
-/** The module the page reads the engine's addresses from. */
-const ENGINE_MODULE = 'virtual:webpdf/engine';
+/** The module the page reads the core's addresses from. */
+const CORE_MODULE = 'virtual:webpdf/core';
+
+/** Where `npm run build:wasm` leaves the core: two files, no source. */
+const CORE_DIR = 'demo/engine';
+const CORE_FILES = ['webpdf-core.js', 'webpdf-core.wasm'];
 
 /**
- * The engine's wasm, as this build knows it: the exact bytes, their digest, the
- * name this build serves its own copy under, and the CDN it would rather fetch
- * them from.
+ * The Rust core, as this build knows it: the two files Emscripten wrote, and the
+ * digest of the binary.
  *
- * A CDN is worth the extra source because of *when* the engine is downloaded,
- * not how fast the CDN is. MuPDF's wasm is 10 MB, the largest thing this project
- * ever fetches, and a copy served from the site's own directory inherits that
- * site's caching: GitHub Pages hands every asset a ten-minute lifetime, so a
- * reader who comes back tomorrow revalidates ten megabytes before the viewer can
- * draw anything. jsDelivr serves a *versioned* npm file with
- * `max-age=31536000, immutable`, so the URL below never changes while the
- * version does not - which means an update to this viewer (new JavaScript, new
- * styles, new everything else) leaves the engine's address alone, and the copy
- * the browser already has stays where it is. Nothing is asked of the CDN that
- * the site cannot answer itself: the same bytes are emitted here as the second
- * source, fetched only if the first one fails or fails to match its digest.
+ * There is one source and it is this site's own. The engine this replaces was
+ * ten megabytes of somebody else's npm package, fetched from a CDN first because
+ * a versioned URL could be cached forever; the core is built from this
+ * repository by `scripts/build-core-wasm.mjs`, so it is emitted here, next to the
+ * page, and updated exactly when the page is. What survives from that design is
+ * the digest: the service worker only keeps bytes whose hash the page was built
+ * expecting, so a cache can never hand back a stale binary under a name that did
+ * not change with it.
  *
- * `$WEBPDF_ENGINE_CDN` replaces the template (`{version}` is substituted); an
- * empty value ships the site's own copy only, which is what a deployment that
- * would rather serve no third party at all wants.
- *
- * The *order* of those two is the page's, not this build's: `engineSources` in
- * `demo/main.ts` asks the CDN first on the published site and the local copy
- * first everywhere else, so that a dev server or a test browser - both of which
- * start with nothing cached - do not download ten megabytes to prove what is
- * already on the disk.
+ * Neither file is in the repository - both are produced from `core/` - so both
+ * are read here rather than imported, and a build without them says so in one
+ * sentence instead of failing at `fs.readFileSync`.
  */
-function engineFacts() {
-  const pkg = JSON.parse(
-    fs.readFileSync(path.join(import.meta.dirname, 'node_modules/mupdf/package.json'), 'utf8'),
-  ) as { version: string };
-  const bytes = fs.readFileSync(path.join(import.meta.dirname, 'node_modules/mupdf/dist/mupdf-wasm.wasm'));
-  const cdn = (
-    process.env.WEBPDF_ENGINE_CDN ?? 'https://cdn.jsdelivr.net/npm/mupdf@{version}/dist/mupdf-wasm.wasm'
-  ).replace('{version}', pkg.version);
+function coreFacts() {
+  for (const name of CORE_FILES) {
+    if (!fs.existsSync(path.resolve(import.meta.dirname, CORE_DIR, name))) {
+      throw new Error(`${CORE_DIR}/${name} is missing: run \`npm run build:wasm\` first`);
+    }
+  }
+  const wasm = fs.readFileSync(path.resolve(import.meta.dirname, CORE_DIR, 'webpdf-core.wasm'));
   return {
-    version: pkg.version,
+    /** Where the page loads the glue from - relative to the page, like every asset. */
+    url: 'engine/webpdf-core.js',
+    /** And the binary the glue fetches. */
+    wasm: 'engine/webpdf-core.wasm',
     /** `sha384-<base64>`, spelled the way an `integrity` attribute is. */
-    integrity: `sha384-${crypto.createHash('sha384').update(bytes).digest('base64')}`,
-    /** Where this build serves its own copy - relative to the page, like every asset. */
-    local: `engine/mupdf-${pkg.version}.wasm`,
-    cdn,
+    integrity: `sha384-${crypto.createHash('sha384').update(wasm).digest('base64')}`,
   };
 }
 
 /**
- * Place the engine's wasm, and tell the page where to look for it.
+ * Place the core's two files, and tell the page where they are.
  *
- * MuPDF's own loader resolves `new URL('mupdf-wasm.wasm', import.meta.url)`, so
- * the bundler emits the wasm binary as an asset whether or not anything ends up
- * fetching it from there - which is exactly the second source above. Naming that
- * asset after the version rather than after its content is what keeps the URL
- * stable across builds, so a reader's browser is not asked for ten megabytes
- * again because a button moved; `assetFileNames` is how the name is chosen,
- * because the emission is the bundler's, not ours.
+ * In development they are already where the page looks: `demo/` is the Vite root
+ * and `demo/engine/` is inside it, so the dev server serves them as static files
+ * and this plugin has nothing to do but answer the virtual module. A build has
+ * to copy them, because Vite only emits what the module graph reaches and the
+ * glue is loaded by URL at runtime - which is deliberate, since Emscripten's
+ * module cannot be bundled.
  */
-function engine(): Plugin {
-  const facts = engineFacts();
+function core(): Plugin {
+  let facts: ReturnType<typeof coreFacts> | null = null;
   let serving = false;
-  // The one name this build chooses for something it did not emit itself: the
-  // wasm, which MuPDF's loader resolves and the bundler therefore emits. The
-  // worker is a build of its own with its own output options, so it has to be
-  // told the same thing, or the same binary lands in the artifact twice.
-  const nameOfAsset = (asset: { names?: string[]; originalFileNames?: string[] }): string => {
-    const names = [...(asset.names ?? []), ...(asset.originalFileNames ?? [])];
-    return names.some((name) => name.endsWith('mupdf-wasm.wasm')) ? facts.local : 'assets/[name]-[hash][extname]';
-  };
+
+  /** Read the core once, on the first thing that actually needs it. */
+  const known = () => (facts ??= coreFacts());
 
   return {
-    name: 'webpdf:engine',
+    name: 'webpdf:core',
     configResolved: (config) => {
       serving = config.command === 'serve';
     },
-    config: () => ({
-      build: { rollupOptions: { output: { assetFileNames: nameOfAsset } } },
-      worker: { rollupOptions: { output: { assetFileNames: nameOfAsset } } },
-    }),
-    // Read by `demo/main.ts` at start-up: the versions and digests are facts
-    // about the installed package, so they are read from it rather than written
-    // out by hand where they would go stale.
-    resolveId: (id) => (id === ENGINE_MODULE ? `\0${ENGINE_MODULE}` : undefined),
-    load: (id) => (id === `\0${ENGINE_MODULE}` ? `export const engine = ${JSON.stringify(facts)};\n` : undefined),
-    // In dev the same address has to answer, or the fallback source is a 404.
-    // The build's copy is the bundler's; this one is read from `node_modules`.
-    configureServer: (server) => {
-      const wasm = path.join(import.meta.dirname, 'node_modules/mupdf/dist/mupdf-wasm.wasm');
-      server.middlewares.use((req: IncomingMessage, res: ServerResponse, next: (err?: unknown) => void) => {
-        if (!serving || (req.url ?? '').split('?')[0] !== `/${facts.local}`) return next();
-        res.setHeader('Content-Type', 'application/wasm');
-        res.setHeader('Content-Length', String(fs.statSync(wasm).size));
-        fs.createReadStream(wasm).pipe(res);
-      });
+    buildStart() {
+      if (serving) return;
+      known();
+      for (const name of CORE_FILES) {
+        this.emitFile({
+          type: 'asset',
+          fileName: `engine/${name}`,
+          source: fs.readFileSync(path.resolve(import.meta.dirname, CORE_DIR, name)),
+        });
+      }
     },
+    resolveId: (id) => (id === CORE_MODULE ? `\0${CORE_MODULE}` : undefined),
+    load: (id) => (id === `\0${CORE_MODULE}` ? `export const core = ${JSON.stringify(known())};\n` : undefined),
   };
 }
 
@@ -287,11 +266,15 @@ function pwa(): Plugin {
    * names are not the bundle's to give - the page itself, which Vite's own HTML
    * plugin emits, and the manifest, which this hook emits after reading this list.
    *
-   * What is *not* in it is the point of the list: the worker (a cache is not how
-   * a worker is updated, and precaching it would only offer a stale one), source
-   * maps, and the engine's wasm - ten megabytes fetched on install for a reader
-   * who may never open a document is not a promise any site should make. It is
-   * kept the first time it is actually used: see `warmEngine` in `demo/sw.js`.
+   * What is *not* in it is the point of the list. The worker itself is - it is a
+   * file the page is made of, its name carries the hash of its contents, and a
+   * viewer that cannot start its worker is not offline at all - but the worker
+   * that *writes* this list is not, because a service worker served from a cache
+   * is a service worker that never updates. Source maps are not: nobody reads
+   * them offline. And the core's wasm is not - nine megabytes fetched on install,
+   * for a reader who may never open a document, is not a promise any site should
+   * make. It is kept the first time it is actually used: see `warmEngine` in
+   * `demo/sw.js`.
    */
   const readBundle = (bundle: Record<string, OutputFile>) => {
     const icons: Record<string, string> = {};
@@ -390,7 +373,7 @@ export default defineConfig({
   root: 'demo',
   // Nothing is copied verbatim; the cache is served by `papers()` above.
   publicDir: false,
-  plugins: [papers(), hostMode(), engine(), pwa()],
+  plugins: [papers(), hostMode(), core(), pwa()],
   build: {
     // Out of the Vite root and into the repository's build directory, which is
     // where every other build output goes - and what the Pages artifact is.
@@ -399,7 +382,6 @@ export default defineConfig({
     target: 'es2022',
     assetsInlineLimit: 0,
   },
-  optimizeDeps: { exclude: ['mupdf'] },
   worker: {
     format: 'es',
     // Without this the worker keeps its `.ts` source name and servers hand it

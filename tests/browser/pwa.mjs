@@ -6,16 +6,14 @@
  * `url` is where the built demo is served (the suite's preview server). Two
  * scenarios are driven here, and they answer two different questions:
  *
- *  1. *The engine's address.* A page served from the machine it is running on -
- *     which is this one, and every dev server and test browser - asks for the
- *     engine next to it first and for the pinned CDN copy second, so that a
- *     browser with no cache to amortize a download against does not pull ten
- *     megabytes per launch (`engineSources` in `demo/main.ts`). What is checked
- *     is that the engine the viewer used is this machine's copy, that the pinned
- *     CDN address in the build still answers with an engine of the right size,
- *     and that a page which has not opened a document yet has fetched no wasm at
- *     all (the engine is imported when it is first needed, not when the page
- *     boots).
+ *  1. *The engine's address and its digest.* The core is built from this
+ *     repository, so it is served from this site and nowhere else, and the page
+ *     keeps a copy of it only after checking it against the digest the build was
+ *     made with (`warmEngine` in `demo/sw.js`). What is checked is that the
+ *     binary the viewer used is this site's own file, that it digests to exactly
+ *     what `vite.demo.config.ts` wrote into the page, and that a page which has
+ *     not opened a document yet has fetched no wasm at all (the engine is loaded
+ *     when it is first needed, not when the page boots).
  *
  *  2. *Nothing but what the browser kept.* A second browser is launched with
  *     every name but `127.0.0.1` unresolvable (`--host-resolver-rules`), which is
@@ -38,8 +36,8 @@
  *     for the files it was made of; the one before *that* is dropped; and the
  *     whole thing still comes up offline afterwards.
  *
- * The fallback in (2) is also the proof that a CDN which is unreachable does not
- * take the viewer with it: the engine there can only have come from this site.
+ * (2) is also the proof that an unreachable network does not take the viewer with
+ * it: the engine there can only have come from this site, and the site is gone.
  */
 
 import fs from 'node:fs';
@@ -67,11 +65,17 @@ if (!file) {
 const pdf = `/pdf/${path.basename(file)}`;
 
 /**
- * The CDN copy of the engine, which is what a *published* page asks for first,
- * pinned to the installed MuPDF exactly as `engineFacts()` writes it.
+ * The core's binary as *this* build knows it: the address the page resolves,
+ * and the digest it was built against.
+ *
+ * Both are read the way `coreFacts()` in `vite.demo.config.ts` writes them -
+ * the built file and its SHA-384 - because that is what the page checks a kept
+ * copy against, and a test that computed its own answer could not tell a build
+ * that wrote the wrong digest from one that wrote the right one.
  */
-const mupdf = JSON.parse(fs.readFileSync(path.join(root, 'node_modules/mupdf/package.json'), 'utf8')).version;
-const cdn = `https://cdn.jsdelivr.net/npm/mupdf@${mupdf}/dist/mupdf-wasm.wasm`;
+const coreWasm = fs.readFileSync(path.join(dist, 'engine', 'webpdf-core.wasm'));
+const coreDigest = `sha384-${createHash('sha384').update(coreWasm).digest('base64')}`;
+const coreName = 'webpdf-core.wasm';
 
 let failures = 0;
 const started = Date.now();
@@ -289,20 +293,19 @@ console.log('› the engine, and where the page was told to find it');
   });
   const kept = await page.evaluate(`window.__kept()`);
   const engine = kept.engine[0] ?? '';
-  // A page served from this machine reads the engine from this machine: that is
-  // the whole reason a test browser - which starts with an empty cache every
-  // launch - does not fetch ten megabytes from a CDN on every run.
-  const local = new URL(`/engine/mupdf-${mupdf}.wasm`, url).href;
-  check('the engine came from this machine, not from a CDN', engine === local, `${engine}`);
+  // There is one source now and it is this site's own - the core is built from
+  // this repository rather than installed from a registry - so the question is
+  // not which source won but whether the file that was kept is the one the page
+  // was built against.
+  const local = new URL(`/engine/${coreName}`, url).href;
+  check('the engine came from this site', engine === local, `${engine || 'nothing kept'}`);
 
-  // The other source is the one a *published* page asks for first, and this page
-  // never touches it, so it is checked directly: the address has to answer, in the
-  // browser, and with the exact bytes this build was compiled against - which is
-  // what the page's own digest check would demand of it anyway. One download per
-  // suite run, against ten megabytes per *launch* if the order above were the
-  // other way round.
-  const cdnDigest = await page.evaluate(`(async () => {
-    const response = await fetch(${JSON.stringify(cdn)});
+  // The binary is the published one, byte for byte: the page digests what it is
+  // handed and will not keep what it did not expect (see `warmEngine`), so a
+  // service worker holding anything else is a service worker serving a stale
+  // engine.
+  const served = await page.evaluate(`(async () => {
+    const response = await fetch(${JSON.stringify(local)});
     if (!response.ok) return { ok: false, status: response.status };
     const bytes = await response.arrayBuffer();
     const hash = await crypto.subtle.digest('SHA-384', bytes);
@@ -310,13 +313,12 @@ console.log('› the engine, and where the page was told to find it');
     for (const byte of new Uint8Array(hash)) binary += String.fromCharCode(byte);
     return { ok: true, size: bytes.byteLength, integrity: 'sha384-' + btoa(binary) };
   })()`);
-  const expected = `sha384-${createHash('sha384').update(fs.readFileSync(path.join(root, 'node_modules/mupdf/dist/mupdf-wasm.wasm'))).digest('base64')}`;
   check(
-    "the pinned CDN address still serves this build's engine",
-    cdnDigest.ok && cdnDigest.integrity === expected,
-    cdnDigest.ok
-      ? `${Math.round(cdnDigest.size / 1e6)} MB, ${cdnDigest.integrity === expected ? 'matching the digest in the build' : `digest ${cdnDigest.integrity} is not ${expected}`}`
-      : `unreachable from the browser: HTTP ${cdnDigest.status}`,
+    'the served binary is the one this build was compiled against',
+    served.ok && served.integrity === coreDigest,
+    served.ok
+      ? `${Math.round(served.size / 1e6)} MB, ${served.integrity === coreDigest ? 'matching the digest in the build' : `digest ${served.integrity} is not ${coreDigest}`}`
+      : `unreachable from the browser: HTTP ${served.status}`,
   );
 
   check(
@@ -353,7 +355,7 @@ console.log('\n› the same viewer with no network at all');
   const kept = await page.evaluate(`window.__kept()`);
   check(
     'and the engine is kept from this site, with no name resolving at all',
-    kept.engine.length === 1 && kept.engine[0].startsWith(server.origin) && kept.engine[0].endsWith(`mupdf-${mupdf}.wasm`),
+    kept.engine.length === 1 && kept.engine[0].startsWith(server.origin) && kept.engine[0].endsWith(coreName),
     kept.engine.join(', ') || 'nothing kept',
   );
 

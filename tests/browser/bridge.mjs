@@ -31,7 +31,9 @@
  */
 
 import http from 'node:http';
+import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -39,6 +41,7 @@ import { attach, launch } from './cdp.mjs';
 import { PAPERS, cachedFile } from '../pdf-cache.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
+const root = path.join(here, '..', '..');
 const url = process.argv[2] ?? 'http://127.0.0.1:5178/';
 
 const paper = PAPERS[0];
@@ -57,19 +60,26 @@ const PASSWORD = 'hunter2';
  * The same paper, encrypted, for the one question the page has to ask.
  *
  * Made here rather than kept in the repository - nothing in this repository is a
- * PDF, and a document a host hands over does not need a file to begin with.
+ * PDF, and a document a host hands over does not need a file to begin with - and
+ * made by the core's own `encrypt` binary, which is the same MuPDF the viewer
+ * reads with. Nothing in the JavaScript here touches a PDF: the package that used
+ * to is gone with the pipeline it belonged to.
+ *
+ * The binary is a build artifact of `core/`, so a suite that has not built it
+ * skips this section rather than failing on a missing file: what is under test is
+ * the page's password card, not cargo.
  */
-async function encrypted(source, password) {
-  const mupdf = await import('mupdf');
-  const doc = mupdf.PDFDocument.openDocument(new Uint8Array(source), 'application/pdf');
-  const saved = doc.saveToBuffer({
-    encrypt: 'aes-256',
-    'user-password': password,
-    'owner-password': password,
-    permissions: -1,
-  });
-  doc.destroy();
-  return Buffer.from(saved.asUint8Array());
+const encryptBin = path.join(root, 'core', 'target', 'release', 'encrypt');
+
+function encrypted(source, password) {
+  const scratch = path.join(os.tmpdir(), `webpdf-bridge-${process.pid}.pdf`);
+  fs.writeFileSync(scratch, source);
+  try {
+    execFileSync(encryptBin, [scratch, `${scratch}.locked`, password], { stdio: ['ignore', 'ignore', 'inherit'] });
+    return fs.readFileSync(`${scratch}.locked`);
+  } finally {
+    for (const file of [scratch, `${scratch}.locked`]) fs.rmSync(file, { force: true });
+  }
 }
 
 let failures = 0;
@@ -218,10 +228,17 @@ try {
 
   /* ------------------------------------ a document with a password */
 
+  if (!fs.existsSync(encryptBin)) {
+    console.log('\n› a document with a password');
+    console.log(`  (skipped: ${path.relative(root, encryptBin)} is not built - run \`cargo build --release --manifest-path core/Cargo.toml\`)`);
+    await browser.close();
+    process.exit(failures ? 1 : 0);
+  }
+
   // A host hands over an encrypted document and says nothing about it - it has no
   // business knowing the password. The page asks in its own card, and the host
   // hears nothing at all until the document is on screen.
-  const locked = (await encrypted(bytes, PASSWORD)).toString('base64');
+  const locked = encrypted(bytes, PASSWORD).toString('base64');
   await page.goto(hostPage(3));
   await page.waitFor(() => window.__heard.some((message) => message.kind === 'hello'), { label: 'the page to say hello', timeout: 30000 });
   await page.evaluate(`window.handOver(${JSON.stringify(locked)}, 'locked.pdf', ${JSON.stringify(pdfUrl + '#locked')})`);

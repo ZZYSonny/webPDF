@@ -128,6 +128,9 @@ pub struct Plan {
     faces: Vec<Face>,
     complete: bool,
     warned: Vec<String>,
+    /// Pages walked so far, and how many there are to walk.
+    next_page: i32,
+    total_pages: i32,
 }
 
 impl Default for Plan {
@@ -145,12 +148,24 @@ impl Plan {
             faces: Vec::new(),
             complete: false,
             warned: Vec::new(),
+            next_page: 0,
+            total_pages: 0,
         }
     }
 
     /// True once every page has been walked, so no font can appear later.
     pub fn is_complete(&self) -> bool {
         self.complete
+    }
+
+    /// How far the walk has got, in pages.
+    pub fn walked_pages(&self) -> i32 {
+        self.next_page
+    }
+
+    /// How many pages the walk has to get through.
+    pub fn total_pages(&self) -> i32 {
+        self.total_pages
     }
 
     /// Every face the plan built, for a host that registers them all at once.
@@ -312,18 +327,53 @@ impl Plan {
     /// The whole walk is one pass: what a page drew, which code each glyph stood
     /// for, and the outlines of the glyphs no earlier page had drawn.
     pub fn walk(&mut self, doc: &Document) -> Result<(), Error> {
-        let count = doc.page_count()?;
-        for index in 0..count {
-            match self.walk_page(doc, index) {
-                Ok(()) => {}
-                Err(error) => self
-                    .warned
-                    .push(format!("page {index} could not be planned: {error}")),
+        self.start(doc)?;
+        self.step(doc, 0)?;
+        Ok(())
+    }
+
+    /// Begin a walk: count the pages and start at the first.
+    ///
+    /// Separate from [`step`](Plan::step) because a host that draws in a browser
+    /// cannot afford to walk a 756-page document in one call: [`walk`](Plan::walk)
+    /// is `start` and then one `step` with no budget, and the wasm bridge is
+    /// `start` and then a `step` per turn, so the page stays alive while the
+    /// document is read.
+    pub fn start(&mut self, doc: &Document) -> Result<(), Error> {
+        self.total_pages = doc.page_count()?;
+        self.next_page = 0;
+        self.complete = false;
+        Ok(())
+    }
+
+    /// Walk up to `budget` more pages, or all of them when `budget` is not
+    /// positive, and say whether the plan is finished.
+    ///
+    /// A page that cannot be read is a warning and not a failure: the font it
+    /// would have contributed is simply not planned, and every glyph of it stays
+    /// an outline, which always renders correctly.
+    pub fn step(&mut self, doc: &Document, budget: i32) -> Result<bool, Error> {
+        if self.complete {
+            return Ok(true);
+        }
+        let end = if budget <= 0 {
+            self.total_pages
+        } else {
+            self.next_page.saturating_add(budget).min(self.total_pages)
+        };
+        while self.next_page < end {
+            let index = self.next_page;
+            self.next_page += 1;
+            if let Err(error) = self.walk_page(doc, index) {
+                self.warned
+                    .push(format!("page {index} could not be planned: {error}"));
             }
         }
-        self.build();
-        self.complete = true;
-        Ok(())
+        if self.next_page >= self.total_pages {
+            self.build();
+            self.complete = true;
+        }
+        Ok(self.complete)
     }
 
     fn walk_page(&mut self, doc: &Document, index: i32) -> Result<(), Error> {

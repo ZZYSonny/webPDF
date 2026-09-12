@@ -16,3 +16,9 @@ ext/key.pem
 .cargo/
 .emsdk/
 core/target
+
+# The core's wasm build: nine megabytes of binary and the minified Emscripten
+# glue that loads it, written by `npm run build:wasm`. Neither is a source file -
+# both are produced from `core/` - so neither belongs in the repository, the same
+# way `dist/` does not.
+demo/engine/

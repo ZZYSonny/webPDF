@@ -8,7 +8,7 @@
  * here goes back to `setZoom`.
  */
 
-import type { ZoomMode } from '../src/index.ts';
+import type { ZoomMode } from './layout.ts';
 
 /** Everything `PdfViewer.setZoom` accepts, which is also what the ladder holds. */
 export type ZoomLevel = number | 'fit-width' | 'fit-page';

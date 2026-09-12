@@ -10,9 +10,10 @@
  *     the build rather than to the reader. This module's job there is to register
  *     it, to notice when a *newer* build has installed and is waiting for a page
  *     willing to reload into it, and to tell it once, after the engine has
- *     actually been used, which URLs the engine came from so it can keep a copy
- *     of the same bytes. A worker that is never asked never takes over - which is
- *     deliberate, and which is why the noticing is here rather than there;
+ *     actually been used, where the engine's binary lives and what it should
+ *     digest to, so it can keep a copy of the same bytes. A worker that is never
+ *     asked never takes over - which is deliberate, and which is why the
+ *     noticing is here rather than there;
  *   - the *documents* are this module's, because which documents matter is a
  *     reader's business and nobody else's. The page writes them into a cache of
  *     its own as they are opened, and the worker serves them from there (see
@@ -39,7 +40,11 @@
  * they try to open something while offline.
  */
 
-import type { EngineWasmSource } from '../src/core/engine-wasm.ts';
+/** Where the core's binary is, and what it must digest to: spelled in `sw.js` too. */
+export interface EngineSource {
+  url: string;
+  integrity: string;
+}
 
 /** The documents this page has kept. Spelled in `demo/sw.js` too: it reads this one. */
 const DOCS = 'webpdf-docs';
@@ -51,8 +56,8 @@ const KEEP = 8;
 const KEPT_AT = 'x-webpdf-kept';
 
 export interface OfflineOptions {
-  /** The engine's sources, in the order the page tries them. */
-  sources: readonly EngineWasmSource[];
+  /** The core's binary, as this build knows it. */
+  engine: EngineSource;
   /**
    * Whether this page is being driven inside a frame that is not its own - the
    * extension's viewer, or any other host. A frame's storage belongs to whoever
@@ -88,7 +93,7 @@ export interface Offline {
  * Register the worker, and hand back the two things the page does about being
  * offline. Safe to call in a browser that can do none of it.
  */
-export function createOffline({ sources, hosted, onWarn, onUpdate }: OfflineOptions): Offline {
+export function createOffline({ engine, hosted, onWarn, onUpdate }: OfflineOptions): Offline {
   const worker = register(hosted, onWarn, onUpdate);
   let warmed = false;
 
@@ -96,7 +101,7 @@ export function createOffline({ sources, hosted, onWarn, onUpdate }: OfflineOpti
     used() {
       if (warmed) return;
       warmed = true;
-      void warmEngine(worker, sources, onWarn);
+      void warmEngine(worker, engine, onWarn);
     },
     keep(url, bytes) {
       void keepDocument(url, bytes, onWarn);
@@ -244,16 +249,16 @@ function watch(
 /** Tell the worker to keep the engine, once a document has needed it. */
 async function warmEngine(
   worker: ServiceWorkerContainer | null,
-  sources: readonly EngineWasmSource[],
+  engine: EngineSource,
   onWarn?: (message: string) => void,
 ): Promise<void> {
-  if (!worker || !sources.length) return;
+  if (!worker || !engine.url) return;
   try {
     // `ready` rather than `controller`: on a first visit the worker is still
     // installing when the first document opens, and this is exactly the visit
     // whose engine would otherwise not be kept.
     const registration = await worker.ready;
-    registration.active?.postMessage({ wpdf: 'warm-engine', sources });
+    registration.active?.postMessage({ wpdf: 'warm-engine', engine });
   } catch (error) {
     onWarn?.(`the engine was not kept for offline: ${String((error as Error)?.message ?? error)}`);
   }

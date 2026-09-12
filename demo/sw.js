@@ -15,11 +15,11 @@
  *     whole - for exactly one generation, see `install` and `activate` - and
  *     nothing from two builds is ever served to the same request: a navigation
  *     is answered from this build's shell and from nowhere else;
- *   - the *engine* (MuPDF's 10 MB wasm) is not precached - downloading ten
- *     megabytes on install, for a reader who may never open a document, is not a
- *     promise a site should make. It is kept the first time it is actually
- *     fetched (`warm-engine`), together with the digest it was verified against,
- *     and served from there afterwards;
+ *   - the *engine* (the Rust core's wasm, nine megabytes of it) is not precached
+ *     - downloading nine megabytes on install, for a reader who may never open a
+ *     document, is not a promise a site should make. It is kept the first time it
+ *     is actually fetched (`warm-engine`), together with the digest it was
+ *     verified against, and served from there afterwards;
  *   - *documents* are not this worker's decision at all. The page keeps the ones
  *     it decides are worth keeping in a cache of its own
  *     (`demo/offline.ts` - the name is spelled there too), and all this worker
@@ -205,11 +205,9 @@ async function shelled(request) {
  *
  * Nothing is *stored* here. This cache is written in one place only - `warmEngine`
  * below, which checks the digest of what it is about to keep - so that everything
- * in it is bytes the page verified. A response served through here has been
- * checked by the page anyway (it digests whatever it is handed and falls back to
- * the next source on a mismatch), but a response that is merely *served* is not
- * necessarily the engine, and this is one cache that must not fill up with
- * things that are not.
+ * in it is bytes the page verified. A response that is merely *served* is not
+ * necessarily the engine, and this is one cache that must not fill up with things
+ * that are not.
  */
 async function engine(request) {
   const cache = await caches.open(ENGINE);
@@ -249,35 +247,39 @@ async function digestOf(bytes) {
 /**
  * Keep the engine, once the reader has actually used it.
  *
- * The page sends the sources it was built with, in order, each with the digest
- * of the bytes it expects - so what goes into this cache is what the page
- * verified, not whatever a URL answered at some point. The first source that
- * answers and matches wins, exactly as it does for the page; a source that is
- * already kept ends it, since the point is to have *an* engine offline, not all
- * of them.
+ * The page sends the one file its build was made against, with the digest of the
+ * bytes it expects - so what goes into this cache is what the page verified, not
+ * whatever a URL answered at some point. A digest that does not match is not
+ * kept: a wasm binary that is not the one the page was built with cannot be
+ * allowed to answer for it later. Nothing is kept at all until the reader has
+ * opened a document, which is the moment the engine is worth nine megabytes.
+ *
+ * The binary's name does not change when it is rebuilt, which is exactly why the
+ * digest is here: the build id covers the page's own files, and this one is
+ * fetched rather than bundled, so the two have to be tied together some other
+ * way.
  */
-async function warmEngine(sources) {
-  const cache = await caches.open(ENGINE);
-  for (const source of sources ?? []) {
-    try {
-      const url = new URL(source.url, self.location.href).href;
-      if (await cache.match(url, { ignoreVary: true })) return;
-      const response = await fetch(url);
-      if (!response.ok) continue;
-      const bytes = await response.arrayBuffer();
-      const digest = source.integrity ? await digestOf(bytes) : null;
-      if (source.integrity && digest && digest !== source.integrity) continue;
-      await cache.put(
-        url,
-        new Response(bytes, {
-          headers: { 'content-type': 'application/wasm', 'content-length': String(bytes.byteLength) },
-        }),
-      );
-      return;
-    } catch {
-      // The next source, or none: the page fetches the engine for itself
-      // either way, and a worker that cannot keep it is not a failure.
-    }
+async function warmEngine(source) {
+  if (!source?.url || !source.integrity) return;
+  try {
+    const cache = await caches.open(ENGINE);
+    const url = new URL(source.url, self.location.href).href;
+    if (await cache.match(url, { ignoreVary: true })) return;
+    const response = await fetch(url);
+    if (!response.ok) return;
+    const bytes = await response.arrayBuffer();
+    // No `crypto.subtle` (a page that is not on a secure origin) means no way to
+    // check, and an unchecked binary is worse than a network fetch.
+    if ((await digestOf(bytes)) !== source.integrity) return;
+    await cache.put(
+      url,
+      new Response(bytes, {
+        headers: { 'content-type': 'application/wasm', 'content-length': String(bytes.byteLength) },
+      }),
+    );
+  } catch {
+    // A worker that cannot keep the engine is not a failure: the page fetches it
+    // for itself either way.
   }
 }
 
@@ -285,7 +287,7 @@ self.addEventListener('message', (event) => {
   const message = event.data;
   if (!message) return;
   if (message.wpdf === 'warm-engine') {
-    event.waitUntil(warmEngine(message.sources));
+    event.waitUntil(warmEngine(message.engine));
     return;
   }
   // A page has found this build waiting and a reader has said yes: take over

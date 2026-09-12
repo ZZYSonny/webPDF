@@ -1,14 +1,12 @@
 /**
  * Demo application.
  *
- * Deliberately built only on the public API - no private reach-ins - so it
- * doubles as a test that the integration surface is sufficient for a real app
- * (and, by extension, for a browser extension content script). The imports name
- * the modules that API lives in rather than the package entry, because the entry
- * also exports `PdfEngine`, and importing that would build a second engine - and
- * fetch the 10 MB wasm for it - on the main thread of a page that draws in a
- * worker. Nothing here is drawn from outside the public surface: every one of
- * these names is re-exported by `src/index.ts`.
+ * The page is the host: it owns the chrome - the bar, the outline, the crop menu,
+ * the reader's memory - and hands the document to a viewer that draws it. What
+ * used to be two halves of one repository (`src/`, a published library, and
+ * `demo/`, a page that imported it) is now this page and the Rust core it drives;
+ * `demo/core/` is the layer that spells the core's protocol in TypeScript, and
+ * `demo/viewer.ts` is the viewer itself. Nothing here reaches past those two.
  *
  * The chrome is one bar and nothing else, and that bar is one line however
  * narrow the window is: the document, its outline and the page number on the
@@ -25,12 +23,12 @@
  * the pages puts the chrome away the way a pinch does - see `dismissOnScroll`.
  */
 
-import { createViewer } from '../src/api.ts';
-import { BIONIC_DIM } from '../src/core/svg/bionic.ts';
-import { configureEngineWasm, type EngineWasmSource } from '../src/core/engine-wasm.ts';
-import { DEFAULT_ZOOM_STEPS, type RenderMode } from '../src/viewer/viewer.ts';
-import type { DocumentInfo, PdfViewer, ViewerEvent } from '../src/index.ts';
-import { engine } from 'virtual:webpdf/engine';
+import { PdfEngine } from './core/engine.ts';
+import { createWorkerEngine } from './core/client.ts';
+import { BIONIC_DIM } from './core/bionic.ts';
+import type { DocumentInfo, FontPlanProgress, PdfEngineLike } from './core/types.ts';
+import { DEFAULT_ZOOM_STEPS, PdfViewer, type RenderMode, type ViewerEvent } from './viewer.ts';
+import { core } from 'virtual:webpdf/core';
 import { createHostBridge, isHosted, type HostBridge, type HostDocument } from './host.ts';
 import { createOffline } from './offline.ts';
 import { get, inherited, keyOfFile, keyOfUrl, MEMORY_KEY, put, read, write, type Memory, type Place, type Settings } from './memory.ts';
@@ -153,31 +151,32 @@ const BASE = new URL('.', document.baseURI).href;
 const resolve = (url: string): string => new URL(url, BASE).href;
 
 /**
- * Where the engine may be fetched from, in order.
- *
- * The *published* site asks the CDN first and its own copy second, and the
- * reasoning for that is in `engineFacts()` in `vite.demo.config.ts`: the CDN's URL
- * is pinned to a MuPDF version rather than to a build, so an update to this
- * viewer does not invalidate the ten megabytes a reader already has.
- *
- * A page served from the machine it is running on asks for the copy *on* that
- * machine first. That is the dev server, `vite preview`, and every test browser:
- * the package is already on the disk (the dev server reads the wasm out of
- * `node_modules`, a build has emitted it next to the page), and a browser with
- * no cache to amortize a download against - every test launch starts with an
- * empty profile - would otherwise pull ten megabytes from somewhere else on
- * every run, to prove something this disk can answer without a network at all.
- * The CDN stays in the list, second: a page whose own copy is missing or wrong
- * still has somewhere to go.
+ * Where the core is: the glue script this build emitted, resolved against the
+ * page rather than against this module - the module is one of the hashed files
+ * under `assets/`, the core is not, and a reader behind a different path
+ * (`[user].github.io/<repo>/`, a server that mounted the build a level down)
+ * has to find it the way they find the page.
  */
-const localEngine: EngineWasmSource = { url: new URL(engine.local, BASE).href, integrity: engine.integrity };
-const cdnEngine: EngineWasmSource[] = engine.cdn ? [{ url: engine.cdn, integrity: engine.integrity }] : [];
-const onThisMachine = import.meta.env.DEV || /^(localhost|127(\.\d+){3}|\[::1\])$/.test(location.hostname);
-const engineSources: EngineWasmSource[] = onThisMachine
-  ? [localEngine, ...cdnEngine]
-  : [...cdnEngine, localEngine];
+const coreUrl = new URL(core.url, BASE).href;
 
-configureEngineWasm({ sources: engineSources });
+/**
+ * The engine: a worker that owns the core, or - where there is no worker to be
+ * had - the core on this thread.
+ *
+ * The worker is preferred because a page render is tens of milliseconds of
+ * arithmetic and the reader is scrolling through it; the fallback is the honest
+ * one, because a viewer that refuses to draw without a worker is a viewer that
+ * does not work in a frame that has none. Nothing above this line knows which
+ * one it got: both answer the same calls, and `rendersInWorker` is the only
+ * thing that tells.
+ */
+async function createEngine(planFonts: boolean): Promise<PdfEngineLike> {
+  const options = { coreUrl, planFonts, onWarn: (message: string) => notify(message) };
+  const worker = await createWorkerEngine(options);
+  if (worker) return worker;
+  // The wasm is fetched and instantiated here and now, on this thread.
+  return await PdfEngine.create(options);
+}
 
 /**
  * The offline half of the page: the service worker, and the documents worth
@@ -185,7 +184,7 @@ configureEngineWasm({ sources: engineSources });
  * see `demo/offline.ts`.
  */
 const offline = createOffline({
-  sources: engineSources,
+  engine: { url: new URL(core.wasm, BASE).href, integrity: core.integrity },
   hosted: isHosted() && window.parent !== window,
   onWarn: (message) => notify(message),
   // A newer build of the viewer, waiting for a page willing to reload into it.
@@ -266,28 +265,34 @@ const bionicMenu: Menu = createMenu({
 /**
  * How the pages are drawn, chosen once on the card that offers a document.
  *
- * The engine plans a document's fonts the moment it is open - one `@font-face`
- * per *font*, for every page of it - and until that plan is ready each page is
- * drawn with the faces that page drew itself. Where those faces are registered
- * is what the choice is about: telling a document about a face makes the
- * browser lay out every text run in it again, so a page's own faces belong in a
- * frame of the page's own (nothing else is touched at all), and the document's
- * faces belong in the one document, all at once, once they are planned.
+ * There is one font path in the core and it is the document's: a page shows real
+ * text only once the plan has walked the document and built its faces, and until
+ * then every glyph is an outline - the same shapes, in the same places, with no
+ * text to select or search. The plan is cheap (0.2 s for a hundred pages, 0.9 s
+ * for the 756-page specification, measured) but it is not instant, so the
+ * question the three modes answer is what to do with it:
  *
- * The plan is 0.6-2.3 s for the corpus papers and 18 s for the 756-page
- * specification, which is exactly why it runs in the background and why there
- * are three answers to "what do I look at while it does".
+ *   - `'progressive'` draws at once - outlines, which look like the page they
+ *     are - and redraws everything under the document's faces the moment they
+ *     are ready, handing each page over to the one document without the reader
+ *     seeing it. This is the mode the page starts in and stars.
+ *   - `'frames'` keeps every page in a frame of its own and gives each frame the
+ *     faces *that page* needs, so nothing about a page is shared with any other.
+ *     A page is still drawn at once (as outlines), and redrawn with its faces
+ *     when the plan arrives; it stays in frames afterwards.
+ *   - `'global'` draws nothing at all until the plan is ready, and then draws
+ *     once: the page a reader sees is never drawn twice.
  */
 const RENDER_MODES: ReadonlyArray<{ id: RenderMode; label: string; note: string }> = [
   {
-    id: 'frames',
-    label: 'IFrame + Per Page Font',
-    note: 'a frame and its own fonts per page — nothing is shared, nothing is planned',
+    id: 'progressive',
+    label: 'Draw at Once, Then Text',
+    note: 'the page immediately as outlines, then the document’s faces — one document once they arrive',
   },
   {
-    id: 'progressive',
-    label: 'IFrame → Global Font',
-    note: 'frames with the page’s own fonts until the document’s fonts are planned, then one document',
+    id: 'frames',
+    label: 'IFrame + Per Page Font',
+    note: 'a frame and its own faces per page — nothing is shared between pages',
   },
   {
     id: 'global',
@@ -302,13 +307,13 @@ const RENDER_MODES: ReadonlyArray<{ id: RenderMode; label: string; note: string 
  * A star in this page is a recommendation and not a state - the crop menu's
  * works the same way, and its README says so - so the row it sits on is the
  * setting worth choosing and the row *in force* is the one the menu opens on and
- * colours (`aria-selected`). A frame and a face per page is the recommended one
- * because every document is then drawn exactly as the file sets it, page by
- * page, with nothing shared between pages and nothing to wait for - which is
- * also why it is where a reader who has chosen nothing starts. The other two are
- * one click away on the same dropdown.
+ * colours (`aria-selected`). Drawing at once and letting the text arrive is the
+ * recommended one because a reader never waits for a document to be read before
+ * seeing it, and because what they get in the meantime is the page itself - the
+ * same glyphs, the same positions, with only the text layer still to come. The
+ * other two are one click away on the same dropdown.
  */
-const RECOMMENDED_MODE: RenderMode = 'frames';
+const RECOMMENDED_MODE: RenderMode = 'progressive';
 
 function modeNamed(value: unknown): RenderMode | null {
   return RENDER_MODES.some((mode) => mode.id === value) ? (value as RenderMode) : null;
@@ -316,6 +321,9 @@ function modeNamed(value: unknown): RenderMode | null {
 
 function requestedMode(): RenderMode {
   const params = new URLSearchParams(location.search);
+  // `?plan=0` is the name this page used before there was a menu, when "do not
+  // plan" was the only other answer there was; it still means the frame mode,
+  // which is the one that never leaves a frame.
   if (params.get('plan') === '0') return 'frames';
   return modeNamed(params.get('mode')) ?? modeNamed(inherited(memory)?.renderMode) ?? RECOMMENDED_MODE;
 }
@@ -436,8 +444,12 @@ fillExampleMenu();
 
 async function ensureViewer(): Promise<PdfViewer> {
   if (viewer) return viewer;
-  viewer = await createViewer({
+  // The plan is not optional: it is where text comes from, and every mode wants
+  // it. What the mode chooses is when to draw and where a page's faces live.
+  const engine = await createEngine(true);
+  viewer = PdfViewer.create({
     container: els.viewer,
+    engine,
     zoom: 'fit-width',
     // The same ladder the zoom box lists, so the dropdown and Ctrl +/- all
     // offer identical levels.
@@ -453,9 +465,6 @@ async function ensureViewer(): Promise<PdfViewer> {
     // Frames with the page's own fonts until the document's plan is ready, then
     // one document - see `RENDER_MODES` above, and `RenderMode` in the viewer.
     renderMode,
-    // A frame holds its own faces, so a document-wide plan would be built and
-    // then never used: the frame mode does not ask for one.
-    planFonts: renderMode !== 'frames',
     // Read at each scroll rather than captured, so chrome that changes height
     // (the outline's own header, a bar that grows a pixel) is accounted for.
     scrollMargin: () => topbarHeight,
@@ -1531,6 +1540,8 @@ declare global {
       mode(): RenderMode;
       /** Whether the pages are drawn one to a frame at this moment. */
       pagesInFrames(): boolean;
+      /** How far the document's font plan has got, or null before one starts. */
+      plan(): FontPlanProgress | null;
     };
   }
 }
@@ -1540,6 +1551,7 @@ window.webpdf = {
   open: (url) => openSource(resolve(url)),
   mode: () => renderMode,
   pagesInFrames: () => viewer?.pagesInFrames ?? false,
+  plan: () => viewer?.planProgress ?? null,
 };
 
 /**

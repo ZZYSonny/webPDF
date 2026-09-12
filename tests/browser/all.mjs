@@ -4,18 +4,23 @@
  *   node tests/browser/all.mjs
  *
  * Makes sure the test corpus is in the cache (the papers are public URLs, so a
- * cold cache is a download), builds the demo, serves it - the Vite config mounts
- * that cache at `/pdf`, which is how the picker offers a local copy of a paper -
- * checks that the text render reproduces MuPDF's outlines and that a ligature is
- * drawn by the letters the text says, then drives the demo UI, including a paper
+ * cold cache is a download), drives the wasm core's exports directly (in Node,
+ * in a second), builds the demo and the extension over it, serves the demo - the
+ * Vite config mounts that cache at `/pdf`, which is how the picker offers a local
+ * copy of a paper - and then drives the page: the demo UI, including a paper
  * fetched from its public URL, because that is what a published page loads.
+ *
+ * The demo build needs `demo/engine/webpdf-core.{js,wasm}`, which
+ * `npm run build:wasm` writes and nothing here builds: this suite is about the
+ * page, and the core is a prerequisite of it, the way `node_modules` is.
  */
 
 import { spawn } from 'node:child_process';
+import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { PAPERS, cachedFile, ensurePapers } from '../pdf-cache.mjs';
+import { PAPERS, ensurePapers } from '../pdf-cache.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const root = path.join(here, '..', '..');
@@ -35,6 +40,14 @@ await ensurePapers(
   PAPERS.map((paper) => paper.url),
   { log: (line) => console.log('  ' + line) },
 );
+
+if (!fs.existsSync(path.join(root, 'demo', 'engine', 'webpdf-core.wasm'))) {
+  console.error('\ndemo/engine/webpdf-core.wasm is missing — run `npm run build:wasm` first');
+  process.exit(1);
+}
+
+console.log('› the wasm bridge, driven directly');
+await run([path.join(root, 'tests', 'core', 'wasm.mjs')]);
 
 console.log('› building demo');
 await run([vite, 'build', '--config', 'vite.demo.config.ts']);
@@ -69,32 +82,8 @@ let failed = false;
 try {
   if (!(await ready())) throw new Error('preview server never came up');
 
-  // Fidelity is measured on the two papers the rest of the suite is written
-  // against; a document that never made it into the cache is skipped rather
-  // than failing the suite on the network.
-  const samples = PAPERS.slice(0, 2).filter((paper) => cachedFile(paper.url));
-
-  for (const paper of samples) {
-    const file = cachedFile(paper.url);
-    console.log(`\n› outline-vs-text fidelity: ${paper.label}`);
-    await run([path.join(here, 'run.mjs'), file, '0'], { stdio: 'inherit' }).catch((err) => {
-      failed = true;
-      console.error(String(err.message));
-    });
-  }
-  if (!samples.length) console.log('\n(no paper in the cache - fidelity skipped)');
-
-  console.log('\n› a ligature is drawn by the letters the text says');
-  await run([path.join(here, 'ligature.mjs')], { stdio: 'inherit' }).catch((err) => {
-    failed = true;
-    console.error(String(err.message));
-  });
-
   console.log('\n› demo application');
   await run([path.join(here, 'demo.mjs'), url], { stdio: 'inherit' });
-
-  console.log('\n› one document, and the browser’s own text behaviour over it');
-  await run([path.join(here, 'single.mjs'), url], { stdio: 'inherit' });
 
   console.log('\n› how a page is drawn while the document’s fonts are being planned');
   await run([path.join(here, 'modes.mjs'), url], { stdio: 'inherit' });
@@ -118,4 +107,7 @@ try {
 }
 
 console.log(failed ? '\nBROWSER TESTS FAILED' : '\nBROWSER TESTS PASSED');
+// A suite that fails has to be a failing command: `npm run test:browser` in a
+// script, or in CI, is only worth anything if the exit code says so.
+process.exit(failed ? 1 : 0);
 process.exit(failed ? 1 : 0);

@@ -20,7 +20,9 @@
  * - a type-only import, which is gone by the time this runs.
  */
 
-import type { CropRuleId, RenderMode, ZoomMode } from '../src/index.ts';
+import type { CropRuleId } from './core/types.ts';
+import type { RenderMode } from './viewer.ts';
+import type { ZoomMode } from './layout.ts';
 
 /** Where the reader is: a page, and a point within it in the document's units. */
 export interface Place {

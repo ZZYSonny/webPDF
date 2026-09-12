@@ -26,7 +26,7 @@
 use std::ptr;
 use std::slice;
 
-use mupdf::{ColorParams, Context, Function, Image, Matrix, Rect, Shade};
+use mupdf::{ColorParams, Context, Function, Image, Matrix, Path, Rect, Shade};
 
 use mupdf_sys as sys;
 
@@ -81,6 +81,33 @@ handle_pointer!(
     Image,
     *mut sys::fz_image
 );
+
+handle_pointer!(
+    /// The `fz_path` behind a `Path`.
+    path_pointer,
+    Path,
+    *mut sys::fz_path
+);
+
+/// The box a path occupies under a transform, with no stroke widening it.
+///
+/// `fz_bound_path` is the exact bound - it walks the curves rather than the
+/// control points - and passing a null stroke is the whole reason this is here
+/// rather than a call to the safe wrapper: `Path::bounds` insists on a
+/// `StrokeState`, and MuPDF turns a zero-width stroke into half a unit of
+/// expansion (`adjust_rect_for_stroke`), so a *fill* measured through the safe
+/// wrapper comes out up to a point wider than the fill. The crop rules compare
+/// these boxes to the page and to each other, so a point of slack is a title
+/// kept that should have been trimmed. A null stroke is the answer MuPDF's own
+/// SVG device gives for a fill, and it is the answer here.
+pub fn bound_path(path: &Path, ctm: &Matrix) -> Rect {
+    let path = path_pointer(path);
+    // SAFETY: the handle is live for the length of the borrow and `fz_bound_path`
+    // neither takes ownership of it nor throws - it walks the path, which is what
+    // the safe wrapper does too.
+    let r = unsafe { sys::fz_bound_path(ctx(), path, ptr::null(), ctm.clone().into()) };
+    Rect::new(r.x0, r.y0, r.x1, r.y1)
+}
 
 /// An image as the `data:` URI MuPDF's own SVG device would have written.
 ///
