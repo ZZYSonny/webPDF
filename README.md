@@ -4,7 +4,7 @@ Read a PDF in the browser: every page is an SVG, and **the text is real text** â
 selectable, searchable, copyable, hintable, and tiny â€” instead of thousands of
 glyph outlines.
 
-![the demo: a paper downloaded from arXiv, rendered as SVG with its real fonts, one line of chrome above it, and every match of a search boxed](docs/demo.png)
+![the demo: a paper downloaded from arXiv, rendered as SVG with its real fonts, one line of chrome above it, and every match of a search boxed](imgs/demo.png)
 
 The repository is two halves and a host between them:
 
@@ -432,6 +432,7 @@ ext/                        the browser extension: a shell around the viewer
 scripts/build-core-wasm.mjs the wasm build (Emscripten, and why the flags)
 scripts/build-extension.mjs the crx and the staged extension
 tests/                      node tests, and the browser suites
+imgs/demo.png               the README's picture of the app, written by demo.mjs
 vite.demo.config.ts         the demo build: the core's files, the PWA, the cache
 vite.ext.config.ts          the extension build
 ```
@@ -476,7 +477,7 @@ serves the demo, and drives all of it in Chromium over CDP:
 | `pwa.mjs` | the service worker, the kept engine, a redeploy, and the viewer with no network at all |
 | `extension.mjs` | the extension in a real browser: interception, CORS, the keyboard, the crx |
 
-`docs/demo.png` is written by `demo.mjs`; it is a deliverable, not a fixture.
+`imgs/demo.png` is written by `demo.mjs`; it is a deliverable, not a fixture.
 
 ### Publishing
 

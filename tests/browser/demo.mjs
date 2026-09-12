@@ -237,7 +237,7 @@ const open = async (value) => {
 };
 
 /**
- * The screenshot is a deliverable: `docs/demo.png` is the README's picture of
+ * The screenshot is a deliverable: `imgs/demo.png` is the README's picture of
  * the app, so it is taken on the public example with a match boxed - the same
  * view a reader gets when they open the published demo.
  *
@@ -246,8 +246,8 @@ const open = async (value) => {
  */
 const shot = async (file) => {
   await page.screenshot(file);
-  fs.copyFileSync(file, path.join(here, '..', '..', 'docs', 'demo.png'));
-  console.log('screenshot: ' + file + ' (+ docs/demo.png)');
+  fs.copyFileSync(file, path.join(here, '..', '..', 'imgs', 'demo.png'));
+  console.log('screenshot: ' + file + ' (+ imgs/demo.png)');
 };
 
 /** What the find bar says, and how much of it is boxed on the visible page. */
