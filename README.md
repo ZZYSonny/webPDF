@@ -1320,9 +1320,17 @@ the workflow to point that somewhere else, or to nothing at all.
   every page: 24 against 89 on *Attention* (15 pages), 27 against 88 on *ResNet*
   (12), 56 against 326 on *GPT-4* (100). The pass costs 0.5–2.3 s of background
   work on those three, so it is only taken up front for documents small enough to
-  afford it; past that the plan stays a window ahead of the reader. The renderer
-  and the viewer are not wired to it yet, so pages still build their own fonts
-  today.
+  afford it; past that the plan stays a window ahead of the reader. The engine can
+  render from it — `EngineOptions.preplanPages` — and a planned document registers
+  every face at page 1 and none after it (34 and 0 on *Attention*, and its first
+  page draws in 48 ms instead of 271 ms), which is the property the per-page
+  frames stand in for. It is **off by default**, and not out of caution: a font
+  that covers a document instead of a page has a different ascent and the
+  program's own advances rather than the distance to the next glyph, and that
+  moves a `<text>` element's box far enough to trip the crop suite's guard against
+  a crop slicing a line of text. Which of the two moves it, and whether the ink is
+  still inside the crop, is the next thing to settle; until then the per-page
+  fonts are what a document gets.
   What it does not buy is hinting: these runs are positioned per character with
   `text-rendering="geometricPrecision"`, exact outlines at subpixel positions,
   which is what hints are there to override.
