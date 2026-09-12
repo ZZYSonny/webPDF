@@ -6,7 +6,7 @@
  * a one-line change at the call site.
  */
 
-import type { DocumentInfo, PdfEngineLike, PdfSource, RenderOptions, RenderedPage } from '../core/engine.ts';
+import type { DocumentInfo, EngineOptions, PdfEngineLike, PdfSource, RenderOptions, RenderedPage } from '../core/engine.ts';
 import type { CropRect, CropRuleId } from '../core/crop.ts';
 import type { FontAsset } from '../core/font/registry.ts';
 import { engineWasmSources } from '../core/engine-wasm.ts';
@@ -33,7 +33,7 @@ export class WorkerEngine implements PdfEngineLike {
   /** Faces the host has already been given, so it never registers one twice. */
   private readonly delivered = new Set<string>();
 
-  constructor(worker: Worker) {
+  constructor(worker: Worker, options?: EngineOptions) {
     this.worker = worker;
     // Where the engine may come from is a decision made in *this* realm, and the
     // worker cannot see it: tell it before anything is asked of it, so that the
@@ -42,7 +42,10 @@ export class WorkerEngine implements PdfEngineLike {
     // something to say, so a worker whose host configured nothing keeps MuPDF's
     // own resolution.
     const sources = engineWasmSources();
-    if (sources.length) this.worker.postMessage({ wpdf: 'engine', sources });
+    // The same message carries how the engine is to be built: a worker cannot see
+    // the host's options any more than it can see its modules, and the options are
+    // read once, when the engine is.
+    if (sources.length || options) this.worker.postMessage({ wpdf: 'engine', sources, options });
     this.worker.addEventListener('message', (event: MessageEvent) => {
       const { id, ok, result, error } = event.data as {
         id: number;
@@ -75,7 +78,16 @@ export class WorkerEngine implements PdfEngineLike {
     this.fonts = [];
     this.staged.clear();
     this.delivered.clear();
-    return this.call<DocumentInfo>('open', [source, password]);
+    const info = await this.call<DocumentInfo>('open', [source, password]);
+    // A planned document built every face it will ever need while it was being
+    // opened, and they are part of opening it: handing them over here is what
+    // lets the viewer write them all in before the first page is laid out, and
+    // never touch the document's fonts again.
+    for (const asset of await this.call<FontAsset[]>('drainNewFonts', [])) {
+      this.staged.add(asset.family);
+      this.fonts.push(asset);
+    }
+    return info;
   }
 
   async renderPage(index: number, opts?: RenderOptions): Promise<RenderedPage> {
@@ -152,7 +164,7 @@ export class WorkerEngine implements PdfEngineLike {
  * Resolves to `null` when workers are unavailable, so callers can fall back to
  * rendering inline instead of failing.
  */
-export async function createWorkerEngine(url?: string | URL): Promise<WorkerEngine | null> {
+export async function createWorkerEngine(url?: string | URL, options?: EngineOptions): Promise<WorkerEngine | null> {
   if (typeof Worker === 'undefined') return null;
   try {
     // The `new Worker(new URL(...))` form must stay syntactically literal:
@@ -163,7 +175,7 @@ export async function createWorkerEngine(url?: string | URL): Promise<WorkerEngi
       : new Worker(new URL('./pdf.worker.ts', import.meta.url), { type: 'module', name: 'webpdf' });
     // A worker that fails to load only reports it asynchronously; probe it so
     // the caller gets a definite answer instead of a viewer that never renders.
-    const engine = new WorkerEngine(worker);
+    const engine = new WorkerEngine(worker, options);
     await engine.probe();
     return engine;
   } catch (error) {

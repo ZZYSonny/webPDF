@@ -21,11 +21,12 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import * as mupdf from 'mupdf';
+import * as fontkit from 'fontkit';
 
-import { FontRegistry } from '../src/core/font/registry.ts';
+import { FontRegistry, type FontAsset } from '../src/core/font/registry.ts';
 import { DocumentFontPlan } from '../src/core/font/plan.ts';
 import { PdfEngine } from '../src/core/engine.ts';
-import { scanGlyphOutlines, scanGlyphPlacements } from '../src/core/svg/glyphs.ts';
+import { isUsableCode, scanGlyphOutlines, scanGlyphPlacements } from '../src/core/svg/glyphs.ts';
 import { glyphLetters, ligatureCode } from '../src/core/svg/ligatures.ts';
 import { upgradeGlyphsToText } from '../src/core/svg/text-upgrade.ts';
 import { type TextChar } from '../src/core/svg/spaces.ts';
@@ -97,7 +98,7 @@ test('a document is planned whole, and its faces follow its fonts, not its pages
       const churned = new Set<string>();
       let covered = 0;
       let fellBack = 0;
-      const count = Math.min(doc.countPages(), 8);
+      const count = doc.countPages();
 
       for (let index = 0; index < count; index++) {
         const page = doc.loadPage(index);
@@ -138,6 +139,78 @@ test('a document is planned whole, and its faces follow its fonts, not its pages
         `      ${document.name}: ${planned.size} families planned over ${count} pages, ` +
           `against ${churned.size} built page by page (${plan.families().length} faces in the plan)`,
       );
+    } finally {
+      doc.destroy();
+    }
+  }
+});
+
+test('every character the plan writes reaches the glyph the page drew', async () => {
+  assert.ok(documents.length > 0, 'no corpus document could be read');
+
+  // The regression this exists for: the plan keeps *every* code a glyph was
+  // drawn with, so that a page asking for it by its own name still finds it, and
+  // two glyphs can be drawn with the same code under two encodings. Written
+  // twice into the cmap, the second claim wins and the page draws the wrong
+  // letter - invisible in the text, because the character is the right one.
+  const fonts = new Map<string, fontkit.Font>();
+  const fontFor = (asset: FontAsset): fontkit.Font => {
+    let font = fonts.get(asset.family);
+    if (!font) {
+      const base64 = /base64,([^)]+)\)/.exec(asset.css)?.[1];
+      assert.ok(base64, `${asset.family}: the face carries no bytes`);
+      font = fontkit.create(Buffer.from(base64, 'base64'));
+      fonts.set(asset.family, font);
+    }
+    return font;
+  };
+
+  for (const document of documents) {
+    const doc = mupdf.Document.openDocument(fs.readFileSync(document.file), 'application/pdf');
+    try {
+      const registry = new FontRegistry();
+      const plan = new DocumentFontPlan({ preplanPages: 200 });
+      await plan.cover(doc, 0, registry);
+
+      let checked = 0;
+      let unnamed = 0;
+      for (let index = 0; index < doc.countPages(); index++) {
+        const page = doc.loadPage(index);
+        try {
+          const svg = pageSvg(page);
+          const outlines = scanGlyphOutlines(svg);
+          const placements = scanGlyphPlacements(svg);
+          const letters = glyphLetters(readChars(page), placements);
+          const pagePlan = await plan.planPage(outlines, placements, { letters });
+          assert.ok(pagePlan, `${document.name}: page ${index + 1} was covered by the plan and then declined`);
+
+          for (const p of placements) {
+            // A glyph MuPDF could not name must stay an outline: writing U+FFFD
+            // asks the browser for a character the page never drew.
+            if (!isUsableCode(p.code)) {
+              const codes: Map<number, number> | undefined = pagePlan.fonts.get(p.fontId)?.codes;
+              assert.equal(codes?.get(p.gid), undefined, `${document.name}: page ${index + 1} wrote a glyph with no name as text`);
+              unnamed++;
+              continue;
+            }
+            const font = pagePlan.fonts.get(p.fontId);
+            if (!font) continue;
+            const code = font.codes.get(p.gid);
+            if (code === undefined) continue;
+            assert.ok(isUsableCode(code), `${document.name}: U+${code.toString(16)} is not a character`);
+            assert.equal(
+              fontFor(font.asset).glyphForCodePoint(code).name,
+              `gid${p.gid}`,
+              `${document.name}: page ${index + 1} asks for U+${code.toString(16)} and gets another glyph`,
+            );
+            checked++;
+          }
+        } finally {
+          page.destroy();
+        }
+      }
+      assert.ok(checked > 1000, `${document.name}: only ${checked} converted glyphs could be checked`);
+      console.log(`      ${document.name}: ${checked} characters reach the glyph the page drew (${unnamed} left unnamed)`);
     } finally {
       doc.destroy();
     }
@@ -266,16 +339,129 @@ test('a planned engine hands every face over at the first page, and none after',
   }
 });
 
-test('a document is left to its own fonts unless the plan is asked for', async () => {
+/**
+ * The plan changes which face a page is drawn with, and nothing else.
+ *
+ * A planned page and a page with its own fonts are the same drawing: the same
+ * characters, at the same positions, under the same transform. The family name
+ * is the one thing that differs, and it is not geometry. What closes the
+ * argument is the test above - every character reaches the glyph the page drew -
+ * so "same characters in the same places" is "same ink".
+ */
+test('a planned page draws what the per-page fonts drew', async () => {
   const document = documents[0];
   assert.ok(document, 'no corpus document could be read');
+  const bytes = new Uint8Array(fs.readFileSync(document.file));
 
-  const engine = new PdfEngine();
+  /** The glyphs a render writes as text: transform, size, and each (x, y, char). */
+  const textRuns = (svg: string): string[] => {
+    const runs: string[] = [];
+    for (const m of svg.matchAll(/<text([^>]*)>(.*?)<\/text>/g)) {
+      const transform = /transform="([^"]*)"/.exec(m[1])?.[1] ?? '';
+      const size = /font-size="([^"]*)"/.exec(m[1])?.[1] ?? '';
+      const chars: string[] = [];
+      for (const t of m[2].matchAll(/<tspan[^>]*x="([^"]*)"[^>]*y="([^"]*)"[^>]*>(.*?)<\/tspan>/g)) {
+        const xs = t[1].split(' ');
+        const ys = t[2].split(' ');
+        const text = [...t[3]];
+        for (let i = 0; i < text.length; i++) chars.push(`${xs[i]},${ys[i]},${text[i]}`);
+      }
+      runs.push(`${transform}|${size}|${chars.join(' ')}`);
+    }
+    return runs;
+  };
+
+  const planned = new PdfEngine();
+  const perPage = new PdfEngine({ preplanPages: 0 });
   try {
-    await engine.open(new Uint8Array(fs.readFileSync(document.file)));
-    assert.equal(engine.plannedFonts().length, 0, 'nothing should be planned without `preplanPages`');
-    const page = await engine.renderPage(0);
-    assert.ok(page.fonts.length > 0, 'the page still needs its own fonts');
+    await planned.open(bytes);
+    await perPage.open(bytes);
+    let runs = 0;
+    for (let index = 0; index < Math.min(5, planned.documentInfo.pageCount); index++) {
+      const a = await perPage.renderPage(index, { textMode: 'auto', responsive: false });
+      const b = await planned.renderPage(index, { textMode: 'auto', responsive: false });
+      const one = textRuns(a.svg);
+      const two = textRuns(b.svg);
+      assert.ok(one.length > 0, `page ${index + 1} produced no text`);
+      assert.deepEqual(two, one, `page ${index + 1}: the planned render is not the per-page render`);
+      assert.equal(
+        (b.svg.match(/<use /g) ?? []).length,
+        (a.svg.match(/<use /g) ?? []).length,
+        `page ${index + 1}: a different number of glyphs stayed outlines`,
+      );
+      runs += one.length;
+    }
+    console.log(`      ${runs} text runs across 5 pages, character for character the same`);
+  } finally {
+    planned.close();
+    perPage.close();
+  }
+});
+
+test('a document is planned by default, and `preplanPages: 0` is how a host opts out', async () => {
+  const document = documents[0];
+  assert.ok(document, 'no corpus document could be read');
+  const bytes = new Uint8Array(fs.readFileSync(document.file));
+
+  const planned = new PdfEngine();
+  const plain = new PdfEngine({ preplanPages: 0 });
+  try {
+    await planned.open(bytes);
+    await plain.open(bytes);
+    assert.ok(planned.plannedFonts().length > 0, 'a document should be planned without being asked');
+    assert.equal(plain.plannedFonts().length, 0, '`preplanPages: 0` should plan nothing');
+
+    const mine = await plain.renderPage(0);
+    assert.ok(mine.fonts.length > 0, 'a page rendered without the plan still needs its own fonts');
+    // The plan is what the viewer's single document rests on, so the faces have
+    // to be in hand before the page that needs them is.
+    const first = await planned.renderPage(0);
+    assert.equal(
+      planned.drainNewFonts().length,
+      planned.plannedFonts().length,
+      'every planned face should arrive with the first page',
+    );
+    console.log(
+      `      planned: ${planned.plannedFonts().length} faces up front, ${first.stats.glyphsAsText} glyphs as text; ` +
+        `per-page: ${mine.fonts.length} faces for the page`,
+    );
+  } finally {
+    planned.close();
+    plain.close();
+  }
+});
+
+/**
+ * A document past the preplan budget is planned the other way: the window
+ * advances with the reading, and every page it reaches is still covered. This is
+ * the path a long document takes, and it used to build nothing at all - `cover`
+ * only built once the document was complete, so a long document silently got no
+ * planned fonts and quietly fell back to a face per page.
+ */
+test('a document past the budget is planned a window ahead, page by page', async () => {
+  // Longer than the window itself, or the first cover would walk the whole
+  // document and there would be nothing left to grow into.
+  const files = await ensurePapers([PAPERS[2].url]);
+  const file = files.get(PAPERS[2].url);
+  assert.ok(typeof file === 'string', `${PAPERS[2].label} could not be read`);
+
+  const engine = new PdfEngine({ preplanPages: 3 });
+  try {
+    await engine.open(new Uint8Array(fs.readFileSync(file)));
+    assert.ok(engine.documentInfo.pageCount > 25, `${PAPERS[2].label} should be longer than the window`);
+    assert.ok(engine.plannedFonts().length > 0, 'the first window should be planned at open');
+    const atOpen = engine.plannedFonts().length;
+    let text = 0;
+    for (let index = 0; index < 20; index++) {
+      const page = await engine.renderPage(index);
+      text += page.stats.glyphsAsText;
+    }
+    assert.ok(
+      engine.plannedFonts().length > atOpen,
+      `a windowed plan must keep building: ${atOpen} faces at open, ${engine.plannedFonts().length} after 20 pages`,
+    );
+    assert.ok(text > 5000, `only ${text} glyphs became text through the window`);
+    console.log(`      ${atOpen} faces at open, ${engine.plannedFonts().length} after 20 pages, ${text} glyphs as text`);
   } finally {
     engine.close();
   }

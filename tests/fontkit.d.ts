@@ -2,6 +2,7 @@
 declare module 'fontkit' {
   export interface Glyph {
     id: number;
+    name: string;
     advanceWidth: number;
     path: { commands: unknown[]; toSVG(): string };
   }

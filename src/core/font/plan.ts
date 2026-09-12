@@ -30,7 +30,7 @@ import * as mupdf from 'mupdf';
 
 import { glyphsFromFont, glyphsFromProgram, pageGlyphs, programId, programsOnPage, type FontProgram } from './program.ts';
 import { glyphLetters, ligatureCode } from '../svg/ligatures.ts';
-import { type GlyphOutline, type GlyphPlacement } from '../svg/glyphs.ts';
+import { glyphKey, type GlyphOutline, type GlyphPlacement } from '../svg/glyphs.ts';
 import { type TextChar } from '../svg/spaces.ts';
 import { PUA_BASE, PUA_LIMIT, type OutlineGlyph } from './build.ts';
 import { FontRegistry, type FontAsset, type PageFontPlan } from './registry.ts';
@@ -117,6 +117,15 @@ export interface DocumentFontPlanOptions {
 
 export class DocumentFontPlan {
   private readonly entries = new Map<string, Entry>();
+  /**
+   * The entries that have grown since they were last built.
+   *
+   * Building a face means hashing every glyph in it, so a plan that rebuilt
+   * everything every time a page was covered would spend the document hashing
+   * fonts that had not changed. A windowed plan walks a page at a time, so this
+   * is what keeps the one-time cost one-time.
+   */
+  private readonly dirty = new Set<Entry>();
   private readonly opts: Required<Pick<DocumentFontPlanOptions, 'preplanPages' | 'ahead'>> & DocumentFontPlanOptions;
   private registry: FontRegistry | null = null;
   /** Pages walked so far, in order. */
@@ -151,7 +160,10 @@ export class DocumentFontPlan {
       debug('font plan: walked', upto, 'pages in', Date.now() - started, 'ms');
     }
     if (whole) this.complete = true;
-    if (this.complete) await this.buildAll();
+    // Whatever has been walked is built, whether or not the document is done: a
+    // windowed plan is the only way a long document is covered at all, and an
+    // entry that is not built is an entry whose pages keep their outlines.
+    await this.buildAll();
   }
 
   /**
@@ -186,8 +198,12 @@ export class DocumentFontPlan {
       const entry = this.match(fontId, drawn, outlines, byGid);
       // Something this page drew that the plan has never seen: rather than guess
       // at a family, the caller keeps building a font for the page it drew.
-      if (!entry || !entry.asset) return null;
+      if (!entry) return null;
+      // A font the plan knows but could build nothing from - every glyph of it
+      // unnamed, or a build that failed - is not a reason to give the whole page
+      // up: its glyphs stay outlines, which is what they would have been anyway.
       const asset = entry.asset;
+      if (!asset) continue;
       if (!seen.has(asset.family)) {
         seen.add(asset.family);
         assets.push(asset);
@@ -221,20 +237,33 @@ export class DocumentFontPlan {
         const { outlines, advances } = glyphsFromFont(handle, fresh);
         for (const [gid, d] of outlines) entry.outlines.set(gid, d);
         for (const [gid, advance] of advances) entry.advances.set(gid, advance);
+        this.dirty.add(entry);
       });
 
       for (const font of fonts) {
         const entry = this.entryFor(font);
-        for (const gid of font.gids) entry.seen.add(gid);
+        let grew = false;
+        for (const gid of font.gids) {
+          if (!entry.seen.has(gid)) {
+            entry.seen.add(gid);
+            grew = true;
+          }
+        }
         for (const [gid, code] of font.codes) {
+          if (!entry.byCode.has(code)) grew = true;
           entry.byCode.set(code, gid);
           const codes = entry.codesByGid.get(gid);
           if (codes) {
-            if (!codes.includes(code)) codes.push(code);
+            if (!codes.includes(code)) {
+              codes.push(code);
+              grew = true;
+            }
           } else {
             entry.codesByGid.set(gid, [code]);
+            grew = true;
           }
         }
+        if (grew) this.dirty.add(entry);
       }
 
       // Which letters a glyph stands for, matched by the origin the display list
@@ -255,7 +284,10 @@ export class DocumentFontPlan {
           if ([...letters].length < 2) continue;
           const gid = Number(key.split(':')[1]);
           const entry = this.entryFor(fonts[Number(key.split(':')[0])]);
-          if (!entry.letters.has(gid)) entry.letters.set(gid, letters);
+          if (!entry.letters.has(gid)) {
+            entry.letters.set(gid, letters);
+            this.dirty.add(entry);
+          }
         }
       }
     } finally {
@@ -286,9 +318,12 @@ export class DocumentFontPlan {
     return entry;
   }
 
-  /** Draw every glyph of every embedded program, and build every face. */
+  /** Draw every glyph the entries that grew are missing, and build those faces. */
   private async buildAll(): Promise<void> {
-    for (const entry of this.entries.values()) {
+    if (this.dirty.size === 0) return;
+    const entries = [...this.dirty];
+    this.dirty.clear();
+    for (const entry of entries) {
       if (!entry.program) continue;
       const fresh = [...entry.seen].filter((gid) => !entry.outlines.has(gid));
       if (fresh.length === 0) continue;
@@ -296,7 +331,7 @@ export class DocumentFontPlan {
       for (const [gid, d] of outlines) entry.outlines.set(gid, d);
       for (const [gid, advance] of advances) entry.advances.set(gid, advance);
     }
-    for (const entry of this.entries.values()) await this.build(entry);
+    for (const entry of entries) await this.build(entry);
   }
 
   private async build(entry: Entry): Promise<void> {
@@ -310,7 +345,10 @@ export class DocumentFontPlan {
 
     // A code belongs to one glyph or it belongs to none: a program used with two
     // encodings can name the same code for two different glyphs, and a cmap that
-    // guessed would draw the wrong letter.
+    // guessed would draw the wrong letter. Decided from scratch, so a font that
+    // grew is a font that is encoded again rather than one carrying the answers
+    // of an earlier, smaller self.
+    entry.codeOf.clear();
     const assigned = new Set<number>();
     for (const [code, gid] of entry.byCode) {
       if (!entry.outlines.has(gid) || assigned.has(code)) continue;
@@ -326,11 +364,16 @@ export class DocumentFontPlan {
       entry.codeOf.set(gid, code);
       assigned.add(code);
     }
-    // Anything left is reachable by a private-use code: every glyph in the font
-    // is one the browser can be asked to draw.
+    // Anything left is reachable by a private-use code: every glyph the document
+    // wrote a character for is one the browser can be asked to draw. A glyph no
+    // page could name at all is *not* - MuPDF reports no character for it, and
+    // inventing one would put a private-use character into the text where the
+    // per-page pipeline left an outline.
     let nextPua = PUA_BASE;
     for (const gid of gids) {
       if (entry.codeOf.has(gid)) continue;
+      const named = (entry.codesByGid.get(gid)?.length ?? 0) > 0 || entry.letters.has(gid);
+      if (!named) continue;
       while (nextPua <= PUA_LIMIT && assigned.has(nextPua)) nextPua++;
       if (nextPua > PUA_LIMIT) continue;
       entry.codeOf.set(gid, nextPua);
@@ -338,12 +381,36 @@ export class DocumentFontPlan {
     }
 
     const glyphs: OutlineGlyph[] = [];
+    // The cmap is built here rather than handed to the font builder, because a
+    // code has to reach exactly one glyph. Every code a glyph was drawn with
+    // goes in - a page that asks for it under its own name must find it - but a
+    // code another glyph already owns is *left out*, not written twice: the
+    // writer keeps the last glyph to claim one, so a second claim draws the
+    // wrong letter. That is what `assigned` above is for, and this is where it
+    // has to be honoured.
+    const cmap = new Map<number, number>();
     for (const gid of gids) {
       const code = entry.codeOf.get(gid);
-      if (code === undefined) continue;
-      // Every code the glyph was drawn for goes in the cmap too, so a page that
-      // asks for it by its own name still finds the right glyph.
-      const codes = [code, ...(entry.codesByGid.get(gid) ?? [])].filter((c, i, all) => all.indexOf(c) === i);
+      if (code !== undefined && !cmap.has(code)) cmap.set(code, gid);
+    }
+    for (const gid of gids) {
+      for (const code of entry.codesByGid.get(gid) ?? []) {
+        if (!cmap.has(code)) cmap.set(code, gid);
+      }
+    }
+    const codesOf = new Map<number, number[]>();
+    for (const [code, gid] of cmap) {
+      const list = codesOf.get(gid);
+      if (list) list.push(code);
+      else codesOf.set(gid, [code]);
+    }
+
+    for (const gid of gids) {
+      const codes = codesOf.get(gid);
+      // A glyph no code could be found for is not reachable anyway, and the
+      // font builder's own last-resort numbering knows nothing about the codes
+      // chosen above, so it would be free to collide with one of them.
+      if (!codes || codes.length === 0) continue;
       glyphs.push({ gid, d: entry.outlines.get(gid) ?? '', codes, advanceEm: entry.advances.get(gid) });
     }
     if (glyphs.length === 0) return;
@@ -365,8 +432,15 @@ export class DocumentFontPlan {
    * The SVG's numbering is not resource order and not first use - a page can
    * start at `font_4`, and one program gets several ids when a Form XObject
    * carries its own copy - so the link is made by the outlines themselves, which
-   * are the same bytes either way. The code the page recorded for each glyph is
-   * the tie-break, because two subsets of one face can draw identically.
+   * are the same bytes either way.
+   *
+   * Two entries can carry the same outlines - the same face embedded twice - and
+   * either of them draws the page correctly, so a tie is not a reason to give
+   * up: it is a reason to prefer the entry that would write the page's *own*
+   * characters for those glyphs, and failing that the larger font, which is the
+   * one more likely to still have the glyph next time. Refusing the page
+   * instead would send it back to a face of its own, which is the one thing the
+   * plan exists to avoid.
    */
   private match(
     fontId: number,
@@ -375,29 +449,28 @@ export class DocumentFontPlan {
     codes: ReadonlyMap<number, number>,
   ): Entry | null {
     let best: Entry | null = null;
-    let bestScore = 0;
-    let tied = false;
+    let bestScore = -1;
     for (const entry of this.entries.values()) {
       if (entry.outlines.size === 0) continue;
-      let score = 0;
+      let agrees = 0;
+      let matches = true;
       for (const gid of gids) {
-        if (entry.outlines.get(gid) !== outlines.get(`${fontId}:${gid}`)?.d) {
-          score = -1;
+        if (entry.outlines.get(gid) !== outlines.get(glyphKey(fontId, gid))?.d) {
+          matches = false;
           break;
         }
-        if (entry.byCode.get(codes.get(gid) ?? -1) === gid) score++;
+        const code = codes.get(gid);
+        if (code !== undefined && entry.codeOf.get(gid) === code) agrees++;
       }
-      if (score < 0) continue;
-      score += 1;
+      if (!matches) continue;
+      // Agreement first, then size: a page's characters are worth more than a
+      // font's completeness, and neither is worth a coin toss.
+      const score = agrees * 0x10000 + Math.min(entry.outlines.size, 0xffff);
       if (score > bestScore) {
-        best = entry;
         bestScore = score;
-        tied = false;
-      } else if (score === bestScore) {
-        tied = true;
+        best = entry;
       }
     }
-    if (!best || tied) return null;
     return best;
   }
 }

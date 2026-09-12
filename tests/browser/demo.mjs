@@ -57,18 +57,17 @@ await page.send('Page.addScriptToEvaluateOnNewDocument', {
     };
 
     /**
-     * A page is drawn in its own frame, so "the pages on screen" and "the fonts
-     * the document was told about" are questions about a tree of documents, not
-     * one. Both helpers are installed in every document and answer for the whole
-     * tree from the top.
+     * The pages and their fonts live in this one document, inside the viewer's
+     * shadow root. The helpers below are written the way a reader would ask:
+     * "the pages on screen", "the text in them", "the faces this document was
+     * told about".
      */
     window.__pages = () => {
       const sr = document.getElementById('viewer')?.shadowRoot;
       if (!sr) return [];
       return [...sr.querySelectorAll('.wpdf-page')];
     };
-    window.__pageSvg = (el) =>
-      el.querySelector('svg.wpdf-page-svg') ?? el.querySelector('iframe')?.contentDocument?.querySelector('svg.wpdf-page-svg') ?? null;
+    window.__pageSvg = (el) => el.querySelector('svg.wpdf-page-svg');
     window.__pageSvgs = () => window.__pages().map(window.__pageSvg).filter(Boolean);
     window.__svgOfPage = (n) => {
       const sr = document.getElementById('viewer')?.shadowRoot;
@@ -77,41 +76,29 @@ await page.send('Page.addScriptToEvaluateOnNewDocument', {
     };
     window.__pageLinks = (kind) =>
       window.__pageSvgs().flatMap((svg) => [...svg.querySelectorAll('a[data-wpdf-link="' + kind + '"]')]);
-    /** A rect in this page's coordinates, even for an element in a page frame. */
+    /** A rect in the page's own coordinates: the pages are in this document. */
     window.__pageRect = (el) => {
       const r = el.getBoundingClientRect();
-      const win = el.ownerDocument.defaultView;
-      const frame = win === window ? null : win.frameElement;
-      if (!frame) return { left: r.left, top: r.top, right: r.right, bottom: r.bottom, width: r.width, height: r.height };
-      const f = frame.getBoundingClientRect();
-      return { left: f.left + r.left, top: f.top + r.top, right: f.left + r.right, bottom: f.top + r.bottom, width: r.width, height: r.height };
+      return { left: r.left, top: r.top, right: r.right, bottom: r.bottom, width: r.width, height: r.height };
     };
-    /** What is really under a point: through the shadow root, and through a page frame. */
+    /** What is really under a point, through the viewer's shadow root. */
     window.__elementAt = (x, y) => {
       const sr = document.getElementById('viewer')?.shadowRoot;
-      let el = sr ? sr.elementFromPoint(x, y) : document.elementFromPoint(x, y);
-      for (let i = 0; i < 4 && el && el.tagName === 'IFRAME'; i++) {
-        const inner = el.contentDocument;
-        if (!inner) break;
-        const r = el.getBoundingClientRect();
-        el = inner.elementFromPoint(x - r.left, y - r.top);
-      }
-      return el;
+      return sr ? sr.elementFromPoint(x, y) : document.elementFromPoint(x, y);
     };
     window.__pageTexts = () => window.__pageSvgs().flatMap((svg) => [...svg.querySelectorAll('text')]);
-    window.__pageCss = () =>
-      window.__pageSvgs()
-        .map((svg) => {
-          const doc = svg.ownerDocument;
-          const sheets = [...doc.adoptedStyleSheets].map((s) => [...s.cssRules].map((r) => r.cssText).join('\\n'));
-          return [...sheets, ...[...doc.querySelectorAll('style')].map((s) => s.textContent ?? '')].join('\\n');
-        })
-        .join('\\n');
+    /** Every stylesheet the pages' document carries: the faces are registered there. */
+    window.__pageCss = () => {
+      const doc = window.__pageSvgs()[0]?.ownerDocument ?? document;
+      const sheets = [...doc.adoptedStyleSheets].map((s) => [...s.cssRules].map((r) => r.cssText).join('\\n'));
+      return [...sheets, ...[...doc.querySelectorAll('style')].map((s) => s.textContent ?? '')].join('\\n');
+    };
     window.__allFaces = () => {
       const out = [{ id: 'top', faces: [...(window.__faces ?? [])] }];
       const seen = new Set([document]);
-      // A page frame lives inside the viewer's shadow root, where window.frames
-      // does not look: the iframes are found in the DOM instead.
+      // A frame is not supposed to be there at all any more, and this is what
+      // says so: every document reachable from here is walked, so a face
+      // registered in one would be counted rather than hidden.
       const visit = (doc) => {
         const frames = [];
         const scan = (root) => {
@@ -188,18 +175,19 @@ const searchState = () =>
     const page = document.getElementById('pageno').value;
     const box = sr.querySelector(`.wpdf-page[data-page="${page}"]`);
     const bands = (root) => root.querySelectorAll('rect[data-wpdf-search]').length;
-    // A page's bands are drawn in the page's own document, so both the total and
-    // the page's own count are read there.
-    const perPage = window.__pageSvgs().map((svg) => bands(svg.ownerDocument));
+    // A band is a child of the page's own `svg`, so it is counted there rather
+    // than in the document: the pages share one document now, and a
+    // document-wide count would be every page's bands at once.
+    const perPage = window.__pageSvgs().map((svg) => bands(svg));
     return {
       count: document.getElementById('search-count')?.textContent ?? '',
       pageno: page,
       highlights: perPage.reduce((a, b) => a + b, 0),
       activeHighlights: window
         .__pageSvgs()
-        .reduce((n, svg) => n + svg.ownerDocument.querySelectorAll('rect[data-wpdf-search="active"]').length, 0),
+        .reduce((n, svg) => n + svg.querySelectorAll('rect[data-wpdf-search="active"]').length, 0),
       // Boxes on the page we are looking at, active and inactive together.
-      bandsOnPage: box && window.__pageSvg(box) ? bands(window.__pageSvg(box).ownerDocument) : 0,
+      bandsOnPage: box && window.__pageSvg(box) ? bands(window.__pageSvg(box)) : 0,
     };
   });
 
@@ -217,12 +205,11 @@ const linkCandidates = (kind) =>
     const out = [];
     for (const svg of window.__pageSvgs()) {
       for (const a of svg.querySelectorAll('a[data-wpdf-link="${kind}"]')) {
-        // In this page's coordinates: a link in a page frame is offset by its frame.
         const r = window.__pageRect(a);
         if (r.width < 2 || r.height < 2) continue;
         if (r.top < chrome + 8 || r.bottom > innerHeight - 8) continue;
         out.push({
-          slot: a.ownerDocument.defaultView?.frameElement?.closest('.wpdf-page')?.dataset.page ?? null,
+          slot: a.closest('.wpdf-page')?.dataset.page ?? null,
           page: a.getAttribute('data-wpdf-page'),
           dest: a.getAttribute('data-wpdf-y'),
           uri: a.getAttribute('data-wpdf-uri'),
@@ -775,7 +762,7 @@ try {
     await new Promise((r) => setTimeout(r, 400));
     const cleared = await page.evaluate(() => ({
       count: document.getElementById('search-count').textContent,
-      highlights: window.__pageSvgs().reduce((n, svg) => n + svg.ownerDocument.querySelectorAll('rect[data-wpdf-search]').length, 0),
+      highlights: window.__pageSvgs().reduce((n, svg) => n + svg.querySelectorAll('rect[data-wpdf-search]').length, 0),
     }));
     if (cleared.highlights !== 0 || cleared.count !== '') fail(`clearing should remove the boxes, got ${JSON.stringify(cleared)}`);
   }
@@ -856,8 +843,9 @@ try {
         .find((el) => el.getAttribute('data-wpdf-page') !== '2');
       if (!a) return null;
       a.focus();
-      // Focus on a page frame's element lands in that frame's document.
-      return { page: a.getAttribute('data-wpdf-page'), active: a.ownerDocument.activeElement === a };
+      // The hit areas live in the viewer's shadow root, so the active element is
+      // the root's, one step in from the document's.
+      return { page: a.getAttribute('data-wpdf-page'), active: (a.getRootNode()).activeElement === a };
     })()`);
     if (!focused) fail('no internal link to focus on page 2');
     else if (!focused.active) fail('an <a tabindex="0"> hit area did not take focus');
@@ -1650,19 +1638,22 @@ try {
 
   // ------------------------------------------------------------- the fonts
   /**
-   * A face is registered once, in the page it belongs to.
+   * Every face goes in once, before the first page, and never again.
    *
-   * This is the cost that used to land on a page boundary: a page brings its
-   * `@font-face` rules with it, and telling a document about one makes the
-   * browser lay out every text run in that document again - a whole-viewport
-   * re-layout in the frame where a new page arrives. A page therefore gets its
-   * own document and keeps its own faces in it: the viewer's document is never
-   * told about a font at all, and no document is told about one twice. The
-   * redraw below (a fade on and off) re-renders every page and registers nothing
-   * anywhere, because those documents already have what those pages need.
+   * This is the cost that used to land on a page boundary: telling a document
+   * about a `@font-face` makes the browser lay out every text run in that
+   * document again, so a page arriving with a face of its own used to re-lay-out
+   * the whole viewport. The engine now plans the document's fonts while it opens
+   * it - one face per *font*, not per page - and the viewer writes them into its
+   * own document before the first page is laid out. There is one document, no
+   * page is a document of its own, and a redraw (a fade on and off, which
+   * re-renders every page) registers nothing at all.
    */
-  console.log('— fonts belong to the page that needs them —');
+  console.log('— every face goes in once, before the first page —');
   const facesBefore = await page.evaluate('window.__allFaces()');
+  const framesBefore = await page.evaluate(
+    "document.getElementById('viewer').shadowRoot.querySelectorAll('iframe').length",
+  );
   await page.evaluate(() => window.webpdf.viewer().setBionic(true, 0.4));
   await new Promise((r) => setTimeout(r, 1500));
   await page.evaluate(() => window.webpdf.viewer().setBionic(false));
@@ -1674,26 +1665,50 @@ try {
     return d.faces.filter((f) => (seen.has(f) ? true : (seen.add(f), false))).map((f) => `${d.id}:${f}`);
   });
   const top = facesAfter.find((d) => d.id === 'top');
-  const perPage = facesAfter.filter((d) => d.id !== 'top');
   console.log(
     'fonts: ' +
       JSON.stringify({
         documents: facesAfter.length,
         registered: total(facesAfter),
         inTheViewerDocument: top?.faces.length ?? 0,
-        perPage: perPage.map((d) => d.faces.length),
+        perPageDocuments: facesAfter.length - 1,
+        pageFrames: framesBefore,
         repeated: repeated.length,
         afterRedraw: total(facesAfter) - total(facesBefore),
       }),
   );
   if (total(facesAfter) === 0) fail('no font face was registered at all, so the pages are not drawn with the fonts they were built with');
-  if (top && top.faces.length > 0) {
-    fail(`the viewer's own document was told about ${top.faces.length} font faces; a page's fonts belong to the page's document`);
-  }
+  if (framesBefore) fail(`${framesBefore} page frame(s) are still in the viewer: a page should not need a document of its own`);
+  // Every face in the one document the pages are in. (The demo shell's own print
+  // frame is a document too, and it holds none.)
+  const withFaces = facesAfter.filter((d) => d.faces.length > 0).length;
+  if (withFaces !== 1) fail(`the pages' faces are spread over ${withFaces} documents; a planned document should be one`);
   if (repeated.length) fail(`the same font face was registered twice in one document: ${JSON.stringify(repeated.slice(0, 4))}`);
   if (total(facesAfter) !== total(facesBefore)) {
-    fail(`re-rendering the pages registered ${total(facesAfter) - total(facesBefore)} more font faces (those documents already had them)`);
+    fail(`re-rendering the pages registered ${total(facesAfter) - total(facesBefore)} more font faces (the document already had them)`);
   }
+
+  // The claim the whole plan exists for: past the first page, scrolling a
+  // planned document registers nothing - so the browser is never asked to lay
+  // the document out again while the reader is reading it.
+  console.log('— and no page after the first registers anything —');
+  const far = Number(await page.evaluate('window.webpdf.info().pageCount'));
+  await page.evaluate(`(() => {
+    const input = document.getElementById('pageno');
+    input.value = ${JSON.stringify(String(far))};
+    input.dispatchEvent(new Event('change'));
+  })()`);
+  await waitForPage(far);
+  await new Promise((r) => setTimeout(r, 900));
+  const facesLast = await page.evaluate('window.__allFaces()');
+  const framesAfter = await page.evaluate(
+    "document.getElementById('viewer').shadowRoot.querySelectorAll('iframe').length",
+  );
+  console.log('  ' + JSON.stringify({ lastPage: far, documents: facesLast.length, registered: total(facesLast), pageFrames: framesAfter }));
+  if (total(facesLast) !== total(facesAfter)) {
+    fail(`reaching the last page registered ${total(facesLast) - total(facesAfter)} more font faces`);
+  }
+  if (framesAfter) fail(`${framesAfter} page frame(s) appeared on the way to the last page`);
 
   // ------------------------------------------------------------- the bar
   /**

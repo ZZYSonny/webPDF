@@ -19,11 +19,12 @@
  * The protocol is deliberately tiny - `{ id, method, args }` in, `{ id, ok,
  * result | error }` out - because the very same `PdfEngine` also runs inline;
  * there is no second implementation to keep in sync. One message is not part of
- * it: `{ wpdf: 'engine', sources }`, which this worker's realm needs because it
- * cannot see the page's modules.
+ * it: `{ wpdf: 'engine', sources, options }`, which this worker's realm needs
+ * because it cannot see the page's modules - not where the wasm is, and not how
+ * the engine is to be built.
  */
 
-import type { PdfEngineLike, PdfSource, RenderOptions } from '../core/engine.ts';
+import type { EngineOptions, PdfEngineLike, PdfSource, RenderOptions } from '../core/engine.ts';
 import type { CropRuleId } from '../core/crop.ts';
 import { configureEngineWasm, loadEngine, type EngineWasmConfig } from '../core/engine-wasm.ts';
 
@@ -33,9 +34,10 @@ interface Request {
   args: unknown[];
 }
 
-/** Where to get the engine, sent by whoever created this worker. */
+/** Where to get the engine, and how to build it, sent by whoever created this worker. */
 interface EngineMessage extends EngineWasmConfig {
   wpdf: 'engine';
+  options?: EngineOptions;
 }
 
 function isEngineMessage(data: unknown): data is EngineMessage {
@@ -43,9 +45,11 @@ function isEngineMessage(data: unknown): data is EngineMessage {
 }
 
 let engine: Promise<PdfEngineLike> | null = null;
+/** How the host asked for the engine to be built, before it is built. */
+let engineOptions: EngineOptions | undefined;
 
 function getEngine(): Promise<PdfEngineLike> {
-  engine ??= loadEngine().then((mod) => new mod.PdfEngine());
+  engine ??= loadEngine().then((mod) => new mod.PdfEngine(engineOptions));
   return engine;
 }
 
@@ -68,6 +72,8 @@ self.onmessage = async (event: MessageEvent<Request | EngineMessage>) => {
   // the engine, and it has to find the sources already in place.
   if (isEngineMessage(data)) {
     configureEngineWasm(data);
+    // Only before the engine exists: the options are read once, when it is built.
+    if (!engine && data.options) engineOptions = data.options;
     return;
   }
   const { id, method, args } = data ?? ({} as Request);

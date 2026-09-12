@@ -65,18 +65,30 @@ export function parseAttributes(s: string): Attribute[] {
   return out;
 }
 
+/**
+ * True when a code point a glyph was drawn for is one a `<text>` run may carry.
+ *
+ * MuPDF substitutes U+FFFD for a glyph it cannot name - a lone surrogate, a
+ * glyph with no Unicode of its own - so U+FFFD is the *absence* of a character
+ * rather than one, and writing it into a run asks the browser for a glyph the
+ * page never drew. It is also the one substitution `data-text` carries, so this
+ * is the rule both the per-page fonts and the document-wide plan have to apply;
+ * they used to disagree, and the plan turned every such glyph into a
+ * replacement character.
+ */
+export function isUsableCode(code: number): boolean {
+  return Number.isInteger(code) && code > 0 && code <= 0x10ffff && code !== 0xfffd;
+}
+
 /** Decode the numeric character references MuPDF writes into `data-text`. */
 export function decodeNumericRefs(s: string): number {
   if (!s) return -1;
-  let value = s;
+  const value = s;
   const ent = /^&#x([0-9a-fA-F]+);$/.exec(s) ?? /^&#(\d+);$/.exec(s);
   if (ent) {
     const n = ent[1];
     const cp = s.startsWith('&#x') ? parseInt(n, 16) : parseInt(n, 10);
-    if (!Number.isFinite(cp) || cp <= 0 || cp > 0x10ffff) return -1;
-    // MuPDF substitutes U+FFFD for lone surrogates, which carries no meaning.
-    if (cp === 0xfffd) return -1;
-    return cp;
+    return isUsableCode(cp) ? cp : -1;
   }
   if (value === '&amp;') return 0x26;
   if (value === '&quot;') return 0x22;
@@ -84,7 +96,7 @@ export function decodeNumericRefs(s: string): number {
   if (value === '&lt;') return 0x3c;
   if (value === '&gt;') return 0x3e;
   const cp = value.codePointAt(0);
-  return cp === undefined ? -1 : cp;
+  return cp === undefined || !isUsableCode(cp) ? -1 : cp;
 }
 
 export function parseMatrix(value: string): Matrix6 | null {

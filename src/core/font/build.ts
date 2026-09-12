@@ -119,6 +119,11 @@ export function buildFontFromOutlines(glyphs: readonly OutlineGlyph[], opts: Bui
 
   let minY = Infinity;
   let maxY = -Infinity;
+  // Every code that has been spoken for, so the last-resort assignment below
+  // cannot hand a glyph a code another glyph already answers to - which would
+  // make the browser draw the wrong one.
+  const claimed = new Set<number>();
+  let nextPua = PUA_BASE;
 
   for (const g of glyphs) {
     let commands: PathCommand[];
@@ -144,10 +149,17 @@ export function buildFontFromOutlines(glyphs: readonly OutlineGlyph[], opts: Bui
         : Math.max(bounds.x1, bounds.x0 + 0.02) || 0.5;
 
     const unicodes = [...new Set(g.codes.filter((c) => Number.isFinite(c) && c > 0 && c <= 0x10ffff))];
+    if (unicodes.length === 0) {
+      while (nextPua <= PUA_LIMIT && claimed.has(nextPua)) nextPua++;
+      // Out of private-use room: the glyph stays in the font with no code at
+      // all rather than taking one that already means something else.
+      if (nextPua <= PUA_LIMIT) unicodes.push(nextPua++);
+    }
+    for (const c of unicodes) claimed.add(c);
     fontGlyphs.push(
       new opentype.Glyph({
         name: `gid${g.gid}`,
-        unicodes: unicodes.length ? unicodes : [PUA_BASE + fontGlyphs.length],
+        unicodes,
         advanceWidth: Math.round(advanceEm * unitsPerEm),
         path,
       }),

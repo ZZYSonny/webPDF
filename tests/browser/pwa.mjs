@@ -79,7 +79,7 @@ const PROBE = `(() => {
     const sr = document.getElementById('viewer')?.shadowRoot;
     if (!sr) return [];
     return [...sr.querySelectorAll('.wpdf-page')]
-      .map((el) => el.querySelector('svg.wpdf-page-svg') ?? el.querySelector('iframe')?.contentDocument?.querySelector('svg.wpdf-page-svg'))
+      .map((el) => el.querySelector('svg.wpdf-page-svg'))
       .filter(Boolean);
   };
   window.__kept = async () => {

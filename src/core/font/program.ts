@@ -26,6 +26,8 @@
 
 import * as mupdf from 'mupdf';
 
+import { isUsableCode } from '../svg/glyphs.ts';
+
 /** Which descriptor key the program was found under. */
 export type ProgramKey = 'FontFile' | 'FontFile2' | 'FontFile3';
 
@@ -231,8 +233,10 @@ export function pageGlyphs(
     }
     const entry = fonts[fontId];
     entry.gids.add(gid);
-    // The first code wins for a gid, as the SVG's own `data-text` does.
-    if (unicode > 0 && !entry.codes.has(gid)) entry.codes.set(gid, unicode);
+    // The first code wins for a gid, as the SVG's own `data-text` does - and a
+    // glyph MuPDF could not name is left without one, so the plan and the
+    // per-page fonts agree on which glyphs have a character at all.
+    if (isUsableCode(unicode) && !entry.codes.has(gid)) entry.codes.set(gid, unicode);
     draws.push({
       fontId,
       gid,

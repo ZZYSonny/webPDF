@@ -87,8 +87,8 @@ try {
   console.log('\n› demo application');
   await run([path.join(here, 'demo.mjs'), url], { stdio: 'inherit' });
 
-  console.log('\n› a page is a document like any other');
-  await run([path.join(here, 'frames.mjs'), url], { stdio: 'inherit' });
+  console.log('\n› one document, and the browser’s own text behaviour over it');
+  await run([path.join(here, 'single.mjs'), url], { stdio: 'inherit' });
 
   console.log('\n› pinch / zoom contract');
   await run([path.join(here, 'pinch.mjs'), url], { stdio: 'inherit' });

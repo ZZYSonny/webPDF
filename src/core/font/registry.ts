@@ -14,7 +14,7 @@
 
 import { buildFontFromOutlines, PUA_BASE, PUA_LIMIT, type OutlineGlyph } from './build.ts';
 import { encodeWoff } from './woff.ts';
-import { glyphKey, type GlyphOutline, type GlyphPlacement } from '../svg/glyphs.ts';
+import { glyphKey, isUsableCode, type GlyphOutline, type GlyphPlacement } from '../svg/glyphs.ts';
 import { ligatureCode } from '../svg/ligatures.ts';
 import { debug } from '../debug.ts';
 
@@ -125,7 +125,7 @@ export class FontRegistry {
       const p = placements[i];
       let byGid = wanted.get(p.fontId);
       if (!byGid) wanted.set(p.fontId, (byGid = new Map()));
-      if (!byGid.has(p.gid) && p.code > 0) byGid.set(p.gid, p.code);
+      if (!byGid.has(p.gid) && isUsableCode(p.code)) byGid.set(p.gid, p.code);
 
       const next = placements[i + 1];
       if (next && next.fontId === p.fontId) {

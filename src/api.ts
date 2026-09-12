@@ -47,6 +47,13 @@ export interface CreateViewerOptions extends Omit<PdfViewerOptions, 'container' 
   /** Forwarded to a freshly created engine. */
   disableCompression?: boolean;
   onWarn?: (message: string) => void;
+  /**
+   * Forwarded to a freshly created engine: how many pages are worth planning its
+   * fonts for before the first one is laid out (see `EngineOptions`). `0` gives
+   * every page its own fonts, which is what the viewer did before the plan
+   * existed - slower to scroll, but useful for measuring the difference.
+   */
+  preplanPages?: number;
 }
 
 function resolveContainer(container: HTMLElement | string): HTMLElement {
@@ -58,17 +65,18 @@ function resolveContainer(container: HTMLElement | string): HTMLElement {
 
 /** Create a viewer, optionally opening a document straight away. */
 export async function createViewer(opts: CreateViewerOptions): Promise<PdfViewer> {
-  const { source, engine, worker, workerUrl, disableCompression, onWarn, ...viewerOpts } = opts;
+  const { source, engine, worker, workerUrl, disableCompression, onWarn, preplanPages, ...viewerOpts } = opts;
 
+  const engineOpts = { disableCompression, onWarn, preplanPages };
   let backend: PdfEngineLike | undefined = engine;
   if (!backend && (worker ?? true)) {
-    backend = (await createWorkerEngine(workerUrl)) ?? undefined;
+    backend = (await createWorkerEngine(workerUrl, engineOpts)) ?? undefined;
   }
   if (!backend) {
     // Only now, and only when there is no worker to draw in: the engine brings
     // the wasm with it.
     const { PdfEngine } = await loadEngine();
-    backend = new PdfEngine({ disableCompression, onWarn });
+    backend = new PdfEngine(engineOpts);
   }
 
   const viewer = PdfViewer.create({ ...viewerOpts, container: resolveContainer(opts.container), engine: backend });
@@ -112,7 +120,11 @@ export async function* renderDocument(
   opts: RenderDocumentOptions = {},
 ): AsyncGenerator<RenderedPage, void, void> {
   const { PdfEngine } = await loadEngine();
-  const engine = new PdfEngine(opts);
+  // Standalone SVGs, so the page's own glyph set is the right one to embed: a
+  // document-wide face would put every glyph the document drew into every page
+  // that uses the font. The plan exists for a viewer, where a face is registered
+  // once and shared; here it is a bigger file for no one's benefit.
+  const engine = new PdfEngine({ ...opts, preplanPages: opts.preplanPages ?? 0 });
   try {
     await engine.open(source);
     const count = engine.documentInfo.pageCount;

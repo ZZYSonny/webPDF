@@ -144,19 +144,31 @@ export interface EngineOptions {
   disableCompression?: boolean;
   onWarn?: (message: string) => void;
   /**
-   * Plan the document's fonts up front, down to this many pages. **Off unless
-   * given**: a document with no `preplanPages` keeps the per-page fonts.
+   * How many pages are worth planning before the first one is laid out.
+   * Defaults to `PREPLAN_PAGES`; `0` turns the plan off and gives every page its
+   * own fonts.
    *
    * A page's own font is a new `@font-face` for that page, and registering a
-   * face re-lays-out the document it lands in. A document the font plan can
-   * cover whole gets one face per *font*, all of them built before any page is
-   * laid out, so nothing registers while the reader is scrolling. The plan costs
-   * a text-only walk of the document (a few milliseconds a page) plus building
-   * each face, so a document past this many pages is planned as it goes instead,
-   * a window ahead of the reader. See `core/font/plan.ts`.
+   * face re-lays-out the document it lands in. A document no longer than this is
+   * walked once, text only, before anything is drawn, and every face it will
+   * ever need is built under one family per *font* - so nothing registers while
+   * the reader is scrolling. Past this many pages the plan keeps a window ahead
+   * of the page being rendered instead, which is still one face per font rather
+   * than one per page, and still registers each face before the page that needs
+   * it. See `core/font/plan.ts`.
    */
   preplanPages?: number;
 }
+
+/**
+ * The page count a document is planned whole within.
+ *
+ * Measured over the test corpus: 64 pages of walking and building costs about a
+ * second, which is what a document of that length can spend on being one
+ * document instead of one per page, and one paper of 100 pages is the first
+ * thing in the corpus that is past it.
+ */
+export const PREPLAN_PAGES = 64;
 
 /**
  * The surface the viewer needs from a rendering backend.
@@ -505,20 +517,14 @@ export class PdfEngine implements PdfEngineLike {
     }
     this.doc = doc;
     this.info = this.readInfo(doc);
-    // Off unless a host asks for it. The plan works - every face of a planned
-    // document is registered before the first page is drawn, and none after -
-    // but it changes the two things a rebuilt font's metrics are made of: a
-    // document-wide font's ascent comes from every glyph in the document rather
-    // than from one page's, and its advances are the program's instead of the
-    // distance to the next glyph on the page. Both are more accurate and both
-    // move a `<text>` element's box a fraction of a point, which is enough to
-    // trip the crop suite's guard against a crop slicing a line of text. That is
-    // being settled before this becomes the default; until then the per-page
-    // fonts are what a document gets.
+    // One face per font, for the whole document, built before any page is laid
+    // out - which is what lets the viewer be a single document rather than one
+    // frame per page. `preplanPages: 0` keeps the per-page fonts.
+    const budget = this.opts.preplanPages ?? PREPLAN_PAGES;
     this.plan =
-      this.opts.preplanPages === undefined
-        ? null
-        : new DocumentFontPlan({ preplanPages: this.opts.preplanPages, onWarn: this.opts.onWarn });
+      budget > 0
+        ? new DocumentFontPlan({ preplanPages: budget, onWarn: this.opts.onWarn })
+        : null;
     if (this.plan) await this.plan.cover(doc, 0, this.registry);
     return this.info;
   }
