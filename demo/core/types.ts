@@ -102,6 +102,7 @@ export interface RenderStats {
   spaces: number;
   /** Glyphs written at bionic reading's reduced strength. */
   faded: number;
+  /** Faces the page drew text with, whether it carried them or named them. */
   fontsBuilt: number;
   fontsReused: number;
   ms: number;

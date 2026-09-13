@@ -219,6 +219,39 @@ check('a page renders to an SVG with real text in it', svg.includes('<text') && 
 // or one drawn before the plan is ready - carries its own faces, because there
 // is no host to serve the URIs the document's stylesheet names.
 check('and a standalone page carries its faces inline', svg.includes('base64,'));
+// The stats are decided by `finish`, which flushes the page's last run and
+// counts the faces the page drew with, so the render has to read them *after*
+// finishing. Before that ordering was fixed, `fonts` was always 0 and the last
+// run was missing from `runs` and `faded` - hence a check against the SVG
+// itself, one `<text>` per run, and one `@font-face` per face.
+const embedded = (svg.match(/@font-face/g) ?? []).length;
+check(
+  'and the stats say how many faces it drew with',
+  rendered.header.stats.fonts === embedded && embedded > 0,
+  `${rendered.header.stats.fonts} faces, ${embedded} embedded`,
+);
+const textElements = (svg.match(/<text[\s>]/g) ?? []).length;
+check(
+  'and how many runs, one <text> each, the last one included',
+  rendered.header.stats.runs === textElements && rendered.header.stats.faded > 0,
+  `${rendered.header.stats.runs} runs, ${textElements} text elements, ${rendered.header.stats.faded} faded`,
+);
+{
+  const namedPrefix = put(`q${page}-`);
+  const namedClass = put('wpdf-page-svg');
+  const named = frame(
+    m._wpdf_render(id, page, namedPrefix.ptr, namedPrefix.size, namedClass.ptr, namedClass.size, 1 | 4 | 8, -1, 0, 0, 0, 0),
+    'render',
+  );
+  m._free(namedPrefix.ptr);
+  m._free(namedClass.ptr);
+  const namedSvg = new TextDecoder().decode(named.payload);
+  check(
+    'and a page that names its faces reports the same count without carrying one',
+    named.header.stats.fonts === rendered.header.stats.fonts && !namedSvg.includes('@font-face'),
+    `${named.header.stats.fonts} faces named, ${namedSvg.includes('@font-face') ? 'a rule is still there' : 'no rule'}`,
+  );
+}
 check('with every glyph accounted for', rendered.header.stats.asText + rendered.header.stats.asOutlines === rendered.header.stats.glyphs, JSON.stringify(rendered.header.stats));
 check('and the class the page’s own stylesheet needs', svg.includes('class="wpdf-page-svg"'));
 check('and its size, so a host can lay the page out', rendered.header.width > 0 && rendered.header.height > 0, `${rendered.header.width}x${rendered.header.height}`);

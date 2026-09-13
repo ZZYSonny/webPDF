@@ -97,7 +97,10 @@ pub struct PageStats {
     pub runs: usize,
     /// Space characters written back into the text.
     pub spaces: usize,
-    /// `@font-face` rules embedded in this page.
+    /// Faces the page drew text with. A page that stands alone carries a
+    /// `@font-face` rule for each of them; one that names them for a host to
+    /// serve reports the same number, so the count says what the page needed
+    /// either way.
     pub fonts: usize,
     /// Images written into this page.
     pub images: usize,
@@ -475,22 +478,35 @@ impl SvgDevice {
         format!("{}{kind}_{}", self.prefix, self.ids)
     }
 
-    /// The `@font-face` rules for the faces this page named, and how many there
-    /// were - which is what `PageStats::fonts` reports, and the only place that
-    /// knows: the rules are written here and nowhere else.
-    fn font_css(&self) -> (String, usize) {
+    /// The `@font-face` rules for the faces this page named, in one string with
+    /// a newline between them. What a page that has to stand alone carries;
+    /// `faces_used` is what `PageStats::fonts` reports.
+    fn font_css(&self) -> String {
         let mut seen = String::new();
-        let mut count = 0;
         for entry in &self.used {
             if let Some(css) = self.plan.face_css(*entry) {
                 if !seen.is_empty() {
                     seen.push('\n');
                 }
                 seen.push_str(css);
-                count += 1;
             }
         }
-        (seen, count)
+        seen
+    }
+
+    /// The faces the page drew text with, which is what `PageStats::fonts`
+    /// reports.
+    ///
+    /// It is the length of `used` - a run only opens once `face_for` has
+    /// answered - but the plan is asked anyway, so that the count is the same
+    /// set of faces `font_css` writes rules for, and asks it through
+    /// `face_for` rather than `face_css` because the latter would build a
+    /// base64 embedding for every face just to learn that it exists.
+    fn faces_used(&self) -> usize {
+        self.used
+            .iter()
+            .filter(|entry| self.plan.face_for(**entry).is_some())
+            .count()
     }
 
     fn next_id(&mut self) -> u32 {
@@ -1054,13 +1070,13 @@ impl SvgDevice {
         while !self.open.is_empty() {
             self.close_one();
         }
-        let (embedded, faces) = if opts.embed_fonts {
+        let font_css = if opts.embed_fonts {
             self.font_css()
         } else {
-            (String::new(), 0)
+            String::new()
         };
-        self.stats.fonts = faces;
-        let font_css = embedded.as_str();
+        self.stats.fonts = self.faces_used();
+        let font_css = font_css.as_str();
         // The window onto the page: a crop when the host asked for one, the
         // page's own box otherwise. The elements inside were written at the
         // page's coordinates either way, so this only decides how much of them
@@ -2002,8 +2018,12 @@ pub fn render_page_svg(
         Ok(cell) => cell.into_inner(),
         Err(shared) => shared.borrow_mut().take(),
     };
-    let stats = device.stats();
+    // The stats are read after `finish`, not before: `finish` flushes the page's
+    // last run - the one that counts towards `runs` and `faded` - and works out
+    // how many faces the page drew with. Read first, the last run was missing
+    // and `fonts` was always 0.
     let svg = device.finish(width, height, opts);
+    let stats = device.stats();
     let (vw, vh) = match opts.view_box {
         Some((_, _, w, h)) => (w, h),
         None => (width, height),
