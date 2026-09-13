@@ -58,6 +58,12 @@ export const PAPERS: readonly Paper[] = [
     settings: 'LaTeX with TrueType-flavoured fonts, 100 pages',
   },
   {
+    label: 'DeepSeek-V4 Technical Report',
+    url: 'https://arxiv.org/pdf/2606.19348v1',
+    note: 'arxiv.org',
+    settings: '87 subset faces over 58 pages, Type 1 and TrueType text',
+  },
+  {
     label: 'PDF 1.7 specification (ISO 32000-1)',
     url: 'https://opensource.adobe.com/dc-acrobat-sdk-docs/pdfstandards/PDF32000_2008.pdf',
     note: 'adobe.com',

@@ -11,6 +11,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { launch } from './cdp.ts';
+import { PAPERS } from '../pdf-cache.ts';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const url = process.argv[2] ?? 'http://127.0.0.1:5175/';
@@ -2335,6 +2336,63 @@ interface FontProbe {
   console.log('icon: ' + JSON.stringify(icon));
   if (!icon.href) fail('the page declares no icon');
   else if (!icon.ok || !icon.svg) fail(`the icon did not load: ${JSON.stringify(icon)}`);
+
+  // ------------------------------------------ the other paper in the corpus
+  // The example list is a corpus rather than one document - a paper is in it for
+  // what it is like - and this is the one it carries most of: 87 subset faces
+  // over 58 pages, Type 1 and TrueType in the same document. So it is opened
+  // here, from the list rather than from a URL written down twice, and from the
+  // cache when the server behind `/pdf` has it: what is being checked is how this
+  // renderer draws *that* document, not what arXiv answers today.
+  //
+  // What the check is really about is the faces. A page names the families its
+  // text was drawn with and the document serves the bytes, so a family a page
+  // names and the document was never told about is a page drawn in a fallback
+  // font - which is what a viewer that reached its plan with the wrong engine
+  // looks like, and what this counts.
+  console.log('— opening the other paper in the corpus —');
+  const other = PAPERS.find((paper) => paper.url.includes('2606.19348'));
+  const otherAt = beforeLoad.options.find((value) => value.includes('2606.19348')) ?? other?.url;
+  if (!other || !otherAt) fail('the picker offers no entry for the DeepSeek-V4 paper');
+  else {
+    await open(otherAt);
+    await page.waitFor(() => window.__pageSvgs().length > 0, { label: 'the other paper to draw', timeout: 120000 });
+    await new Promise((r) => setTimeout(r, 1500));
+    const paper = await page.evaluate(() => {
+      const texts = window.__pageTexts();
+      const used = new Set(
+        texts.map((text) => text.getAttribute('font-family')).filter((family): family is string => !!family),
+      );
+      const css = window.__pageCss();
+      // `cssText` is the browser's own spelling of the rule, and it drops the
+      // quotes the core writes around the family - so the quotes are optional
+      // here, and a check that insisted on them would count no faces at all.
+      const registered = new Set(
+        [...css.matchAll(/@font-face[^}]*font-family:\s*['"]?([^;'"]+)['"]?/g)].map((m) => m[1]),
+      );
+      return {
+        pages: document.getElementById('pagecount')?.textContent ?? '',
+        title: document.title,
+        drawn: window.__pageSvgs().length,
+        texts: texts.length,
+        families: used.size,
+        registered: registered.size,
+        // Every family the pages name, and the document never said what it is.
+        unnamed: [...used].filter((family) => !registered.has(family)).length,
+        // The faces are served, not spelled out: a rule that carried its font
+        // inline would show up here.
+        inlineBytes: (css.match(/base64,([A-Za-z0-9+/=]+)/g) ?? []).reduce((n, m) => n + m.length, 0),
+      };
+    });
+    console.log('other paper: ' + JSON.stringify(paper));
+    if (!/^DeepSeek-V4/.test(paper.title)) fail(`the other paper is ${JSON.stringify(paper.title)}, not the DeepSeek-V4 report`);
+    if (paper.drawn < 1) fail('the other paper drew no pages');
+    if (Number(paper.pages) < 50) fail(`the other paper is ${paper.pages} pages, not a report of the corpus's size`);
+    if (paper.texts < 20) fail(`the other paper rendered almost no text (${paper.texts} elements)`);
+    if (paper.unnamed > 0) fail(`the other paper names ${paper.unnamed} families the document was never told about`);
+    if (paper.registered < 50) fail(`the other paper's plan built ${paper.registered} faces, not the many it has`);
+    if (paper.inlineBytes > 0) fail(`the other paper's rules carry ${paper.inlineBytes} characters of inline font`);
+  }
 
   // ------------------------------------------------------- the public example
   // The shipped page has no documents of its own, so this is the path a reader
