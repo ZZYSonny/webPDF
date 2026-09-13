@@ -432,6 +432,31 @@ documents is capped at eight, and the cap is visible: it
 is exactly "what has been read here". A newer build installs, waits, and asks —
 a page that is being read is never swapped out from under the reader.
 
+### Opening a PDF with it
+
+Installed, the viewer is also the application a PDF can open in. The manifest
+(`demo/manifest.webmanifest`) declares a `file_handlers` entry — the MIME type
+`application/pdf` and the extension `.pdf` — and a browser that supports it
+registers the installed app with the operating system's own list of applications
+for that file type, where the reader can pick it like any other. The declaration
+is read at install time, so what is registered is the installed app and not the
+page; the first launch asks for permission, and the OS's own settings can take
+the association away again.
+
+A launch is not a URL the page could read. The browser opens the app at the
+handler's `action` — this page's own entry — and puts the files on
+`window.launchQueue`, which holds them until the page takes a consumer for it.
+`demo/main.ts` takes one as it starts, so a launch that arrived before its
+modules ran is still handled, and the document is opened by exactly the path a
+file the reader picked in the dialog takes: the same viewer, the same memory, the
+same naming.
+
+The handler asks for `launch_type: "multiple-clients"` — one file per launch, so
+a reader who opens three documents at once gets three windows with one document
+each rather than one window that would have to choose. Nothing about the offline
+story changes: the launched file is already on the reader's own disk, and the
+shell the app starts from is the copy the worker keeps.
+
 ---
 
 ## The browser extension
@@ -598,6 +623,10 @@ wants; the published site is `dist/demo`, and the extension points at it.
   to 14 of the same paper in 1.27.2. Both are MuPDF's difference, not this
   code's: every crop measurement that differs between the two pipelines is one
   of those pages.
+* **Being the application a PDF opens in is Chromium's.** Firefox and Safari have
+  no File Handling API, so there the viewer is a page that opens PDFs rather than
+  the application a PDF opens in: the manifest member is inert, and the page
+  checks for `launchQueue` before taking a consumer for it.
 * **A document is not styled by us.** The viewer draws what the PDF says: a
   missing font is substituted by MuPDF, an image is the image, and a page whose
   content is a bitmap becomes that bitmap. Fidelity is measured against MuPDF's

@@ -1635,10 +1635,75 @@ const hostBridge: HostBridge = createHostBridge({
   },
 });
 
+/**
+ * The File Handling API - what an installed application is given when the
+ * operating system opens a file with it - which the DOM library does not carry.
+ *
+ * The manifest's `file_handlers` is what puts this page in the operating
+ * system's own list of applications for a PDF. A launch from there is not a URL
+ * the page could read: the browser opens the app at the handler's `action` and
+ * puts the files on this queue, where they wait for the page to say what to do
+ * with them.
+ */
+declare global {
+  interface LaunchQueue {
+    /** Take every launch, including any that arrived before this was called. */
+    setConsumer(consumer: (params: LaunchParams) => void): void;
+  }
+  interface LaunchParams {
+    /** The files the launch is for, as handles: the bytes stay where they are. */
+    readonly files: FileSystemHandle[];
+    /** The URL the app was launched at, which is the handler's `action`. */
+    readonly targetURL: string;
+  }
+  var launchQueue: LaunchQueue;
+}
+
+/** Whether the operating system has handed this window a file to open. */
+let launched = false;
+
+/** Whether a handle is a file - `kind` is a string, so it narrows nothing. */
+const isFile = (handle: FileSystemHandle): handle is FileSystemFileHandle => handle.kind === 'file';
+
+/**
+ * The files the operating system opened this application with.
+ *
+ * A launch is queued before this module runs and is handed over the moment a
+ * consumer is set, so this is not a race: a reader who double-clicked a PDF is
+ * being answered by the time the greeting below is reached, and is not told to
+ * open the one they just opened.
+ *
+ * The manifest asks for `launch_type: "multiple-clients"`, so a launch carries
+ * one file and a reader who opens three documents at once gets three windows,
+ * one document each - which is the whole of what this viewer can show. Should a
+ * launch carry several files anyway, they are opened one after another and the
+ * last is what the window ends up showing: the queue is the operating system
+ * asking for them, and dropping one without a word would be worse.
+ */
+if ('launchQueue' in window) {
+  launchQueue.setConsumer(async (params) => {
+    launched = true;
+    for (const handle of params.files) {
+      // A handler for directories would be handed one; this page declared PDFs.
+      if (!isFile(handle)) {
+        warn(`${handle.name} is not a file, so it was not opened`);
+        continue;
+      }
+      try {
+        await openSource(await handle.getFile());
+      } catch (error) {
+        // Only the handover itself can fail here; `openSource` answers for its own.
+        console.error(error);
+        notify(`Error: ${String((error as Error)?.message ?? error)}`, 'error');
+      }
+    }
+  });
+}
+
 if (isHosted()) {
   // A hosted page has no reader to greet and no document to offer: it is waiting
   // for the one it was opened for, which the card would only cover up.
   els.empty.hidden = true;
-} else {
+} else if (!launched) {
   notify('Ready — open a PDF to begin.');
 }

@@ -3,8 +3,8 @@
  *
  *   node tests/browser/pwa.ts [url]
  *
- * `url` is where the built demo is served (the suite's preview server). Two
- * scenarios are driven here, and they answer two different questions:
+ * `url` is where the built demo is served (the suite's preview server). Four
+ * scenarios are driven here, and each answers a different question:
  *
  *  1. *The engine's address and its digest.* The core is built from this
  *     repository, so it is served from this site and nowhere else, and the page
@@ -35,6 +35,13 @@
  *     offer lands on the new build; the build before it is still there to answer
  *     for the files it was made of; the one before *that* is dropped; and the
  *     whole thing still comes up offline afterwards.
+ *
+ *  4. *The application a PDF opens with.* An installed application can be
+ *     registered with the operating system as the application for a file type,
+ *     and it is the manifest that asks for it. A launch is not a URL the page
+ *     could read but a queue it has to take, so both ends are checked: that the
+ *     manifest declares the handler, and that the page's own consumer opens the
+ *     file the launch hands over.
  *
  * (2) is also the proof that an unreachable network does not take the viewer with
  * it: the engine there can only have come from this site, and the site is gone.
@@ -143,10 +150,11 @@ interface Kept {
 }
 
 /**
- * The two handles `PROBE` leaves on the page. It runs before the demo's own
- * modules - it is installed with `addScriptToEvaluateOnNewDocument` - so the
- * globals it defines belong to no module that could declare them; they are
- * named here, from the script above, which is the only place their shape exists.
+ * The handles the probes leave on the page. They run before the demo's own
+ * modules - they are installed with `addScriptToEvaluateOnNewDocument` - so the
+ * globals they define belong to no module that could declare them; they are
+ * named here, from the scripts below, which is the only place their shape
+ * exists. `__consumers` and `__launch` are `LAUNCH_PROBE`'s.
  */
 declare global {
   interface Window {
@@ -154,6 +162,10 @@ declare global {
     __svgs(): SVGElement[];
     /** What the page has kept for offline use. */
     __kept(): Promise<Kept>;
+    /** How many consumers the page has taken on `window.launchQueue`. */
+    __consumers(): number;
+    /** Hand the page a file over the launch queue, as the OS would. */
+    __launch(url: string, name: string): Promise<void>;
   }
 }
 
@@ -315,6 +327,13 @@ interface Manifest {
   display: string;
   start_url: string;
   icons: Array<{ src: string; sizes: string }>;
+  /** What the browser registers the installed app with the OS as handling. */
+  file_handlers?: Array<{
+    action: string;
+    name?: string;
+    accept: Record<string, string[]>;
+    launch_type?: string;
+  }>;
 }
 
 /** The engine binary, as the page's own fetch can report it. */
@@ -783,6 +802,110 @@ console.log('\n› a redeploy, and what the page does about it');
     fs.rmSync(dir, { recursive: true, force: true });
     await browser.close();
   }
+}
+
+/* --------------------------------------- the application a PDF opens with */
+
+/**
+ * The File Handling API, as a browser test can reach it.
+ *
+ * A real launch cannot be staged from here: registering an application with the
+ * operating system is the reader's decision, and the launch itself comes from
+ * outside the browser. So each end is checked where it lives - the manifest,
+ * which is what a browser reads at install time, and the page's own consumer,
+ * taken off the queue as a launch would take it and handed a file the way a
+ * launch hands one over: a handle whose `getFile()` answers with the bytes. The
+ * wrapper below is the whole of the deception, and it wraps the *taking* of the
+ * consumer rather than anything in the page, so what runs is the page's own
+ * code from the queue outwards.
+ */
+const LAUNCH_PROBE = `(() => {
+  const consumers = [];
+  if ('launchQueue' in window) {
+    const queue = window.launchQueue;
+    const take = queue.setConsumer.bind(queue);
+    queue.setConsumer = (consumer) => {
+      consumers.push(consumer);
+      return take(consumer);
+    };
+  }
+  window.__consumers = () => consumers.length;
+  window.__launch = async (url, name) => {
+    const bytes = await (await fetch(url)).arrayBuffer();
+    const file = new File([bytes], name, { type: 'application/pdf' });
+    const handle = { kind: 'file', name, getFile: async () => file };
+    for (const consumer of consumers) await consumer({ files: [handle], targetURL: location.href });
+  };
+})()`;
+
+console.log('\n› the application the operating system opens a PDF with');
+{
+  const browser = await launch();
+  const page = await browser.newPage();
+  await page.setViewport(1280, 900);
+  await page.send('Page.addScriptToEvaluateOnNewDocument', { source: PROBE });
+  await page.send('Page.addScriptToEvaluateOnNewDocument', { source: LAUNCH_PROBE });
+  await boot(page, url);
+
+  const manifest = await page.evaluate<Manifest>(`fetch('./manifest.webmanifest').then((r) => r.json())`);
+  const handler = (manifest.file_handlers ?? []).find((entry) => entry.accept['application/pdf']);
+  // An `action` the app cannot serve is an entry the browser throws away, and it
+  // is resolved against the manifest rather than against the page, so where it
+  // lands is as much of the declaration as what it says.
+  const action = handler ? new URL(handler.action, new URL('./manifest.webmanifest', url)).href : '';
+  check(
+    'the manifest offers the installed app to the OS as the application for a PDF',
+    !!(
+      handler &&
+      handler.accept['application/pdf']?.includes('.pdf') &&
+      action.startsWith(url) &&
+      handler.launch_type === 'multiple-clients'
+    ),
+    handler
+      ? `action ${action} for ${JSON.stringify(handler.accept)}, ${handler.launch_type ?? 'single-client'} by default`
+      : `no handler for application/pdf: ${JSON.stringify(manifest.file_handlers ?? null)}`,
+  );
+
+  // A launch is a queue rather than a URL, and a page that never takes it is a
+  // page the reader's double-click goes into and disappears.
+  const consumers = await page.evaluate<number>(`window.__consumers()`);
+  check(
+    'the page takes the launch, so the file the OS hands over is opened',
+    consumers === 1,
+    consumers === 1 ? 'one consumer on window.launchQueue' : `${consumers} consumers on window.launchQueue`,
+  );
+
+  // Then the launch itself. This paper's own metadata carries no title, so the
+  // name on the tab is the *file's*: what is on screen came in as the document
+  // the handle answered with, not as a URL this page went and fetched.
+  await page.evaluate(`window.__launch(${JSON.stringify(pdf)}, 'launched.pdf')`);
+  await page.waitFor(() => window.__svgs().length > 0, { label: 'the launched document to draw', timeout: 120000 });
+  const launched = await page.evaluate<{ title: string; pages: number; drawn: number }>(`({
+    title: document.title,
+    pages: window.webpdf.info()?.pageCount ?? 0,
+    drawn: window.__svgs().length,
+  })`);
+  check(
+    'a launch opens the file it carries, into the viewer the reader would have got',
+    launched.title === 'launched.pdf' && launched.pages > 1 && launched.drawn > 0,
+    `${launched.drawn} pages drawn of ${launched.pages}, titled ${JSON.stringify(launched.title)}`,
+  );
+
+  // And the page has to come up where the API is not there at all, which is
+  // every browser that is not a Chromium one: nothing about opening the PDF a
+  // reader picked depends on the OS being able to hand one over.
+  const plain = await browser.newPage();
+  await plain.setViewport(1280, 900);
+  await plain.send('Page.addScriptToEvaluateOnNewDocument', { source: 'delete window.launchQueue;' });
+  await boot(plain, url);
+  const absent = await plain.evaluate<boolean>(`!('launchQueue' in window)`);
+  check(
+    'and the page comes up with no launch queue at all',
+    absent && (await plain.evaluate<boolean>(`!!window.webpdf?.open`)),
+    absent ? 'the page booted with window.launchQueue deleted' : 'the API could not be taken away, so this checked nothing',
+  );
+
+  await browser.close();
 }
 
 console.log(failures ? `\nPWA CHECK FAILED (${failures})` : '\nPWA CHECK PASSED');
