@@ -174,7 +174,7 @@ nothing a frame would absorb.
 
 Measured with the core built for the browser — the wasm module itself, driven
 directly in Node — rendering page 1 of the papers in the test corpus (all public
-URLs, `demo/papers.mjs`):
+URLs, `demo/papers.ts`):
 
 | document | glyphs | as text | SVG | runs | faces in the plan |
 | --- | --- | --- | --- | --- | --- |
@@ -263,7 +263,7 @@ errors), and `demo/core/client.ts` is the same engine behind a worker. Which of
 the two a page got is a detail it never mentions: both answer the same calls, and
 a reader does not care which thread holds the document.
 
-The build is `node scripts/build-core-wasm.mjs` (`npm run build:wasm`). It needs
+The build is `node scripts/build-core-wasm.ts` (`npm run build:wasm`). It needs
 the Emscripten SDK, which the repository keeps in `.emsdk/`, and it writes
 `demo/engine/webpdf-core.js` and `demo/engine/webpdf-core.wasm` — a build
 artifact, gitignored, like `dist/`. Two of its settings are not preferences and
@@ -364,7 +364,7 @@ pages' zoom belongs to the viewer:
 ### Offline
 
 A reader who has opened the viewer once can open it again on a train. The service
-worker (`demo/sw.js`) precaches the shell — the page, its scripts, its styles,
+worker (`demo/sw.ts`) precaches the shell — the page, its scripts, its styles,
 its manifest and icons, and the core's Emscripten glue — and nothing else. The
 9 MB binary and the documents are kept the first time they are actually used, and
 both are kept *by the page*: the engine's wasm only after the page has checked it
@@ -396,7 +396,7 @@ and a viewer that can no longer serve the extension says so instead of sitting o
 a tab that never draws. The extension stores no memory of the reader; where they
 were is the viewer's own storage.
 
-`npm run build:extension` builds it, `node scripts/build-extension.mjs` stages
+`npm run build:extension` builds it, `node scripts/build-extension.ts` stages
 `dist/ext/webpdf` and signs a `.crx`.
 
 ---
@@ -434,21 +434,25 @@ demo/                       the viewer (the Vite root, and the site)
   core/rules.ts             the crop rules: names, and the expressions they apply
   core/crop.ts              the host's half of a crop: the box, and the padding
   offline.ts                the service worker, and the documents worth keeping
-  sw.js                     the shell, the engine, and the documents
+  sw.ts                     the shell, the engine, and the documents
+  host-mode.ts              the class a hosted page sets before its first paint
   worker.ts                 the core, on a thread of its own
   core/bridge.ts            the frame protocol, in TypeScript
   core/engine.ts            PdfEngine: a document, its plan, its pages
   core/client.ts            WorkerEngine: the same engine, over postMessage
   core/types.ts             what a host sees
-  papers.mjs                the corpus: public URLs, and where they are cached
+  papers.ts                the corpus: public URLs, and where they are cached
   examples.ts               the picker's entries, cached copies first
   host.ts                   the bridge to a host page (the extension)
 
 ext/                        the browser extension: a shell around the viewer
-scripts/build-core-wasm.mjs the wasm build (Emscripten, and why the flags)
-scripts/build-extension.mjs the crx and the staged extension
-tests/                      node tests, and the browser suites
-imgs/demo.png               the README's picture of the app, written by demo.mjs
+scripts/build-core-wasm.ts  the wasm build (Emscripten, and why the flags)
+scripts/build-extension.ts  staging and packing, from the compiled extension
+scripts/crx.ts              CRX3: the signing, the header, and reading one back
+scripts/no-jekyll.ts        the marker GitHub Pages needs
+tests/                      node tests (memory, zoom, crop rules, the crx) and
+                            the browser suites, each a program of its own
+imgs/demo.png               the README's picture of the app, written by demo.ts
 vite.demo.config.ts         the demo build: the core's files, the PWA, the cache
 vite.ext.config.ts          the extension build
 ```
@@ -462,7 +466,7 @@ npm run build:wasm     build the core for the browser (needs .emsdk/, and a
                        rustc with the wasm32-unknown-emscripten target)
 npm run dev            the demo, with the core served from demo/engine/
 npm run build          the wasm, then the demo, into dist/demo
-npm run typecheck      tsc over demo/, ext/ and tests/
+npm run typecheck      tsc over demo/, ext/, scripts/ and tests/
 npm test               the node tests: the memory, the zoom box, the crop
                        rules, the crx
 npm run test:core      cargo test: 37 unit tests over crop, links, info, the
@@ -471,6 +475,15 @@ npm run test:browser   every browser suite (see below)
 npm run verify         the three of them
 ```
 
+Everything here is TypeScript, including the scripts and the tests, and Node
+runs them by stripping the types rather than compiling them — which is what the
+`engines` field and the CI runner's Node version are about. That needs Node
+22.18 or newer; `typecheck` is what checks the types, and it is part of the CI
+build because a type error means the artifact would be built from source that
+does not compile as written. The one thing stripping cannot do is emit code that
+was never there, so `erasableSyntaxOnly` is on: no enums, no namespaces, no
+parameter properties — nothing whose *type* is also a runtime construct.
+
 The native core is the fastest way to look at anything:
 
 ```
@@ -478,23 +491,23 @@ cargo run --release --manifest-path core/Cargo.toml -- paper.pdf .scratch/out 0
 WPDF_CROP='^arXiv:;^\s*[0-9]+\s*$' WPDF_LINKS=1 cargo run --release --manifest-path core/Cargo.toml -- paper.pdf .scratch/out 0
 ```
 
-The corpus is a list of public URLs (`demo/papers.mjs`), downloaded into
+The corpus is a list of public URLs (`demo/papers.ts`), downloaded into
 `.scratch/pdfs` by `npm run pdfs`. Nothing in the repository is a PDF.
 
-`tests/browser/all.mjs` fetches the corpus, builds the demo and the extension,
+`tests/browser/all.ts` fetches the corpus, builds the demo and the extension,
 serves the demo, and drives all of it in Chromium over CDP:
 
 | suite | what it drives |
 | --- | --- |
-| `tests/core/wasm.mjs` | the wasm bridge's exports, driven from Node in a second — open, plan, stylesheet, render, crop, links, save, close |
-| `demo.mjs` | the whole application: the card, the bar at every width, the outline, the search, crop, bionic, links, Ctrl+S, Ctrl+P — and the screenshot in this README |
-| `modes.mjs` | the two render modes: what is drawn while the plan is walking, that no page frame is ever made, and that the handover is invisible |
-| `pinch.mjs` | the zoom contract, and that the browser's own pinch does no layout work |
-| `bridge.mjs` | a host page: what crosses the bridge, and a document with a password |
-| `pwa.mjs` | the service worker, the kept engine, a redeploy, and the viewer with no network at all |
-| `extension.mjs` | the extension in a real browser: interception, CORS, the keyboard, the crx |
+| `tests/core/wasm.ts` | the wasm bridge's exports, driven from Node in a second — open, plan, stylesheet, render, crop, links, save, close |
+| `demo.ts` | the whole application: the card, the bar at every width, the outline, the search, crop, bionic, links, Ctrl+S, Ctrl+P — and the screenshot in this README |
+| `modes.ts` | the two render modes: what is drawn while the plan is walking, that no page frame is ever made, and that the handover is invisible |
+| `pinch.ts` | the zoom contract, and that the browser's own pinch does no layout work |
+| `bridge.ts` | a host page: what crosses the bridge, and a document with a password |
+| `pwa.ts` | the service worker, the kept engine, a redeploy, and the viewer with no network at all |
+| `extension.ts` | the extension in a real browser: interception, CORS, the keyboard, the crx |
 
-`imgs/demo.png` is written by `demo.mjs`; it is a deliverable, not a fixture.
+`imgs/demo.png` is written by `demo.ts`; it is a deliverable, not a fixture.
 
 ### Publishing
 

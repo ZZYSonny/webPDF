@@ -13,11 +13,23 @@
  *   - they are served with `access-control-allow-origin: *`, so the browser
  *     fetches them directly, with no proxy of ours in the middle.
  *
- * Plain JavaScript, read from both sides: the demo bundles it, and the Node
- * scripts under `tests/` import it as-is. Nothing here touches the filesystem,
- * so the demo can carry the list without carrying a downloader; the fetching
- * half lives in `tests/pdf-cache.mjs`.
+ * Read from both sides: the demo bundles it, and the Node scripts under `tests/`
+ * import it as it stands. Nothing here touches the filesystem, so the demo can
+ * carry the list without carrying a downloader; the fetching half lives in
+ * `tests/pdf-cache.ts`.
  */
+
+/** One document in the corpus, addressed by the public URL it lives at. */
+export interface Paper {
+  /** What the picker and the test output call it. */
+  label: string;
+  /** The public URL the bytes come from. */
+  url: string;
+  /** Who is being downloaded from. */
+  note: string;
+  /** One line on what the document exercises. */
+  settings: string;
+}
 
 /** Where a cache of the corpus may live instead of the default directory. */
 export const CACHE_ENV = 'WEBPDF_PDF_CACHE';
@@ -25,16 +37,8 @@ export const CACHE_ENV = 'WEBPDF_PDF_CACHE';
 /** The default cache directory, relative to the repository root: gitignored. */
 export const CACHE_DIR = '.scratch/pdfs';
 
-/**
- * @typedef {object} Paper
- * @property {string} label    what the picker and the test output call it
- * @property {string} url      the public URL the bytes come from
- * @property {string} note     who is being downloaded from
- * @property {string} settings one line on what the document exercises
- */
-
-/** @type {readonly Paper[]} */
-export const PAPERS = [
+/** The corpus, in the order the demo and the tests list it. */
+export const PAPERS: readonly Paper[] = [
   {
     label: 'Attention Is All You Need',
     url: 'https://arxiv.org/pdf/1706.03762v7',
@@ -62,7 +66,7 @@ export const PAPERS = [
 ];
 
 /** The paper that URL belongs to, or null. */
-export function paperFor(url) {
+export function paperFor(url: string): Paper | null {
   return PAPERS.find((p) => p.url === url) ?? null;
 }
 
@@ -70,23 +74,23 @@ export function paperFor(url) {
  * The file name a paper is cached under: the last segment of its URL, which is
  * already unique because the version is part of it.
  */
-export function pdfName(url) {
+export function pdfName(url: string): string {
   const name = decodeURIComponent(new URL(url).pathname.split('/').pop() ?? '');
   return /\.pdf$/i.test(name) ? name : `${name || 'document'}.pdf`;
 }
 
-/** @param {string} [cacheDir] an absolute directory, or a repo-relative one */
-function directory(cacheDir) {
+/** @param cacheDir an absolute directory, or a repo-relative one */
+function directory(cacheDir?: string): string {
   if (!cacheDir) return CACHE_DIR;
   return cacheDir.startsWith('/') ? cacheDir : `${CACHE_DIR}/${cacheDir.replace(/^\.\//, '')}`;
 }
 
 /** Where `url` is cached: the value for the `src` of a document, once fetched. */
-export function cachedPath(url, cacheDir) {
+export function cachedPath(url: string, cacheDir?: string): string {
   return `${directory(cacheDir)}/${pdfName(url)}`;
 }
 
 /** The path a paper's cache file is served at by the dev and preview servers. */
-export function pdfPath(url) {
+export function pdfPath(url: string): string {
   return `/pdf/${pdfName(url)}`;
 }

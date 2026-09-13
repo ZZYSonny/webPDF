@@ -1,7 +1,7 @@
 /**
  * The wasm bridge, driven directly from Node.
  *
- *   node tests/core/wasm.mjs [pdf] [page]
+ *   node tests/core/wasm.ts [pdf] [page]
  *
  * Loads the Emscripten module `npm run build:wasm` produces and calls its exports
  * the way `demo/core/bridge.ts` does, so a broken export, a mis-framed answer or
@@ -30,21 +30,66 @@ if (!existsSync(WASM)) {
 const pdf = process.argv[2] ?? path.join(root, '.scratch', 'pdfs', '1706.03762v7.pdf');
 const page = Number(process.argv[3] ?? 0);
 
+/**
+ * The module's surface, spelled the way this file calls it.
+ *
+ * Only the exports used here are named, and every one of them answers with a
+ * frame pointer rather than a value: the bridge reads the frame back with
+ * `frame()` below, which is exactly what mis-framing would break.
+ */
+interface CoreModule {
+  HEAPU8: Uint8Array;
+  _malloc(size: number): number;
+  _free(ptr: number): void;
+  lengthBytesUTF8(text: string): number;
+  stringToUTF8(text: string, ptr: number, size: number): void;
+  _wpdf_out_ptr(): number;
+  _wpdf_open(ptr: number, len: number): number;
+  _wpdf_plan(id: number, max: number): number;
+  _wpdf_stylesheet(id: number): number;
+  _wpdf_measure_crop(id: number, page: number, ptr: number, len: number): number;
+  _wpdf_crop_check(ptr: number, len: number): number;
+  _wpdf_render(
+    id: number,
+    page: number,
+    prefix: number,
+    prefixLen: number,
+    className: number,
+    classLen: number,
+    flags: number,
+    bionicDim: number,
+    cropX: number,
+    cropY: number,
+    cropW: number,
+    cropH: number,
+  ): number;
+  _wpdf_links(id: number, page: number): number;
+  _wpdf_save(id: number): number;
+  _wpdf_close(id: number): number;
+}
+
+/** What `frame()` hands back: the parsed header, and the bytes after it. */
+interface Frame {
+  header: any;
+  payload: Uint8Array;
+}
+
 const { default: createModule } = await import(new URL(`file://${ENGINE}`).href);
 
-let m;
+let m!: CoreModule;
 try {
   m = await createModule({
     // Emscripten names the wasm after the *binary* it linked (`engine`), and the
     // build renames it; this is where it actually is. The path is absolute
     // because Node resolves a relative one against the working directory rather
     // than against the glue, which is not where the file lives.
-    locateFile: (name) => (name.endsWith('.wasm') ? WASM : path.join(path.dirname(ENGINE), name)),
+    locateFile: (name: string) => (name.endsWith('.wasm') ? WASM : path.join(path.dirname(ENGINE), name)),
   });
 } catch (error) {
   // The glue's stack trace prints its own minified source, so only the message.
-  console.error(`${error.name}: ${error.message}`);
-  console.error((error.stack ?? '').split('\n').slice(1, 4).join('\n'));
+  const failure = error as Error;
+  console.error(`${failure.name}: ${failure.message}`);
+  console.error((failure.stack ?? '').split('\n').slice(1, 4).join('\n'));
   process.exit(1);
 }
 
@@ -56,7 +101,7 @@ try {
  * the core can catch: it is a valid UTF-8 byte, and it ends up inside whatever
  * the string was for.
  */
-function put(text) {
+function put(text: string): { ptr: number; size: number } {
   const size = m.lengthBytesUTF8(text) + 1;
   const ptr = m._malloc(size);
   m.stringToUTF8(text, ptr, size);
@@ -64,7 +109,7 @@ function put(text) {
 }
 
 /** Read the frame a call returned: [u32 header length][header][payload]. */
-function frame(len, what) {
+function frame(len: number, what: string): Frame {
   const out = m._wpdf_out_ptr();
   const headerLen = new DataView(m.HEAPU8.buffer, out, 4).getUint32(0, true);
   const header = JSON.parse(new TextDecoder().decode(m.HEAPU8.subarray(out + 4, out + 4 + headerLen)));
@@ -74,7 +119,7 @@ function frame(len, what) {
 }
 
 let failures = 0;
-const check = (label, ok, detail = '') => {
+const check = (label: string, ok: boolean, detail = '') => {
   console.log(`${ok ? 'ok  ' : 'FAIL'} ${label}${detail ? ` — ${detail}` : ''}`);
   if (!ok) failures++;
 };
@@ -92,7 +137,7 @@ check('and its outline', Array.isArray(info.outline), `${info.outline.length} to
 const id = opened.header.id;
 
 let slices = 0;
-let planned;
+let planned: any;
 for (;;) {
   const { header } = frame(m._wpdf_plan(id, 8), 'plan');
   slices++;

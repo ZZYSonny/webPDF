@@ -2,7 +2,7 @@
  * The extension, end to end: a real Chrome, the built extension loaded, and the
  * contract the extension exists for.
  *
- *   node tests/browser/extension.mjs [url] [dir]
+ *   node tests/browser/extension.ts [url] [dir]
  *
  * `url` is the server the published viewer is served from. The build is pointed
  * at it with `--remote` instead of at github.io, so what runs here is the
@@ -54,10 +54,13 @@ import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import type { AddressInfo } from 'node:net';
 
-import { attach, launch } from './cdp.mjs';
-import { PAPERS, cachedFile } from '../pdf-cache.mjs';
-import { verifyCrx } from '../../scripts/crx.mjs';
+import { attach, launch } from './cdp.ts';
+import { PAPERS, cachedFile } from '../pdf-cache.ts';
+import { verifyCrx } from '../../scripts/crx.ts';
+import type { Browser, Page } from './cdp.ts';
+import type { PdfViewer } from '../../demo/viewer.ts';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const url = process.argv[2] ?? 'http://127.0.0.1:5178/';
@@ -75,16 +78,16 @@ const pdfUrl = new URL(`/pdf/${path.basename(file)}`, url).href;
 
 /** The repository, and the version the build puts in the artifact names. */
 const repo = path.join(here, '..', '..');
-const version = JSON.parse(fs.readFileSync(path.join(repo, 'package.json'), 'utf8')).version;
+const version: string = JSON.parse(fs.readFileSync(path.join(repo, 'package.json'), 'utf8')).version;
 
 let failures = 0;
 const started = Date.now();
-const check = (label, ok, detail = '') => {
+const check = (label: string, ok: boolean, detail: string = ''): void => {
   const at = `${String(Math.round((Date.now() - started) / 1000)).padStart(3)}s`;
   console.log(`${ok ? 'ok  ' : 'FAIL'} ${at} ${label}${detail ? ` — ${detail}` : ''}`);
   if (!ok) failures++;
 };
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
 /* --------------------------------------------------------- the bare server */
 
@@ -105,8 +108,8 @@ const bare = http.createServer((req, res) => {
   res.writeHead(200, { 'Content-Type': 'application/pdf', 'Content-Length': String(body.length) });
   res.end(body);
 });
-await new Promise((resolve) => bare.listen(0, '127.0.0.1', resolve));
-const bareOrigin = `http://127.0.0.1:${bare.address().port}`;
+await new Promise<void>((resolve) => bare.listen(0, '127.0.0.1', () => resolve()));
+const bareOrigin = `http://127.0.0.1:${(bare.address() as AddressInfo).port}`;
 
 /**
  * A viewer from the future, as far as this extension is concerned.
@@ -141,17 +144,27 @@ const STUB_VIEWER = `<!doctype html>
 
 /* ------------------------------------------------------------ the browser */
 
+/** One row of Chromium's own `/json/list`: a tab, a frame, or a worker. */
+interface TargetListItem {
+  id: string;
+  type: string;
+  url: string;
+  webSocketDebuggerUrl: string;
+}
+
 /** Start a browser with the extension loaded, and find the extension's own id. */
-async function withExtension({ where = extensionDir, expectApp = url } = {}) {
+async function withExtension(
+  { where = extensionDir, expectApp = url }: { where?: string; expectApp?: string | null } = {},
+): Promise<{ browser: Browser; id: string; workerId: string; viewer: string }> {
   if (!fs.existsSync(path.join(where, 'manifest.json'))) {
     throw new Error(`${where} is not built — run \`npm run build:extension\` first`);
   }
   // Which viewer this build frames is a build-time answer, and the only one the
   // test cannot choose for itself: the rest of the flow is the same either way.
-  const staged = JSON.parse(fs.readFileSync(path.join(where, 'viewer.json'), 'utf8'));
+  const staged = JSON.parse(fs.readFileSync(path.join(where, 'viewer.json'), 'utf8')) as { app: string };
   if (expectApp && !staged.app.startsWith(expectApp)) {
     throw new Error(
-      `this build frames ${staged.app}, not this server — build it with \`node scripts/build-extension.mjs --remote ${url}\``,
+      `this build frames ${staged.app}, not this server — build it with \`node scripts/build-extension.ts --remote ${url}\``,
     );
   }
   const browser = await launch({
@@ -160,9 +173,9 @@ async function withExtension({ where = extensionDir, expectApp = url } = {}) {
     // extension that reached for a CDN would fail here rather than quietly pass.
     args: ['--host-resolver-rules=MAP * ~NOTFOUND, EXCLUDE 127.0.0.1'],
   });
-  let id = null;
+  let id: string | null = null;
   for (let i = 0; i < 80 && !id; i++) {
-    const targets = await (await fetch(`http://127.0.0.1:${browser.port}/json/list`)).json();
+    const targets = (await (await fetch(`http://127.0.0.1:${browser.port}/json/list`)).json()) as TargetListItem[];
     const worker = targets.find((target) => /^service_worker chrome-extension:\/\/[a-p]+\/background\.js$/.test(`${target.type} ${target.url}`));
     if (worker) id = new URL(worker.url).host;
     else await sleep(150);
@@ -178,21 +191,27 @@ async function withExtension({ where = extensionDir, expectApp = url } = {}) {
   return { browser, id, workerId, viewer: staged.app };
 }
 
+/** A CDP reply, as far as this file reads one: the value `Runtime.evaluate` brought back. */
+interface CdpReply {
+  id?: number;
+  result?: { result?: { value?: number } };
+}
+
 /** The worker's own rules: is the redirect in place yet? */
-async function waitForRule(browser) {
-  const list = await (await fetch(`http://127.0.0.1:${browser.port}/json/list`)).json();
+async function waitForRule(browser: Browser): Promise<string> {
+  const list = (await (await fetch(`http://127.0.0.1:${browser.port}/json/list`)).json()) as TargetListItem[];
   const worker = list.find((target) => target.url.endsWith('/background.js'));
   if (!worker) throw new Error('no service worker to ask');
   const socket = new WebSocket(worker.webSocketDebuggerUrl);
   await new Promise((resolve) => socket.addEventListener('open', resolve, { once: true }));
   let next = 0;
-  const pending = new Map();
+  const pending = new Map<number, (reply: CdpReply) => void>();
   socket.addEventListener('message', (event) => {
-    const message = JSON.parse(event.data);
-    if (message.id && pending.has(message.id)) pending.get(message.id)(message);
+    const message = JSON.parse(event.data) as CdpReply;
+    if (message.id && pending.has(message.id)) pending.get(message.id)?.(message);
   });
-  const send = (method, params = {}) =>
-    new Promise((resolve) => {
+  const send = (method: string, params: Record<string, unknown> = {}): Promise<CdpReply> =>
+    new Promise<CdpReply>((resolve) => {
       const id = ++next;
       pending.set(id, resolve);
       socket.send(JSON.stringify({ id, method, params }));
@@ -220,25 +239,35 @@ async function waitForRule(browser) {
  * viewer tab alive at a time, because every frame on this server has the same URL
  * - the document travels to the frame as a message, not as a location.
  */
-async function frameTarget(browser, prefix = url) {
-  const targets = await (await fetch(`http://127.0.0.1:${browser.port}/json/list`)).json();
+async function frameTarget(browser: Browser, prefix: string = url): Promise<Page> {
+  const targets = (await (await fetch(`http://127.0.0.1:${browser.port}/json/list`)).json()) as TargetListItem[];
   const frames = targets.filter((target) => target.type === 'iframe' && target.url.startsWith(prefix));
   if (frames.length > 1) throw new Error(`${frames.length} frames at ${prefix} are open — close all but one before asking`);
   if (!frames.length) throw new Error(`no frame at ${prefix}`);
   return await attach(frames[0].webSocketDebuggerUrl);
 }
 
+/** How `inFrame` retries, and which frame it asks. */
+interface InFrameOptions {
+  tries?: number;
+  prefix?: string;
+}
+
 /** Ask the viewer's frame something. The frame is recreated with every tab load. */
-async function inFrame(browser, expression, { tries = 4, prefix = url } = {}) {
-  let last = null;
+async function inFrame<T = unknown>(
+  browser: Browser,
+  expression: (() => T) | string,
+  { tries = 4, prefix = url }: InFrameOptions = {},
+): Promise<T> {
+  let last: unknown = null;
   for (let i = 0; i < tries; i++) {
-    const frame = await frameTarget(browser, prefix).catch((error) => {
+    const frame = await frameTarget(browser, prefix).catch((error: unknown) => {
       last = error;
       return null;
     });
     if (frame) {
       try {
-        return await frame.evaluate(expression);
+        return await frame.evaluate<T>(expression);
       } catch (error) {
         last = error;
       } finally {
@@ -250,17 +279,28 @@ async function inFrame(browser, expression, { tries = 4, prefix = url } = {}) {
   throw last ?? new Error('the viewer frame never answered');
 }
 
+/** How `waitInFrame` waits, and which frame it asks. */
+interface WaitInFrameOptions {
+  label?: string;
+  timeout?: number;
+  prefix?: string;
+}
+
 /** The same, waiting for the frame to say something true. */
-async function waitInFrame(browser, predicate, { label, timeout = 60000, prefix = url } = {}) {
+async function waitInFrame<T>(
+  browser: Browser,
+  predicate: () => T,
+  { label, timeout = 60000, prefix = url }: WaitInFrameOptions = {},
+): Promise<T> {
   const source = `(${predicate.toString()})()`;
   const deadline = Date.now() + timeout;
-  let last;
+  let last: unknown;
   while (Date.now() < deadline) {
     try {
       last = await inFrame(browser, source, { tries: 1, prefix });
-      if (last) return last;
+      if (last) return last as T;
     } catch (error) {
-      last = `error: ${error.message}`;
+      last = `error: ${(error as Error).message}`;
     }
     await sleep(200);
   }
@@ -292,15 +332,53 @@ const PROBE = `(() => {
   requestAnimationFrame(tick);
 })();`;
 
-async function probeTheFrame(page) {
+/**
+ * What the two scripts above put on the page's own `window`. None of it belongs
+ * to the viewer: `STUB_VIEWER` reports the bridge it was handed, and `PROBE`
+ * records the frames it sampled, so both are declared here rather than anywhere
+ * the page could see them.
+ */
+declare global {
+  interface Window {
+    /** The bridge the stub viewer was handed by the host, or null before hello. */
+    __ready: number | null;
+    /** How many bytes the host handed over, as the stub viewer counted them. */
+    __handed: number;
+    /** What the probe sampled over the page's first animation frames. */
+    __frames: FirstFrame[];
+  }
+}
+
+/** One sample the probe took: what the host page looked like on one frame. */
+interface FirstFrame {
+  host: boolean;
+  display: string;
+  text: string;
+}
+
+/** The `Target.attachedToTarget` event, as far as this file reads it. */
+interface AttachedToTarget {
+  sessionId: string;
+  targetInfo: { type: string };
+  waitingForDebugger: boolean;
+}
+
+/**
+ * The page's `send` with the session of an attached frame: `Target.setAutoAttach`
+ * with `flatten` delivers frame traffic on a session id, which is the third
+ * argument the `Page` type does not name.
+ */
+type SessionSend = (method: string, params?: Record<string, unknown>, sessionId?: string) => Promise<any>;
+
+async function probeTheFrame(page: Page): Promise<void> {
   await page.send('Target.setAutoAttach', { autoAttach: true, waitForDebuggerOnStart: true, flatten: true });
-  page.on('Target.attachedToTarget', ({ sessionId, targetInfo, waitingForDebugger }) => {
+  page.on('Target.attachedToTarget', ({ sessionId, targetInfo, waitingForDebugger }: AttachedToTarget) => {
     void (async () => {
       if (targetInfo.type === 'iframe') {
-        await page.send('Page.enable', {}, sessionId).catch(() => {});
-        await page.send('Page.addScriptToEvaluateOnNewDocument', { source: PROBE }, sessionId).catch(() => {});
+        await (page.send as SessionSend)('Page.enable', {}, sessionId).catch(() => {});
+        await (page.send as SessionSend)('Page.addScriptToEvaluateOnNewDocument', { source: PROBE }, sessionId).catch(() => {});
       }
-      if (waitingForDebugger) await page.send('Runtime.runIfWaitingForDebugger', {}, sessionId).catch(() => {});
+      if (waitingForDebugger) await (page.send as SessionSend)('Runtime.runIfWaitingForDebugger', {}, sessionId).catch(() => {});
     })();
   });
 }
@@ -312,10 +390,12 @@ async function probeTheFrame(page) {
  * "page one is on screen", because a document that was read before opens
  * somewhere in the middle.
  */
-async function openPdf(browser, page, target) {
+async function openPdf(browser: Browser, page: Page, target: string): Promise<boolean> {
   await page.goto(target);
   await page.waitFor(
-    () => location.protocol === 'chrome-extension:' && (document.getElementById('app')?.src ?? '').startsWith('http'),
+    () =>
+      location.protocol === 'chrome-extension:' &&
+      ((document.getElementById('app') as HTMLIFrameElement | null)?.src ?? '').startsWith('http'),
     { label: 'the viewer tab', timeout: 60000 },
   );
   return await waitInFrame(
@@ -328,6 +408,12 @@ async function openPdf(browser, page, target) {
   );
 }
 
+/** The extension page's own answer to a key press: what it focused, and whether it has focus. */
+interface KeyPressState {
+  focused: string;
+  hasFocus: boolean;
+}
+
 /**
  * Press Ctrl+<key> in the frame, through the browser's own input pipeline.
  *
@@ -336,7 +422,11 @@ async function openPdf(browser, page, target) {
  * the key - so these presses are also what checks that the frame was given the
  * keyboard.
  */
-async function pressInFrame(browser, key, probe = null) {
+async function pressInFrame<Probe extends object = object>(
+  browser: Browser,
+  key: string,
+  probe: string | null = null,
+): Promise<KeyPressState & Probe> {
   const frame = await frameTarget(browser);
   try {
     for (const type of ['keyDown', 'keyUp']) {
@@ -353,14 +443,14 @@ async function pressInFrame(browser, key, probe = null) {
     const state = await frame.evaluate(() => ({ focused: document.activeElement?.id ?? '', hasFocus: document.hasFocus() }));
     // Whatever the key set in motion is read in the same frame, before the
     // target is closed: an expression string is evaluated as it is.
-    return probe ? { ...state, ...(await frame.evaluate(probe)) } : state;
+    return probe ? { ...state, ...(await frame.evaluate<Probe>(probe)) } : (state as KeyPressState & Probe);
   } finally {
     await frame.close();
   }
 }
 
 /** Wait for a download to land, and be the size it is going to be. */
-async function waitForFile(dir, seconds) {
+async function waitForFile(dir: string, seconds: number): Promise<{ name: string; size: number } | null> {
   const deadline = Date.now() + seconds * 1000;
   while (Date.now() < deadline) {
     const name = fs.readdirSync(dir).find((each) => !each.endsWith('.crdownload'));
@@ -383,7 +473,7 @@ async function waitForFile(dir, seconds) {
  * this build and a build of a page that does not exist yet - which is how a
  * *future* viewer is put in front of *this* extension.
  */
-function pointedAt(app, name) {
+function pointedAt(app: string, name: string): string {
   const into = path.join(here, 'out', `stub-${name}`);
   fs.rmSync(into, { recursive: true, force: true });
   fs.cpSync(extensionDir, into, { recursive: true });
@@ -392,6 +482,36 @@ function pointedAt(app, name) {
 }
 
 fs.mkdirSync(path.join(here, 'out'), { recursive: true });
+
+/** A remembered place, as the viewer wrote it into its own storage. */
+interface RememberedPlace {
+  key: string;
+  pos: { page: number; y: number | null };
+  settings: {
+    zoom?: { level: number };
+    bionic?: { on: boolean };
+    crop?: { patterns: string[] };
+  };
+  keys: number;
+}
+
+/** What an ordinary web page's `fetch` of the PDF came back with. */
+interface PageFetchResult {
+  ok: boolean;
+  status?: number;
+  message?: string;
+}
+
+/** What the print probe reports back: the blob the viewer handed the printer. */
+interface PrintedDocument {
+  printed: boolean;
+  type: string | null;
+  size: number;
+  magic: string;
+}
+
+/** The frame's debug handle, as it exists once the demo page has booted there. */
+type ViewerHandle = NonNullable<Window['webpdf']>;
 
 try {
   /* ---------------------------------------------------------- the extension */
@@ -405,9 +525,9 @@ try {
   await openPdf(browser, page, pdfUrl);
   const shell = await page.evaluate(() => ({
     href: location.href,
-    note: document.getElementById('note').hidden,
+    note: (document.getElementById('note') as HTMLElement).hidden,
     text: document.body.innerText.trim(),
-    frame: document.getElementById('app').src,
+    frame: (document.getElementById('app') as HTMLIFrameElement).src,
   }));
   check('a PDF URL opens the viewer', shell.href.startsWith(`chrome-extension://${id}/viewer.html`), shell.href.slice(0, 60));
   check('the viewer is framed as a hosted page', shell.frame.startsWith(viewer) && shell.frame.includes('host=1'), shell.frame);
@@ -426,7 +546,7 @@ try {
   );
 
   const drawn = await inFrame(browser, () => {
-    const viewer = window.webpdf.viewer();
+    const viewer = (window.webpdf as ViewerHandle).viewer() as PdfViewer;
     const svg = viewer.pageElement(1);
     return { pages: viewer.pageCount, text: svg ? svg.querySelectorAll('text').length : 0, place: viewer.place() };
   });
@@ -463,7 +583,7 @@ try {
     })()`,
   );
   await sleep(1200); // the page waits out the burst before it writes: 400 ms
-  const remembered = await inFrame(
+  const remembered = await inFrame<RememberedPlace | null>(
     browser,
     `(() => {
       const memory = JSON.parse(localStorage.getItem('webpdf.memory') ?? '{}');
@@ -473,7 +593,7 @@ try {
   );
   check(
     'the viewer writes the reader\'s place into its own memory',
-    remembered?.pos?.page === 5 && remembered.settings?.zoom?.level === 1.5 && remembered.settings?.bionic?.on === true && remembered.settings?.crop?.patterns.join() === '^[0-9]+$',
+    remembered?.pos?.page === 5 && remembered?.settings?.zoom?.level === 1.5 && remembered?.settings?.bionic?.on === true && remembered?.settings?.crop?.patterns.join() === '^[0-9]+$',
     JSON.stringify(remembered),
   );
 
@@ -486,7 +606,7 @@ try {
   // Open it again, the way a reader would: same URL, new tab load.
   await openPdf(browser, page, pdfUrl);
   const restored = await inFrame(browser, () => {
-    const viewer = window.webpdf.viewer();
+    const viewer = (window.webpdf as ViewerHandle).viewer() as PdfViewer;
     return { page: viewer.place().page, y: viewer.place().y, zoom: viewer.zoom, bionic: viewer.bionic, dim: viewer.bionicDim, crop: [...viewer.crop], padding: viewer.cropPadding };
   });
   check('the position comes back', restored.page === 5 && Math.abs((restored.y ?? 0) - 200) < 6, JSON.stringify({ page: restored.page, y: restored.y }));
@@ -519,7 +639,7 @@ try {
   const saved = await waitForFile(downloads, 20);
   check(
     'Ctrl+S saves the document the viewer was handed',
-    saved?.name === path.basename(file) && saved.size === fs.statSync(file).size,
+    saved?.name === path.basename(file) && saved?.size === fs.statSync(file).size,
     JSON.stringify(saved),
   );
 
@@ -527,7 +647,7 @@ try {
   // What is in the print frame has to be the bytes this page was handed, to the
   // byte - not the SVG pages the viewer drew from them, which is what the
   // browser would print if the page let the key through.
-  const printed = await pressInFrame(
+  const printed = await pressInFrame<PrintedDocument>(
     browser,
     'p',
     `(async () => {
@@ -566,7 +686,10 @@ try {
   // position, though, and every one of those messages wakes the worker again,
   // so the pages are quietened first.
   await page.goto('about:blank');
-  const workers = async () => (await (await fetch(`http://127.0.0.1:${browser.port}/json/list`)).json()).filter((target) => target.url.endsWith('/background.js'));
+  const workers = async () =>
+    ((await (await fetch(`http://127.0.0.1:${browser.port}/json/list`)).json()) as TargetListItem[]).filter((target) =>
+      target.url.endsWith('/background.js'),
+    );
   for (let i = 0; i < 6 && (await workers()).length > 0; i++) {
     for (const running of await workers()) await fetch(`http://127.0.0.1:${browser.port}/json/close/${running.id}`);
     await sleep(600);
@@ -596,7 +719,7 @@ try {
   const plain = `${bareOrigin}/plain`;
   const web = await browser.newPage();
   await web.goto(url);
-  const pageFetch = await web.evaluate(`(async () => {
+  const pageFetch = await web.evaluate<PageFetchResult>(`(async () => {
     try {
       const res = await fetch(${JSON.stringify(plain)});
       return { ok: true, status: res.status };
@@ -613,8 +736,8 @@ try {
   await intercepted.setViewport(1280, 900);
   await openPdf(browser, intercepted, plain);
   const throughType = await inFrame(browser, () => {
-    const viewer = window.webpdf.viewer();
-    return { pages: viewer.pageCount, text: viewer.pageElement(1).querySelectorAll('text').length };
+    const viewer = (window.webpdf as ViewerHandle).viewer() as PdfViewer;
+    return { pages: viewer.pageCount, text: (viewer.pageElement(1) as Element).querySelectorAll('text').length };
   });
   check('the extension opens it anyway, recognised by content type', throughType.pages > 1 && throughType.text > 0, JSON.stringify(throughType));
 
@@ -654,7 +777,7 @@ try {
   await gonePage.setViewport(1280, 900);
   await gonePage.goto(pdfUrl);
   const card = await gonePage
-    .waitFor(() => (document.getElementById('note')?.hidden === false ? document.getElementById('note-title').textContent : ''), {
+    .waitFor(() => (document.getElementById('note')?.hidden === false ? ((document.getElementById('note-title') as HTMLElement).textContent ?? '') : ''), {
       label: 'the extension to admit it is out of date',
       timeout: 30000,
     })
@@ -698,12 +821,12 @@ try {
       const theirs = verifyCrx(fs.readFileSync(`${packedDir}.crx`));
       check('the reader here understands Chromium\'s own crx', theirs.ok === true, `id ${theirs.extensionId}, version ${theirs.version}`);
     } catch (error) {
-      check('Chromium could pack the same directory', false, String(error.message).slice(0, 120));
+      check('Chromium could pack the same directory', false, String((error as Error).message).slice(0, 120));
     }
   }
 } catch (error) {
   failures++;
-  console.error(`FAIL: ${String(error?.stack ?? error)}`);
+  console.error(`FAIL: ${String((error as Error)?.stack ?? error)}`);
 } finally {
   bare.close();
 }

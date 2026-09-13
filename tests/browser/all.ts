@@ -1,7 +1,7 @@
 /**
  * One command for the whole browser test suite.
  *
- *   node tests/browser/all.mjs
+ *   node tests/browser/all.ts
  *
  * Makes sure the test corpus is in the cache (the papers are public URLs, so a
  * cold cache is a download), drives the wasm core's exports directly (in Node,
@@ -15,20 +15,20 @@
  * page, and the core is a prerequisite of it, the way `node_modules` is.
  */
 
-import { spawn } from 'node:child_process';
+import { spawn, type SpawnOptions } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { PAPERS, ensurePapers } from '../pdf-cache.mjs';
+import { PAPERS, ensurePapers } from '../pdf-cache.ts';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const root = path.join(here, '..', '..');
 const port = Number(process.env.PORT ?? 5178);
 const url = `http://127.0.0.1:${port}/`;
 
-const run = (args, opts = {}) =>
-  new Promise((resolve, reject) => {
+const run = (args: readonly string[], opts: SpawnOptions = {}) =>
+  new Promise<void>((resolve, reject) => {
     const child = spawn(process.execPath, args, { cwd: root, stdio: 'inherit', ...opts });
     child.on('exit', (code) => (code === 0 ? resolve() : reject(new Error(`${args.join(' ')} exited ${code}`))));
   });
@@ -47,7 +47,7 @@ if (!fs.existsSync(path.join(root, 'demo', 'engine', 'webpdf-core.wasm'))) {
 }
 
 console.log('› the wasm bridge, driven directly');
-await run([path.join(root, 'tests', 'core', 'wasm.mjs')]);
+await run([path.join(root, 'tests', 'core', 'wasm.ts')]);
 
 console.log('› building demo');
 await run([vite, 'build', '--config', 'vite.demo.config.ts']);
@@ -57,7 +57,7 @@ await run([vite, 'build', '--config', 'vite.demo.config.ts']);
 // cross-origin frame and no network in the way.
 console.log('› building the extension');
 await run([vite, 'build', '--config', 'vite.ext.config.ts']);
-await run([path.join(root, 'scripts/build-extension.mjs'), '--out', 'dist/ext', '--remote', url]);
+await run([path.join(root, 'scripts/build-extension.ts'), '--out', 'dist/ext', '--remote', url]);
 
 console.log(`› serving on ${url}`);
 const server = spawn(vite, ['preview', '--config', 'vite.demo.config.ts', '--port', String(port), '--host', '127.0.0.1'], {
@@ -83,22 +83,22 @@ try {
   if (!(await ready())) throw new Error('preview server never came up');
 
   console.log('\n› demo application');
-  await run([path.join(here, 'demo.mjs'), url], { stdio: 'inherit' });
+  await run([path.join(here, 'demo.ts'), url], { stdio: 'inherit' });
 
   console.log('\n› how a page is drawn while the document’s fonts are being planned');
-  await run([path.join(here, 'modes.mjs'), url], { stdio: 'inherit' });
+  await run([path.join(here, 'modes.ts'), url], { stdio: 'inherit' });
 
   console.log('\n› pinch / zoom contract');
-  await run([path.join(here, 'pinch.mjs'), url], { stdio: 'inherit' });
+  await run([path.join(here, 'pinch.ts'), url], { stdio: 'inherit' });
 
   console.log('\n› the host bridge: a new page, an old host');
-  await run([path.join(here, 'bridge.mjs'), url], { stdio: 'inherit' });
+  await run([path.join(here, 'bridge.ts'), url], { stdio: 'inherit' });
 
   console.log('\n› the viewer with no network: the service worker and the engine');
-  await run([path.join(here, 'pwa.mjs'), url], { stdio: 'inherit' });
+  await run([path.join(here, 'pwa.ts'), url], { stdio: 'inherit' });
 
   console.log('\n› the extension, loaded in a browser');
-  await run([path.join(here, 'extension.mjs'), url], { stdio: 'inherit' });
+  await run([path.join(here, 'extension.ts'), url], { stdio: 'inherit' });
 } catch (err) {
   failed = true;
   console.error(err);

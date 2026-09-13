@@ -23,8 +23,55 @@
  * keeps this honest about a format no one here controls.
  */
 
-import { createHash, createPrivateKey, createPublicKey, generateKeyPairSync, sign as signWith, verify as verifyWith } from 'node:crypto';
+import {
+  createHash,
+  createPrivateKey,
+  createPublicKey,
+  generateKeyPairSync,
+  sign as signWith,
+  verify as verifyWith,
+  type KeyObject,
+} from 'node:crypto';
 import fs from 'node:fs';
+
+/** A private key, and where it came from (for the build's own log line). */
+export interface SigningKey {
+  privateKey: KeyObject;
+  source: string;
+  created: boolean;
+}
+
+/** What a packed crx is, plus the two facts about it worth printing. */
+export interface PackedCrx {
+  crx: Buffer;
+  /** The extension id this key gives: the browser will show this one. */
+  extensionId: string;
+  /** The public half, base64 DER, as the manifest's `key` field wants it. */
+  publicKey: string;
+}
+
+export interface CrxParts {
+  version: number;
+  header: Buffer;
+  zip: Buffer;
+  signedHeaderData: Buffer;
+  publicKey: Buffer;
+  signature: Buffer;
+}
+
+export interface VerifiedCrx {
+  ok: boolean;
+  extensionId: string;
+  zip: Buffer;
+  version: number;
+}
+
+/** One length-delimited protobuf field, as `fields` reads it back. */
+interface ProtobufField {
+  tag: number;
+  wire: number;
+  value: Buffer;
+}
 
 /** The letters an extension id is spelled with: one per nibble, `a` for zero. */
 const ID_LETTERS = 'abcdefghijklmnop';
@@ -33,7 +80,7 @@ const ID_LETTERS = 'abcdefghijklmnop';
 const CONTEXT = Buffer.from('CRX3 SignedData\u0000', 'binary');
 
 /** A protobuf varint. */
-function varint(value) {
+function varint(value: number): Buffer {
   const bytes = [];
   let rest = value;
   do {
@@ -45,25 +92,25 @@ function varint(value) {
 }
 
 /** A length-delimited protobuf field: the wire type the whole header uses. */
-function field(tag, value) {
+function field(tag: number, value: Buffer): Buffer {
   return Buffer.concat([varint((tag << 3) | 2), varint(value.length), value]);
 }
 
-function uint32(value) {
+function uint32(value: number): Buffer {
   const buffer = Buffer.alloc(4);
   buffer.writeUInt32LE(value >>> 0, 0);
   return buffer;
 }
 
 /** Every field of a protobuf message, length-delimited ones being all we write. */
-function fields(message) {
-  const found = [];
+function fields(message: Buffer): ProtobufField[] {
+  const found: ProtobufField[] = [];
   let at = 0;
   while (at < message.length) {
     const read = () => {
       let value = 0;
       let shift = 0;
-      let byte;
+      let byte: number;
       do {
         byte = message[at++];
         value += (byte & 0x7f) * 2 ** shift;
@@ -80,7 +127,7 @@ function fields(message) {
 }
 
 /** The extension id of a public key: 16 bytes of SHA-256, a letter per nibble. */
-export function extensionId(publicKeyDer) {
+export function extensionId(publicKeyDer: Buffer): string {
   const digest = createHash('sha256').update(publicKeyDer).digest().subarray(0, 16);
   let id = '';
   for (const byte of digest) id += ID_LETTERS[byte >> 4] + ID_LETTERS[byte & 0x0f];
@@ -96,7 +143,7 @@ export function extensionId(publicKeyDer) {
  * for looking at the artifact and wrong for giving it to anyone, because a new id
  * is a reader with no remembered positions (see `ext/src/lib/history.ts`).
  */
-export function signingKey(where = null) {
+export function signingKey(where: string | null = null): SigningKey {
   const value = typeof where === 'string' && where.trim() !== '' ? where.trim() : null;
   if (value && value.includes('BEGIN')) {
     return { privateKey: createPrivateKey(value), source: 'the key it was given', created: false };
@@ -115,7 +162,7 @@ export function signingKey(where = null) {
  * Pack a zip as a signed crx. The zip is the archive as it will be installed:
  * the same bytes, which is what the signature is about.
  */
-export function packCrx(zip, privateKey) {
+export function packCrx(zip: Buffer, privateKey: KeyObject): PackedCrx {
   const publicKeyDer = createPublicKey(privateKey).export({ type: 'spki', format: 'der' });
   const crxId = createHash('sha256').update(publicKeyDer).digest().subarray(0, 16);
   const signedHeaderData = field(1, crxId);
@@ -130,7 +177,7 @@ export function packCrx(zip, privateKey) {
 }
 
 /** The parts of a crx: its header, its archive, and what the header says. */
-export function readCrx(buffer) {
+export function readCrx(buffer: Buffer): CrxParts {
   if (buffer.subarray(0, 4).toString('binary') !== 'Cr24') throw new Error('not a crx: no Cr24 magic');
   const version = buffer.readUInt32LE(4);
   const length = buffer.readUInt32LE(8);
@@ -157,7 +204,7 @@ export function readCrx(buffer) {
  * a crx this accepts is a crx whose signature is over its own contents and its
  * own header, in Chrome's layout - which is the property that matters.
  */
-export function verifyCrx(buffer) {
+export function verifyCrx(buffer: Buffer): VerifiedCrx {
   const crx = readCrx(buffer);
   const signed = Buffer.concat([CONTEXT, uint32(crx.signedHeaderData.length), crx.signedHeaderData, crx.zip]);
   const key = createPublicKey({ key: crx.publicKey, format: 'der', type: 'spki' });

@@ -15,7 +15,7 @@ import { defineConfig } from 'vite';
  * asks to see every URL is exactly the wrong thing to ship.
  *
  * The rest of the extension - `viewer.html`, `viewer.css`, `manifest.json` and
- * the icon - is *staged*, not compiled, by `scripts/build-extension.mjs`, which
+ * the icon - is *staged*, not compiled, by `scripts/build-extension.ts`, which
  * runs after this and assembles `dist/ext/webpdf`.
  */
 

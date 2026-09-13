@@ -2,7 +2,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import path from 'node:path';
-import { defineConfig, type Connect, type Plugin } from 'vite';
+import { defineConfig, transformWithEsbuild, type Connect, type Plugin } from 'vite';
 
 /**
  * Demo / dev-server config.
@@ -110,6 +110,22 @@ function papers(): Plugin {
 }
 
 /**
+ * Read one of the two files this build emits as plain JavaScript.
+ *
+ * `demo/host-mode.ts` and `demo/sw.ts` are written in TypeScript like the rest
+ * of the project, but neither goes through the module graph: one is a classic
+ * script in the head, and the other is started by the browser as a worker with
+ * its own global scope. So neither can be imported - both are read by name and
+ * emitted as they are - and the types have to come off somewhere. esbuild is
+ * already here as Vite's own transform, so it is asked directly rather than
+ * bringing a second one in.
+ */
+async function plainScript(file: string): Promise<string> {
+  const { code } = await transformWithEsbuild(fs.readFileSync(file, 'utf8'), file);
+  return code;
+}
+
+/**
  * Emit `host-mode.js` - the one script that has to run before the first paint -
  * next to the built page.
  *
@@ -118,11 +134,11 @@ function papers(): Plugin {
  * offers a document, so the class that hides the card has to be set while the
  * shell is still parsing. That means a classic script in the head - and Vite
  * bundles module scripts only, so a non-module script would be left pointing at
- * `demo/host-mode.js`, which the build does not copy. Emitting it here keeps the
+ * `demo/host-mode.ts`, which is not in the bundle. Emitting it here keeps the
  * reference and the file in step; the dev server serves it from the source tree.
  */
 function hostMode(): Plugin {
-  const file = path.resolve(import.meta.dirname, 'demo/host-mode.js');
+  const file = path.resolve(import.meta.dirname, 'demo/host-mode.ts');
   let serving = false;
 
   return {
@@ -130,8 +146,8 @@ function hostMode(): Plugin {
     configResolved: (config) => {
       serving = config.command === 'serve';
     },
-    buildStart() {
-      if (!serving) this.emitFile({ type: 'asset', fileName: 'host-mode.js', source: fs.readFileSync(file, 'utf8') });
+    async buildStart() {
+      if (!serving) this.emitFile({ type: 'asset', fileName: 'host-mode.js', source: await plainScript(file) });
     },
     // The tag itself is added here rather than written in the shell: a classic
     // script in the source HTML is left alone by the build *and* complained about,
@@ -153,9 +169,14 @@ function hostMode(): Plugin {
     configureServer: (server) => {
       server.middlewares.use((req: IncomingMessage, res: ServerResponse, next: (err?: unknown) => void) => {
         if (!serving || (req.url ?? '').split('?')[0] !== '/host-mode.js') return next();
-        res.setHeader('Content-Type', 'text/javascript; charset=utf-8');
-        res.setHeader('Cache-Control', 'no-cache');
-        res.end(fs.readFileSync(file, 'utf8'));
+        plainScript(file).then(
+          (source) => {
+            res.setHeader('Content-Type', 'text/javascript; charset=utf-8');
+            res.setHeader('Cache-Control', 'no-cache');
+            res.end(source);
+          },
+          (error: unknown) => next(error),
+        );
       });
     },
   };
@@ -177,7 +198,7 @@ const CORE_FILES = ['webpdf-core.js', 'webpdf-core.wasm'];
  * There is one source and it is this site's own. The engine this replaces was
  * ten megabytes of somebody else's npm package, fetched from a CDN first because
  * a versioned URL could be cached forever; the core is built from this
- * repository by `scripts/build-core-wasm.mjs`, so it is emitted here, next to the
+ * repository by `scripts/build-core-wasm.ts`, so it is emitted here, next to the
  * page, and updated exactly when the page is. What survives from that design is
  * the digest: the service worker only keeps bytes whose hash the page was built
  * expecting, so a cache can never hand back a stale binary under a name that did
@@ -257,7 +278,7 @@ function core(): Plugin {
  * when it should.
  *
  * The service worker itself, and why it is shaped the way it is, is
- * `demo/sw.js`; this only fills in the two lists it needs and puts it next to
+ * `demo/sw.ts`; this only fills in the two lists it needs and puts it next to
  * the page, where its scope covers the whole site.
  */
 function pwa(): Plugin {
@@ -274,7 +295,7 @@ function pwa(): Plugin {
    * them offline. And the core's wasm is not - nine megabytes fetched on install,
    * for a reader who may never open a document, is not a promise any site should
    * make. It is kept the first time it is actually used: see `warmEngine` in
-   * `demo/sw.js`.
+   * `demo/sw.ts`.
    */
   const readBundle = (bundle: Record<string, OutputFile>) => {
     const icons: Record<string, string> = {};
@@ -306,7 +327,7 @@ function pwa(): Plugin {
         },
       ],
     },
-    generateBundle(_options, bundle) {
+    async generateBundle(_options, bundle) {
       const files = bundle as unknown as Record<string, OutputFile>;
       const { icons, shell } = readBundle(files);
 
@@ -337,14 +358,13 @@ function pwa(): Plugin {
         digest = digest.update(file).update(source);
       }
 
-      const source = fs
-        .readFileSync(path.resolve(import.meta.dirname, 'demo/sw.js'), 'utf8')
+      const source = (await plainScript(path.resolve(import.meta.dirname, 'demo/sw.ts')))
         .replace('__BUILD__', JSON.stringify(digest.digest('hex').slice(0, 16)))
         .replace('__PRECACHE__', JSON.stringify(shell, null, 2));
       // A placeholder that survived means the worker would silently precache
       // nothing, or share a cache with the build before this one.
       for (const marker of ['__BUILD__', '__PRECACHE__']) {
-        if (source.includes(marker)) this.error(`demo/sw.js no longer has a ${marker} placeholder to fill in`);
+        if (source.includes(marker)) this.error(`demo/sw.ts no longer has a ${marker} placeholder to fill in`);
       }
       this.emitFile({ type: 'asset', fileName: 'sw.js', source });
     },

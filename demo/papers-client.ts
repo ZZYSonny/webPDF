@@ -1,7 +1,7 @@
 /**
  * The test corpus, as the demo page sees it.
  *
- * `papers.mjs` is the list of public URLs; the Vite demo config additionally
+ * `papers.ts` is the list of public URLs; the Vite demo config additionally
  * serves any paper the test suite has cached, at `/pdf/<name>`, and tells this
  * module which ones those are - as an injected global for `vite preview`, which
  * serves a pre-built page, and as a virtual module for `vite dev`. The directory
@@ -10,7 +10,7 @@
  */
 
 import { papers as cached } from 'virtual:webpdf/papers';
-import { PAPERS, pdfName, pdfPath, type Paper } from './papers.mjs';
+import { PAPERS, pdfName, pdfPath, type Paper } from './papers.ts';
 
 export type { Paper };
 

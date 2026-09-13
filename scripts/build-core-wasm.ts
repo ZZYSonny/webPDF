@@ -27,7 +27,7 @@
  * alive by `webpdf_core::wasm::keep_exports`, because an rlib's `#[no_mangle]`
  * functions are not linker roots on their own.
  *
- *   node scripts/build-core-wasm.mjs [--out <dir>]
+ *   node scripts/build-core-wasm.ts [--out <dir>]
  */
 import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';

@@ -12,7 +12,7 @@
  *
  * The crx is packed with the key this test generates and read back the way a
  * browser reads it. Chromium's own packer is the real judge of the format and
- * `tests/browser/extension.mjs` puts a crx this code wrote through it; what is
+ * `tests/browser/extension.ts` puts a crx this code wrote through it; what is
  * checked here is that a crx is signed over *its own contents* - tamper with the
  * archive and the signature stops verifying.
  */
@@ -21,7 +21,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
 import { isOpenable } from '../ext/src/lib/url.ts';
-import { extensionId, packCrx, readCrx, signingKey, verifyCrx } from '../scripts/crx.mjs';
+import { extensionId, packCrx, readCrx, signingKey, verifyCrx } from '../scripts/crx.ts';
 
 test('only the schemes a reader can actually open are accepted', () => {
   assert.equal(isOpenable('https://example.test/a.pdf'), true);

@@ -6,7 +6,7 @@
  * begin with an underscore - which is exactly what Vite's asset directory
  * could become. An empty file is the whole fix.
  *
- *   node scripts/no-jekyll.mjs [dir]
+ *   node scripts/no-jekyll.ts [dir]
  */
 
 import fs from 'node:fs';

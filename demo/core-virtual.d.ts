@@ -5,7 +5,7 @@
  * so these are not facts about a package version: they are where *this build*
  * put the two files Emscripten wrote, and the digest of the binary among them.
  * The service worker keeps the binary against that digest (see `warmEngine` in
- * `sw.js`), which is the one thing about the core that cannot be read off the
+ * `sw.ts`), which is the one thing about the core that cannot be read off the
  * page itself - the glue is fetched by URL at runtime, so nothing about it
  * reaches the module graph.
  *

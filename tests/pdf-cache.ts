@@ -1,13 +1,13 @@
 /**
  * The corpus, as the Node tests see it.
  *
- * `papers.mjs` knows the public URLs; this is the Node layer over it: where the
+ * `papers.ts` knows the public URLs; this is the Node layer over it: where the
  * cache is, which documents are in it, and how to make sure one is there before
  * a render needs it.
  *
- *   node tests/pdf-cache.mjs            # fetch anything missing
- *   node tests/pdf-cache.mjs --list     # what is in the cache, and its size
- *   node tests/pdf-cache.mjs --clear    # empty the cache
+ *   node tests/pdf-cache.ts            # fetch anything missing
+ *   node tests/pdf-cache.ts --list     # what is in the cache, and its size
+ *   node tests/pdf-cache.ts --clear    # empty the cache
  *
  * The cache directory is `$WEBPDF_PDF_CACHE` when set - relative paths are read
  * from the repository root - and `.scratch/pdfs` (gitignored) otherwise.
@@ -17,9 +17,20 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { CACHE_DIR, CACHE_ENV, PAPERS, cachedPath } from '../demo/papers.mjs';
+import { CACHE_DIR, CACHE_ENV, PAPERS, cachedPath, type Paper } from '../demo/papers.ts';
 
 export { CACHE_DIR, CACHE_ENV, PAPERS };
+export type { Paper };
+
+/** Options shared by the fetch helpers. */
+export interface FetchOptions {
+  /** An absolute cache directory, or one relative to the repository root. */
+  dir?: string;
+  /** Download again even when the cache file is already there. */
+  force?: boolean;
+  /** Receives one line per decision: cached, fetching, saved, failed. */
+  log?: (message: string) => void;
+}
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 
@@ -34,12 +45,12 @@ const TIMEOUT_MS = 120_000;
  * argument - is read from the repository root, so it is the same directory
  * whichever script asks.
  */
-export function cacheDir(dir = process.env[CACHE_ENV] || CACHE_DIR) {
+export function cacheDir(dir: string = process.env[CACHE_ENV] || CACHE_DIR): string {
   return path.resolve(root, dir);
 }
 
 /** Every cached PDF, sorted by name. A missing directory is an empty cache. */
-export function cachedFiles(dir) {
+export function cachedFiles(dir?: string): string[] {
   const directory = cacheDir(dir);
   let entries;
   try {
@@ -56,14 +67,14 @@ export function cachedFiles(dir) {
 }
 
 /** The cache file for a paper's URL, or null while it is not cached. */
-export function cachedFile(url, dir) {
+export function cachedFile(url: string, dir?: string): string | null {
   const file = path.resolve(root, cachedPath(url, dir));
   return fs.existsSync(file) ? file : null;
 }
 
 /** Which of `urls` (every paper by default) are cached right now. */
-export function cachedPapers(urls = PAPERS.map((p) => p.url), dir) {
-  return urls.map((url) => cachedFile(url, dir)).filter(Boolean);
+export function cachedPapers(urls: readonly string[] = PAPERS.map((p) => p.url), dir?: string): string[] {
+  return urls.map((url) => cachedFile(url, dir)).filter((file): file is string => file !== null);
 }
 
 /**
@@ -73,7 +84,10 @@ export function cachedPapers(urls = PAPERS.map((p) => p.url), dir) {
  * cannot be fetched is reported and skipped, never silently rendered as
  * something else.
  */
-export async function ensurePapers(urls = PAPERS.map((p) => p.url), options = {}) {
+export async function ensurePapers(
+  urls: readonly string[] = PAPERS.map((p) => p.url),
+  options: FetchOptions = {},
+): Promise<Map<string, string | Error>> {
   if (!urls.length) return new Map();
   return downloadAll(urls, { ...options, dir: cacheDir(options.dir) });
 }
@@ -85,11 +99,9 @@ export async function ensurePapers(urls = PAPERS.map((p) => p.url), options = {}
  * file is never half a PDF; and they are checked for the `%PDF` magic, so a
  * captive portal's HTML error page cannot end up cached as a document.
  *
- * @param {string} url
- * @param {{dir?: string, force?: boolean, log?: (message: string) => void}} [options]
- * @returns {Promise<string>} the path the bytes were written to
+ * @returns the path the bytes were written to
  */
-export async function download(url, options = {}) {
+export async function download(url: string, options: FetchOptions = {}): Promise<string> {
   const target = path.resolve(root, cachedPath(url, options.dir));
   const say = options.log ?? (() => {});
 
@@ -121,27 +133,29 @@ export async function download(url, options = {}) {
  * `Error` in its place so a caller can report what could not be fetched without
  * losing the ones that could.
  *
- * @param {readonly string[]} [urls]
- * @param {{dir?: string, force?: boolean, log?: (message: string) => void}} [options]
  */
-export async function downloadAll(urls, options = {}) {
+export async function downloadAll(
+  urls?: readonly string[],
+  options: FetchOptions = {},
+): Promise<Map<string, string | Error>> {
   const wanted = urls?.length ? urls : PAPERS.map((p) => p.url);
-  const paths = new Map();
+  const paths = new Map<string, string | Error>();
   // Sequential on purpose: parallel fetches from one host is a good way to be
   // asked, politely, to stop.
   for (const url of wanted) {
     try {
       paths.set(url, await download(url, options));
     } catch (error) {
-      options.log?.(`failed   ${url}: ${error.message}`);
-      paths.set(url, error);
+      const failure = error instanceof Error ? error : new Error(String(error));
+      options.log?.(`failed   ${url}: ${failure.message}`);
+      paths.set(url, failure);
     }
   }
   return paths;
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
-  const say = (line) => console.log(line);
+  const say = (line: string) => console.log(line);
   const args = process.argv.slice(2);
   const dir = cacheDir();
 

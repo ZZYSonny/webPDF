@@ -14,21 +14,102 @@
  *     because the pages are laid out at a scale we control;
  *   - Ctrl+wheel is left to the browser and must not touch the layout.
  *
- *   node tests/browser/pinch.mjs [url]
+ *   node tests/browser/pinch.ts [url]
  */
 
-import { launch } from './cdp.mjs';
+import { launch } from './cdp.ts';
+
+/** One finger of a CDP touch event: where it is and which finger it is. */
+interface TouchPoint {
+  x: number;
+  y: number;
+  id: number;
+}
+
+/** The params of `Input.dispatchTouchEvent`: the gesture phase and its fingers. */
+interface TouchEventParams {
+  type: string;
+  touchPoints: TouchPoint[];
+}
+
+/** The params of `Input.dispatchKeyEvent`: one key with its modifiers and ids. */
+interface KeyEventParams {
+  modifiers: number;
+  key: string;
+  code: string;
+  windowsVirtualKeyCode: number;
+  nativeVirtualKeyCode: number;
+}
+
+/** The params of `Input.dispatchMouseEvent`: a wheel tick at a point. */
+interface MouseWheelEventParams {
+  type: string;
+  x: number;
+  y: number;
+  deltaX: number;
+  deltaY: number;
+  modifiers: number;
+  pointerType: string;
+}
+
+/** One row of `Performance.getMetrics`, which reports name/value pairs. */
+interface PerformanceMetric {
+  name: string;
+  value: number;
+}
+
+/** Which of the chrome panels the page had open. */
+interface PanelOpenState {
+  outline: boolean;
+  menu: boolean;
+  crop: boolean;
+}
+
+/** What the outline panel says once it has followed the page. */
+interface TocPanelState {
+  page: number;
+  entry: string;
+  overflowing: boolean;
+  scrollTop: number;
+  visible: boolean;
+  vvLeft: number;
+  scrollX: number;
+}
+
+/** The zoom dropdown as read back from the page. */
+interface ZoomMenuState {
+  open: boolean;
+  options: string[];
+  selected: string;
+}
+
+/** What picking an entry in the dropdown left behind. */
+interface ZoomChoiceState {
+  open: boolean;
+  box: string;
+  mode: string;
+}
+
+/** What the keyboard walk of the dropdown left behind. */
+interface ZoomKeyState {
+  opened: boolean;
+  start: string;
+  moved: string;
+  closed: boolean;
+  box: string;
+  mode: string;
+}
 
 const url = process.argv[2] ?? 'http://127.0.0.1:5178/';
 const W = 1440;
 const H = 900;
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
 const browser = await launch();
 const page = await browser.newPage();
 
-const failures = [];
-const check = (label, ok, detail) => {
+const failures: string[] = [];
+const check = (label: string, ok: boolean, detail?: string) => {
   console.log(`  ${ok ? 'ok  ' : 'FAIL'}  ${label}${detail ? ` — ${detail}` : ''}`);
   if (!ok) failures.push(label);
 };
@@ -40,47 +121,47 @@ const state = () =>
     const sr = host?.shadowRoot;
     const box = sr?.querySelector('.wpdf-page');
     const rect = box?.getBoundingClientRect();
-    const vv = visualViewport;
+    const vv = visualViewport as VisualViewport;
     const viewer = window.webpdf?.viewer?.();
     return {
       pageScale: +vv.scale.toFixed(3),
       // The box holds a bare number; the fit modes are named in the dropdown.
-      box: document.getElementById('zoom-value')?.value ?? '',
+      box: (document.getElementById('zoom-value') as HTMLInputElement | null)?.value ?? '',
       presets: [...document.querySelectorAll('#zoom-menu .menu-option')].map((o) => o.textContent),
       mode: viewer?.zoomMode ?? '',
       scale: viewer ? +viewer.zoom.toFixed(4) : null,
       statusBar: !!document.querySelector('.statusbar'),
       zoomedClass: document.body.classList.contains('wpdf-zoomed'),
-      chromeOpacity: getComputedStyle(document.querySelector('.topbar')).opacity,
-      outlineOpacity: getComputedStyle(document.getElementById('toc')).opacity,
-      outlineOpen: document.getElementById('toc').hidden === false,
-      zoomMenuOpen: document.getElementById('zoom-menu').hidden === false,
-      cropMenuOpen: document.getElementById('crop-menu').hidden === false,
-      page: Number(document.getElementById('pageno').value),
+      chromeOpacity: getComputedStyle(document.querySelector('.topbar') as Element).opacity,
+      outlineOpacity: getComputedStyle(document.getElementById('toc') as Element).opacity,
+      outlineOpen: (document.getElementById('toc') as HTMLElement).hidden === false,
+      zoomMenuOpen: (document.getElementById('zoom-menu') as HTMLElement).hidden === false,
+      cropMenuOpen: (document.getElementById('crop-menu') as HTMLElement).hidden === false,
+      page: Number((document.getElementById('pageno') as HTMLInputElement).value),
       tocActive: document.querySelector('#toc-body .toc-item.active')?.textContent ?? '',
       scrollX: Math.round(window.scrollX),
       scrollY: Math.round(window.scrollY),
       // Where the magnified view sits over the layout, in CSS pixels.
       vvLeft: Math.round(vv.offsetLeft),
       vvTop: Math.round(vv.offsetTop),
-      hostLeft: Math.round(host.getBoundingClientRect().left),
-      docH: document.scrollingElement.scrollHeight,
+      hostLeft: Math.round((host as HTMLElement).getBoundingClientRect().left),
+      docH: (document.scrollingElement as Element).scrollHeight,
       innerHeight,
       dpr: +devicePixelRatio.toFixed(3),
       pageBox: rect ? `${Math.round(rect.width)}x${Math.round(rect.height)}` : null,
-      slots: [...(sr?.querySelectorAll('.wpdf-page') ?? [])].map((el) => Number(el.dataset.page)),
+      slots: [...(sr?.querySelectorAll<HTMLElement>('.wpdf-page') ?? [])].map((el) => Number(el.dataset.page)),
     };
   });
 
 const metrics = async () => {
   await page.send('Performance.enable');
-  const { metrics: list } = await page.send('Performance.getMetrics');
-  const out = {};
+  const { metrics: list } = (await page.send('Performance.getMetrics')) as { metrics: PerformanceMetric[] };
+  const out: Record<string, number> = {};
   for (const m of list) out[m.name] = m.value;
   return out;
 };
 
-const measure = async (gesture) => {
+const measure = async (gesture: () => Promise<void>) => {
   const before = { s: await state(), m: await metrics() };
   await gesture();
   await sleep(500);
@@ -93,13 +174,14 @@ const measure = async (gesture) => {
   };
 };
 
-const touch = (type, points) => page.send('Input.dispatchTouchEvent', { type, touchPoints: points });
+const touch = (type: string, points: TouchPoint[]) =>
+  page.send('Input.dispatchTouchEvent', { type, touchPoints: points } satisfies TouchEventParams);
 
 /** A real two-finger pinch: fingers start `from` apart and end `to` apart. */
 async function pinch({ from = 60, to = 240, steps = 22 } = {}) {
   const cx = W / 2;
   const cy = H / 2;
-  const points = (d) => [
+  const points = (d: number) => [
     { x: cx, y: cy - d, id: 1 },
     { x: cx, y: cy + d, id: 2 },
   ];
@@ -116,7 +198,7 @@ async function pinch({ from = 60, to = 240, steps = 22 } = {}) {
 async function pan({ dy = -900, steps = 30 } = {}) {
   const cx = W / 2;
   const cy = H / 2;
-  const points = (off) => [
+  const points = (off: number) => [
     { x: cx, y: cy + off, id: 1 },
     { x: cx + 90, y: cy + off, id: 2 },
   ];
@@ -136,7 +218,7 @@ async function pan({ dy = -900, steps = 30 } = {}) {
  * re-derives the page scale from it, ending the zoom under test.
  */
 async function swipe({ dx = 0, dy = 0, steps = 24 } = {}) {
-  const point = (i) => [{ x: W / 2 + (dx * i) / steps, y: H / 2 + (dy * i) / steps, id: 1 }];
+  const point = (i: number) => [{ x: W / 2 + (dx * i) / steps, y: H / 2 + (dy * i) / steps, id: 1 }];
   await touch('touchStart', point(0));
   await sleep(16);
   for (let i = 1; i <= steps; i++) {
@@ -158,8 +240,8 @@ async function crossPage() {
   return { before, after: await state() };
 }
 
-async function chord(key, code, vk) {
-  const base = { modifiers: 2, key, code, windowsVirtualKeyCode: vk, nativeVirtualKeyCode: vk };
+async function chord(key: string, code: string, vk: number) {
+  const base = { modifiers: 2, key, code, windowsVirtualKeyCode: vk, nativeVirtualKeyCode: vk } satisfies KeyEventParams;
   await page.send('Input.dispatchKeyEvent', { ...base, type: 'rawKeyDown' });
   await page.send('Input.dispatchKeyEvent', { ...base, type: 'keyUp' });
   await sleep(300);
@@ -183,12 +265,12 @@ try {
   const document_ = await page.evaluate(() => {
     // The example papers are a dropdown on the empty card; the rows carry the
     // URLs they open.
-    const rows = [...document.querySelectorAll('#example-menu .menu-option')];
-    const options = rows.map((el) => el.dataset.url).filter(Boolean);
+    const rows = [...document.querySelectorAll<HTMLElement>('#example-menu .menu-option')];
+    const options = rows.map((el) => el.dataset.url).filter((value): value is string => Boolean(value));
     const chosen = options.find((value) => value.startsWith('/pdf/')) ?? options.find((value) => value.startsWith('https://arxiv.org/'));
     if (!chosen) throw new Error('no example to open: ' + JSON.stringify(options));
-    document.getElementById('example-btn').click();
-    rows.find((el) => el.dataset.url === chosen).click();
+    (document.getElementById('example-btn') as HTMLElement).click();
+    (rows.find((el) => el.dataset.url === chosen) as HTMLElement).click();
     return chosen;
   });
   console.log('document: ' + document_);
@@ -214,8 +296,8 @@ try {
   console.log("\n— a pinch is the browser's, and costs no layout —");
   // Every panel open first: a pinch magnifies the chrome along with the pages,
   // so what happens to an open panel is part of the contract.
-  const panelsOpen = await page
-    .evaluate(
+  const panelsOpen: PanelOpenState = await page
+    .evaluate<string>(
       `JSON.stringify((() => {
         const toc = document.getElementById('toc');
         if (toc.hidden) document.getElementById('toc-toggle').click();
@@ -277,7 +359,7 @@ try {
   // Reopen the panel behind the zoom on purpose: a host that does not dismiss
   // its chrome must still not have its document moved under it.
   await page.evaluate(() => {
-    if (document.getElementById('toc').hidden) document.getElementById('toc-toggle').click();
+    if ((document.getElementById('toc') as HTMLElement).hidden) (document.getElementById('toc-toggle') as HTMLElement).click();
   });
   const listed = await state();
   const crossed = await crossPage();
@@ -302,7 +384,7 @@ try {
     body.scrollTop = 0;
   })()`);
   const second = await crossPage();
-  const panel = await page.evaluate(`JSON.stringify((() => {
+  const panel: TocPanelState = await page.evaluate<string>(`JSON.stringify((() => {
     const body = document.getElementById('toc-body');
     const box = body.getBoundingClientRect();
     const active = document.querySelector('#toc-body .toc-item.active');
@@ -324,8 +406,8 @@ try {
     `visualViewport.offsetLeft ${crossed.after.vvLeft} -> ${panel.vvLeft}, scrollX ${panel.scrollX}`);
 
   await page.evaluate(() => {
-    document.getElementById('toc-body').style.maxHeight = '';
-    document.getElementById('toc-close').click();
+    (document.getElementById('toc-body') as HTMLElement).style.maxHeight = '';
+    (document.getElementById('toc-close') as HTMLElement).click();
     window.scrollTo(0, 0);
   });
   await resetScale();
@@ -337,7 +419,7 @@ try {
     start.presets.join(' · '));
   await chord('-', 'Minus', 189);
   const down = await state();
-  check('Ctrl+- stepped to the next level down', down.scale < start.scale, `${start.box} -> ${down.box} (${down.mode})`);
+  check('Ctrl+- stepped to the next level down', down.scale! < start.scale!, `${start.box} -> ${down.box} (${down.mode})`);
   check('Ctrl+- was not a browser zoom', down.dpr === dprBefore && down.innerHeight === start.innerHeight, `dpr ${down.dpr}, innerHeight ${down.innerHeight}`);
   await chord('=', 'Equal', 187);
   const up = await state();
@@ -351,8 +433,8 @@ try {
   // The `+`/`-` buttons are gone from the bar; the list is the control, and the
   // fit modes are named there by what they resolve to.
   await page.evaluate(() => {
-    document.getElementById('zoom-menu-btn').click();
-    const row = [...document.querySelectorAll('#zoom-menu .menu-option')]
+    (document.getElementById('zoom-menu-btn') as HTMLElement).click();
+    const row = [...document.querySelectorAll<HTMLElement>('#zoom-menu .menu-option')]
       .find((el) => /\(fit page\)$/.test(el.textContent));
     if (!row) throw new Error('the dropdown names no fit-page level');
     row.click();
@@ -362,9 +444,9 @@ try {
   check('choosing fit page applies it', chosenPage.mode === 'fit-page', `${home.box} (${home.mode}) -> ${chosenPage.box} (${chosenPage.mode})`);
   check('the dropdown closed behind the choice', !chosenPage.zoomMenuOpen);
   await page.evaluate(() => {
-    document.getElementById('zoom-menu-btn').click();
-    const row = [...document.querySelectorAll('#zoom-menu .menu-option')].find((el) => /\(fit width\)$/.test(el.textContent));
-    row.click();
+    (document.getElementById('zoom-menu-btn') as HTMLElement).click();
+    const row = [...document.querySelectorAll<HTMLElement>('#zoom-menu .menu-option')].find((el) => /\(fit width\)$/.test(el.textContent));
+    (row as HTMLElement).click();
   });
   await sleep(500);
   const back = await state();
@@ -372,7 +454,7 @@ try {
 
   console.log('\n— typing a level sets it, and the old status bar is gone —');
   check('there is no status bar left to collide with the pages', !back.statusBar);
-  const typeLevel = async (text) => {
+  const typeLevel = async (text: string) => {
     // `page.evaluate` takes an options object, not an argument, so the value goes
     // into the expression.
     await page.evaluate(`(() => {
@@ -386,22 +468,22 @@ try {
     return state();
   };
   const typed = await typeLevel('175');
-  check('a typed number is applied, with no percent sign to type', Math.abs(typed.scale - 1.75) < 0.001, `"175" -> ${typed.box} (${typed.mode})`);
+  check('a typed number is applied, with no percent sign to type', Math.abs(typed.scale! - 1.75) < 0.001, `"175" -> ${typed.box} (${typed.mode})`);
   check('the box reads back as a bare number', typed.box === '175', `"${typed.box}"`);
   const tolerated = await typeLevel('150%');
-  check('a stray percent sign is tolerated, not required', Math.abs(tolerated.scale - 1.5) < 0.001, `"150%" -> ${tolerated.box}`);
+  check('a stray percent sign is tolerated, not required', Math.abs(tolerated.scale! - 1.5) < 0.001, `"150%" -> ${tolerated.box}`);
   const fitPage = await typeLevel('fit page');
   check('a typed fit mode is applied', fitPage.mode === 'fit-page' && /^\d+$/.test(fitPage.box), `"${fitPage.box}" (${fitPage.mode})`);
 
   console.log('\n— the dropdown lists every level, open and closed —');
-  await page.evaluate(() => document.getElementById('zoom-menu-btn').click());
+  await page.evaluate(() => (document.getElementById('zoom-menu-btn') as HTMLElement).click());
   await sleep(250);
-  const opened = await page.evaluate(`JSON.stringify({
+  const opened = await page.evaluate<string>(`JSON.stringify({
     open: document.getElementById('zoom-menu').hidden === false,
     options: [...document.querySelectorAll('#zoom-menu .menu-option')].map((o) => o.textContent),
     selected: document.querySelector('#zoom-menu .menu-option[aria-selected="true"]')?.textContent ?? '',
   })`);
-  const menu = JSON.parse(opened);
+  const menu: ZoomMenuState = JSON.parse(opened);
   check('the button opens the list', menu.open, `${menu.options.length} options`);
   check('every level is offered, fit modes by percentage',
     menu.options.length >= 9 && menu.options.some((o) => /^\d+% \(fit width\)$/.test(o)) && menu.options.some((o) => /^\d+% \(fit page\)$/.test(o)),
@@ -412,27 +494,27 @@ try {
     option.click();
   })()`);
   await sleep(500);
-  const picked = await page.evaluate(`JSON.stringify({
+  const picked = await page.evaluate<string>(`JSON.stringify({
     open: document.getElementById('zoom-menu').hidden === false,
     box: document.getElementById('zoom-value').value,
     mode: window.webpdf.viewer().zoomMode,
   })`);
-  const chosen = JSON.parse(picked);
+  const chosen: ZoomChoiceState = JSON.parse(picked);
   check('picking an entry applies it and closes the list', !chosen.open && chosen.mode === 'fit-width' && /^\d+$/.test(chosen.box),
     `"${chosen.box}" (${chosen.mode})`);
 
   console.log('\n— a click elsewhere closes the list —');
-  await page.evaluate(() => document.getElementById('zoom-menu-btn').click());
+  await page.evaluate(() => (document.getElementById('zoom-menu-btn') as HTMLElement).click());
   await sleep(200);
-  await page.evaluate(() => document.getElementById('viewer').dispatchEvent(new PointerEvent('pointerdown', { bubbles: true })));
+  await page.evaluate(() => (document.getElementById('viewer') as HTMLElement).dispatchEvent(new PointerEvent('pointerdown', { bubbles: true })));
   await sleep(200);
-  const dismissed = await page.evaluate(() => document.getElementById('zoom-menu').hidden === false);
+  const dismissed = await page.evaluate(() => (document.getElementById('zoom-menu') as HTMLElement).hidden === false);
   check('clicking outside dismisses it', !dismissed);
 
   await chord('0', 'Digit0', 48);
 
   console.log('\n— the keyboard drives the list too —');
-  const keyed = await page.evaluate(`JSON.stringify((() => {
+  const keyed = await page.evaluate<string>(`JSON.stringify((() => {
     const input = document.getElementById('zoom-value');
     input.focus();
     input.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true }));
@@ -450,7 +532,7 @@ try {
       mode: window.webpdf.viewer().zoomMode,
     };
   })())`);
-  const keys = JSON.parse(keyed);
+  const keys: ZoomKeyState = JSON.parse(keyed);
   await sleep(300);
   check('ArrowDown opens the list on the current level', keys.opened && /\(fit width\)$/.test(keys.start), `"${keys.start}"`);
   check('a second ArrowDown moves the cursor', keys.moved !== keys.start, `"${keys.start}" -> "${keys.moved}"`);
@@ -463,7 +545,7 @@ try {
     for (let i = 0; i < 8; i++) {
       await page.send('Input.dispatchMouseEvent', {
         type: 'mouseWheel', x: W / 2, y: H / 2, deltaX: 0, deltaY: -40, modifiers: 2, pointerType: 'mouse',
-      });
+      } satisfies MouseWheelEventParams);
       await sleep(16);
     }
   });
@@ -471,7 +553,7 @@ try {
   check('no layout work for ctrl+wheel', wheel.layoutMs < 10, `${wheel.layoutCount} layouts, ${wheel.layoutMs} ms`);
   await resetScale();
 } catch (error) {
-  failures.push(String(error?.message ?? error));
+  failures.push(String((error as { message?: unknown } | undefined)?.message ?? error));
   console.error(error);
 } finally {
   await page.close();

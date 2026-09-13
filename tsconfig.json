@@ -14,7 +14,8 @@
     "isolatedModules": true,
     "verbatimModuleSyntax": true,
     "allowImportingTsExtensions": true,
-    "resolveJsonModule": true
+    "resolveJsonModule": true,
+    "erasableSyntaxOnly": true
   },
-  "include": ["demo", "ext", "tests", "vite.demo.config.ts", "vite.ext.config.ts"]
+  "include": ["demo", "ext", "scripts", "tests", "vite.demo.config.ts", "vite.ext.config.ts"]
 }

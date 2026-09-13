@@ -69,9 +69,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+      # The build scripts are TypeScript now, and Node runs them directly by
+      # stripping the types, so the runner's Node has to be one that does that
+      # without a flag. That has been the default since 22.18; 24 is the LTS
+      # that carries it, and `engines` in package.json states the same floor.
       - uses: actions/setup-node@v5
         with:
-          node-version: 22
+          node-version: 24
           cache: npm
       # MuPDF's Rust wrapper generates its bindings with bindgen, and bindgen
       # parses MuPDF's headers with libclang - so install one here rather than

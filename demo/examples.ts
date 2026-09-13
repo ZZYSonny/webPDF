@@ -14,7 +14,7 @@
  */
 
 import { cachedPapers, type Paper } from './papers-client.ts';
-import { PAPERS, pdfName } from './papers.mjs';
+import { PAPERS, pdfName } from './papers.ts';
 
 export interface Example {
   /** What the picker says. */

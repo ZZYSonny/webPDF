@@ -24,22 +24,23 @@
  *      the reader can see: a page that was on screen when the plan arrived stays
  *      on screen through it.
  *
- *   node tests/browser/modes.mjs [url]
+ *   node tests/browser/modes.ts [url]
  */
 
-import { launch } from './cdp.mjs';
+import { launch } from './cdp.ts';
+import type { RenderMode } from '../../demo/viewer.ts';
 
 const url = process.argv[2] ?? 'http://127.0.0.1:5178/';
 const PUBLIC_EXAMPLE = 'https://arxiv.org/pdf/1706.03762v7';
 const CACHED_PREFIX = '/pdf/';
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
 let failures = 0;
-const fail = (msg) => {
+const fail = (msg: string): void => {
   console.error('FAIL: ' + msg);
   failures++;
 };
-const ok = (msg) => console.log('  ok    ' + msg);
+const ok = (msg: string): void => console.log('  ok    ' + msg);
 
 const browser = await launch();
 const page = await browser.newPage();
@@ -150,13 +151,85 @@ await page.send('Page.addScriptToEvaluateOnNewDocument', {
 });
 
 /**
+ * What the script above leaves in the page, and what the test reads back.
+ *
+ * These are the page's own counters, so only the page can say what they hold;
+ * the shapes below are the shapes the script writes, and anything that may be
+ * absent before the script has run or before a document is open is nullable.
+ */
+interface PageState {
+  /** The page's number, from the slot's own dataset. */
+  page: number;
+  /** How many `<svg>` pictures the slot holds: two means a handover is running. */
+  pictures: number;
+  /** The family on the page's text, or null while it is drawn as outlines. */
+  family: string | null;
+  /** Characters in the page's text, which is zero before the plan is ready. */
+  chars: number;
+}
+
+/** One reading of the whole viewer, as `window.__state()` reports it. */
+interface ViewerState {
+  /** Frames made for pages: always zero, because a page is a node of one document. */
+  frames: number;
+  /** Faces the top document knows about. */
+  topFonts: number;
+  /** The plan's own flag, or null before a plan starts. */
+  ready: boolean | null;
+  /** The mode in force, or null before the page's debug handle exists. */
+  mode: RenderMode | null;
+  /** One row per page slot, in page order. */
+  rows: PageState[];
+}
+
+/** What the first page on screen was drawn in, as the script recorded it. */
+interface FirstDraw {
+  pictures: number;
+  topFonts: number;
+  ready: boolean | null;
+  family: string | null;
+  chars: number;
+}
+
+/** The card's own answer: the modes it offers, the one it stars, the one in force. */
+interface CardState {
+  rows: Array<string | undefined>;
+  starred: Array<string | undefined>;
+  selected: Array<string | undefined>;
+  label: string;
+}
+
+/** The page's debug handle, which the bootstrap `waitFor` has proved is there. */
+type WebpdfHandle = NonNullable<Window['webpdf']>;
+
+declare global {
+  interface Window {
+    /** The page's counters, or null while the viewer has no shadow root. */
+    __state(): ViewerState | null;
+    /** The card's own answer, read by opening and closing its menu. */
+    __card(): CardState;
+    /** What the first page was drawn in, or null until one is on screen. */
+    __firstDraw: FirstDraw | null;
+    /** Whether a frame was ever made for a page. */
+    __frameSeen: boolean;
+    /** The pages on screen when the plan became ready, or null before that. */
+    __paintedAtReady: number[] | null;
+    /** Pages that stopped holding a page while the redraw happened. */
+    __lostPaint: number[];
+  }
+}
+
+/**
  * Load the demo in one mode, open a paper through the card, and report.
  *
  * `prefer` picks the example by a substring of its URL, so a section that needs
  * a plan long enough to watch can ask for a bigger document than the one the
  * card happens to list first.
  */
-async function openExample(mode, prefer = null) {
+async function openExample(
+  mode: RenderMode,
+  prefer: string | null = null,
+): Promise<{ chosen: string; first: FirstDraw; firstMs: number }> {
   const at = `${url}${url.includes('?') ? '&' : '?'}mode=${mode}`;
   await page.goto(at);
   await page.waitFor(() => typeof window.webpdf === 'object', { label: 'demo bootstrap', timeout: 90000 });
@@ -173,10 +246,12 @@ async function openExample(mode, prefer = null) {
     window.__frameSeen = false;
     window.__paintedAtReady = null;
     window.__lostPaint = [];
-    document.getElementById('example-btn').click();
+    (document.getElementById('example-btn') as HTMLElement).click();
   });
   const options = await page.evaluate(() =>
-    [...document.querySelectorAll('#example-menu .menu-option')].map((el) => el.dataset.url).filter(Boolean),
+    [...document.querySelectorAll<HTMLElement>('#example-menu .menu-option')]
+      .map((el) => el.dataset.url)
+      .filter(Boolean) as string[],
   );
   const chosen =
     (prefer && options.find((value) => value.includes(prefer))) ??
@@ -187,7 +262,7 @@ async function openExample(mode, prefer = null) {
     `[...document.querySelectorAll('#example-menu .menu-option')].find((el) => el.dataset.url === ${JSON.stringify(chosen)}).click()`,
   );
   await page.waitFor(() => window.__firstDraw !== null, { label: `a page in ${mode} mode`, timeout: 120000 });
-  const first = await page.evaluate('window.__firstDraw');
+  const first = await page.evaluate<FirstDraw>('window.__firstDraw');
   return { chosen, first, firstMs: Date.now() - started };
 }
 
@@ -233,10 +308,11 @@ try {
     console.log('  diagnostics: ' + JSON.stringify(await page.evaluate('window.__state()')));
     throw error;
   });
-  const redrawn = await page.evaluate('window.__state()');
-  const lost = await page.evaluate('window.__lostPaint');
-  const painted = await page.evaluate('window.__paintedAtReady');
-  const one = redrawn.rows.find((row) => row.page === 1);
+  const redrawn = await page.evaluate<ViewerState>('window.__state()');
+  const lost = await page.evaluate<number[]>('window.__lostPaint');
+  const painted = await page.evaluate<number[] | null>('window.__paintedAtReady');
+  // The wait above is for page 1 to be drawn again as text, so it has a row.
+  const one = redrawn.rows.find((row) => row.page === 1) as PageState;
   console.log(
     '  ' +
       JSON.stringify({
@@ -258,8 +334,8 @@ try {
   console.log('\n— global: one document, nothing drawn until the plan is ready —');
   const global = await openExample('global');
   await sleep(500);
-  const state = await page.evaluate('window.__state()');
-  const frameSeen = await page.evaluate('window.__frameSeen');
+  const state = await page.evaluate<ViewerState>('window.__state()');
+  const frameSeen = await page.evaluate<boolean>('window.__frameSeen');
   console.log('  ' + JSON.stringify({ firstPageMs: global.firstMs, ...global.first, frameSeen }));
   if (frameSeen) fail('a page frame appeared in the global mode');
   if (global.first.pictures !== 1) fail(`the first page arrived as ${global.first.pictures} picture(s)`);
@@ -286,7 +362,7 @@ try {
   await page.evaluate("localStorage.removeItem('webpdf.memory')");
   await page.goto(url);
   await page.waitFor(() => typeof window.webpdf === 'object', { label: 'demo bootstrap', timeout: 90000 });
-  const byDefault = await page.evaluate(() => ({ mode: window.webpdf.mode(), card: window.__card() }));
+  const byDefault = await page.evaluate(() => ({ mode: (window.webpdf as WebpdfHandle).mode(), card: window.__card() }));
   console.log('  ' + JSON.stringify(byDefault));
   if (byDefault.mode !== 'global') fail(`a reader who has chosen nothing should start in the global mode, got ${byDefault.mode}`);
   if (byDefault.card.rows.join() !== 'global,progressive')
@@ -300,10 +376,13 @@ try {
   else ok(`a fresh page starts in ${byDefault.mode}, first in the list, and the card stars it and marks it as the choice`);
 
   await page.evaluate(() => {
-    document.getElementById('mode-btn').click();
-    document.querySelector('#mode-menu .menu-option[data-mode="progressive"]').click();
+    (document.getElementById('mode-btn') as HTMLElement).click();
+    (document.querySelector('#mode-menu .menu-option[data-mode="progressive"]') as HTMLElement).click();
   });
-  const chosen = await page.evaluate(() => ({ mode: window.webpdf.mode(), label: document.getElementById('mode-label').textContent }));
+  const chosen = await page.evaluate(() => ({
+    mode: (window.webpdf as WebpdfHandle).mode(),
+    label: (document.getElementById('mode-label') as HTMLElement).textContent,
+  }));
   if (chosen.mode !== 'progressive') fail(`choosing progressive should take effect before the next document, got ${chosen.mode}`);
   // Read a document under the chosen mode, which is what writes the choice down.
   await openExample('progressive');
@@ -311,7 +390,7 @@ try {
   await sleep(1200);
   await page.goto(url);
   await page.waitFor(() => typeof window.webpdf === 'object', { label: 'demo bootstrap again', timeout: 90000 });
-  const remembered = await page.evaluate(() => ({ mode: window.webpdf.mode(), card: window.__card() }));
+  const remembered = await page.evaluate(() => ({ mode: (window.webpdf as WebpdfHandle).mode(), card: window.__card() }));
   console.log('  ' + JSON.stringify(remembered));
   if (remembered.mode !== 'progressive') fail(`the mode a reader chose should come back on the next visit, got ${remembered.mode}`);
   else if (remembered.card.selected.join() !== 'progressive') {
@@ -325,11 +404,12 @@ try {
   await page.evaluate("localStorage.removeItem('webpdf.memory')");
   await page.goto(`${url}${url.includes('?') ? '&' : '?'}plan=0`);
   await page.waitFor(() => typeof window.webpdf === 'object', { label: 'demo bootstrap with plan=0', timeout: 90000 });
-  const legacy = await page.evaluate('window.webpdf.mode()');
+  const legacy = await page.evaluate<RenderMode>('window.webpdf.mode()');
   if (legacy !== 'progressive') fail(`?plan=0 should still mean the mode that does not wait for the plan, got ${legacy}`);
   else ok('?plan=0 still names the mode that does not wait for the plan');
 } catch (error) {
-  fail(String(error && error.stack ? error.stack.split('\n')[0] : error));
+  const thrown = error as { stack?: string } | null | undefined;
+  fail(String(thrown && thrown.stack ? thrown.stack.split('\n')[0] : error));
 } finally {
   await browser.close();
 }

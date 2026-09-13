@@ -6,7 +6,7 @@
  * different places on purpose:
  *
  *   - the *shell* - this page and the files it is made of - is the service
- *     worker's (`demo/sw.js`), because it is the same for everyone and belongs to
+ *     worker's (`demo/sw.ts`), because it is the same for everyone and belongs to
  *     the build rather than to the reader. This module's job there is to register
  *     it, to notice when a *newer* build has installed and is waiting for a page
  *     willing to reload into it, and to tell it once, after the engine has
@@ -17,7 +17,7 @@
  *   - the *documents* are this module's, because which documents matter is a
  *     reader's business and nobody else's. The page writes them into a cache of
  *     its own as they are opened, and the worker serves them from there (see
- *     `kept` in `sw.js`) - so the rule for what is available offline is exactly
+ *     `kept` in `sw.ts`) - so the rule for what is available offline is exactly
  *     "what has been read here", with nothing cached behind the reader's back.
  *
  * The list is capped and it is ordered by when a document was kept, which is the
@@ -40,13 +40,13 @@
  * they try to open something while offline.
  */
 
-/** Where the core's binary is, and what it must digest to: spelled in `sw.js` too. */
+/** Where the core's binary is, and what it must digest to: spelled in `sw.ts` too. */
 export interface EngineSource {
   url: string;
   integrity: string;
 }
 
-/** The documents this page has kept. Spelled in `demo/sw.js` too: it reads this one. */
+/** The documents this page has kept. Spelled in `demo/sw.ts` too: it reads this one. */
 const DOCS = 'webpdf-docs';
 
 /** How many documents are worth keeping - see the note above. */

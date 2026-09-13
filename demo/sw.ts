@@ -42,11 +42,31 @@
 
 /* eslint-env serviceworker */
 
-// A digest of every file in the shell: the same build, the same name.
-const BUILD = __BUILD__;
+// The two things the build knows and this file cannot: written by the `pwa()`
+// plugin in `vite.demo.config.ts`, which reads this file, replaces the two names
+// below, and emits the result. They are declared here so the file can be
+// typechecked like every other one; the declarations are gone by the time it is
+// emitted, and the names they describe are what the build looks for.
 
-// The shell, as relative URLs. Filled in by `pwa()` in `vite.demo.config.ts`.
+/** A digest of every file in the shell: the same build, the same name. */
+declare const __BUILD__: string;
+
+/** The shell, as relative URLs. Filled in by `pwa()` in `vite.demo.config.ts`. */
+declare const __PRECACHE__: readonly string[];
+
+const BUILD = __BUILD__;
 const PRECACHE = __PRECACHE__;
+
+/**
+ * This worker's own global scope.
+ *
+ * `self` is typed as a `Window` here, because the project is one TypeScript
+ * program and a page's globals are what most of it wants: `lib.dom` wins over
+ * `lib.webworker` for the name. `waitUntil`, `clients` and `skipWaiting` are
+ * this worker's, not a window's, so the scope is named once, as itself, and
+ * everything below goes through it.
+ */
+const scope = self as unknown as ServiceWorkerGlobalScope;
 
 /** The shell's cache, named after the build so a new one cannot mix with it. */
 const SHELL = `webpdf-shell-${BUILD}`;
@@ -64,14 +84,14 @@ const SHELL_PREFIX = 'webpdf-shell-';
  * shell and is never trimmed.
  */
 const ORDER = 'webpdf-shells';
-const ORDER_KEY = new URL('./shells.json', self.location.href).href;
+const ORDER_KEY = new URL('./shells.json', scope.location.href).href;
 
 /** The engine's cache, and the page's document cache, which is not ours to trim. */
 const ENGINE = 'webpdf-engine';
 const DOCS = 'webpdf-docs';
 
 /** The page, for a navigation that is not about a particular file. */
-const INDEX = new URL('./index.html', self.location.href).href;
+const INDEX = new URL('./index.html', scope.location.href).href;
 
 /**
  * The site's own entry - `/`, or `/webPDF/` where it is published - which is the
@@ -81,7 +101,7 @@ const INDEX = new URL('./index.html', self.location.href).href;
  * locally cached papers into the page on its way out, and a navigation that
  * skipped that would come up without them.
  */
-const ENTRY = new URL('./', self.location.href).href;
+const ENTRY = new URL('./', scope.location.href).href;
 
 /**
  * The shell this build replaced, once one is known to be kept.
@@ -90,30 +110,30 @@ const ENTRY = new URL('./', self.location.href).href;
  * every request that is not a navigation. A worker that was terminated reads it
  * again on the first such request; that is what `read` is for.
  */
-let older = null;
+let older: string | null = null;
 let read = false;
 
 /** The shells that are kept, newest first. */
-async function order() {
+async function order(): Promise<string[]> {
   const cache = await caches.open(ORDER);
   const kept = await cache.match(ORDER_KEY);
   if (!kept) return [];
   try {
-    const names = JSON.parse(await kept.text());
-    return Array.isArray(names) ? names.filter((name) => typeof name === 'string') : [];
+    const names: unknown = JSON.parse(await kept.text());
+    return Array.isArray(names) ? names.filter((name): name is string => typeof name === 'string') : [];
   } catch {
     return [];
   }
 }
 
 /** Put a shell at the front of the order, where it stays until it is dropped. */
-async function remember(name) {
+async function remember(name: string): Promise<void> {
   const cache = await caches.open(ORDER);
   const names = [name, ...(await order()).filter((other) => other !== name)];
   await cache.put(ORDER_KEY, new Response(JSON.stringify(names)));
 }
 
-self.addEventListener('install', (event) => {
+scope.addEventListener('install', (event) => {
   event.waitUntil(
     (async () => {
       const cache = await caches.open(SHELL);
@@ -126,7 +146,7 @@ self.addEventListener('install', (event) => {
       // lifetime, and a shell assembled from that would be a page pointing at
       // files the deploy has already replaced - which is a broken build, cached
       // until the *next* one.
-      await cache.addAll(PRECACHE.map((file) => new Request(file, { cache: 'reload' })));
+      await cache.addAll(PRECACHE.map((file: string) => new Request(file, { cache: 'reload' })));
       // The entry alone is allowed to fail - `index.html` is already in the list
       // and is matched in its place - so a server that answers it with a
       // redirect, or not at all, cannot take the whole install down with it.
@@ -138,7 +158,7 @@ self.addEventListener('install', (event) => {
   );
 });
 
-self.addEventListener('activate', (event) => {
+scope.addEventListener('activate', (event) => {
   event.waitUntil(
     (async () => {
       // This build's shell, and the one before it. The second is not nostalgia:
@@ -157,13 +177,13 @@ self.addEventListener('activate', (event) => {
       // A first visit installed this worker *after* the page it belongs to was
       // already loading; claiming it is what makes that page's later fetches -
       // the engine, a document - go through here.
-      await self.clients.claim();
+      await scope.clients.claim();
     })(),
   );
 });
 
 /** The shell this build replaced, if it is still kept. */
-async function previous() {
+async function previous(): Promise<string | null> {
   if (!read) {
     read = true;
     older = (await order()).find((name) => name !== SHELL) ?? null;
@@ -172,7 +192,7 @@ async function previous() {
 }
 
 /** The page itself: the cached shell, by URL or as the site's one page. */
-async function shell(request) {
+async function shell(request: Request): Promise<Response> {
   const cache = await caches.open(SHELL);
   return (
     (await cache.match(request, { ignoreSearch: true })) ??
@@ -191,7 +211,7 @@ async function shell(request) {
  * deploy used to be - a viewer that cannot load its own engine until someone
  * reloads it.
  */
-async function shelled(request) {
+async function shelled(request: Request): Promise<Response | null> {
   for (const name of [SHELL, await previous()]) {
     if (!name || !(await caches.has(name))) continue;
     const hit = await (await caches.open(name)).match(request, { ignoreSearch: true });
@@ -209,20 +229,20 @@ async function shelled(request) {
  * necessarily the engine, and this is one cache that must not fill up with things
  * that are not.
  */
-async function engine(request) {
+async function engine(request: Request): Promise<Response> {
   const cache = await caches.open(ENGINE);
   const kept = await cache.match(request, { ignoreVary: true });
   return kept ?? (await fetch(request));
 }
 
 /** A document the page kept, a file the shell kept, or the network. */
-async function kept(request) {
+async function kept(request: Request): Promise<Response> {
   const cached = await caches.match(request, { cacheName: DOCS, ignoreVary: true });
   if (cached) return cached;
   return (await shelled(request)) ?? (await fetch(request));
 }
 
-self.addEventListener('fetch', (event) => {
+scope.addEventListener('fetch', (event) => {
   const request = event.request;
   if (request.method !== 'GET') return;
   const url = new URL(request.url);
@@ -235,8 +255,8 @@ self.addEventListener('fetch', (event) => {
 });
 
 /** `sha384-<base64>` of some bytes, or null where there is nothing to check with. */
-async function digestOf(bytes) {
-  const subtle = self.crypto?.subtle;
+async function digestOf(bytes: ArrayBuffer): Promise<string | null> {
+  const subtle = scope.crypto?.subtle;
   if (!subtle) return null;
   const hash = await subtle.digest('SHA-384', bytes);
   let binary = '';
@@ -259,11 +279,11 @@ async function digestOf(bytes) {
  * fetched rather than bundled, so the two have to be tied together some other
  * way.
  */
-async function warmEngine(source) {
+async function warmEngine(source: { url?: string; integrity?: string } | undefined): Promise<void> {
   if (!source?.url || !source.integrity) return;
   try {
     const cache = await caches.open(ENGINE);
-    const url = new URL(source.url, self.location.href).href;
+    const url = new URL(source.url, scope.location.href).href;
     if (await cache.match(url, { ignoreVary: true })) return;
     const response = await fetch(url);
     if (!response.ok) return;
@@ -283,7 +303,7 @@ async function warmEngine(source) {
   }
 }
 
-self.addEventListener('message', (event) => {
+scope.addEventListener('message', (event) => {
   const message = event.data;
   if (!message) return;
   if (message.wpdf === 'warm-engine') {
@@ -295,5 +315,5 @@ self.addEventListener('message', (event) => {
   // The page reloads itself on `controllerchange`, so the shell is not swapped
   // out from under a page that is staying - and the shell it came from is still
   // kept until the next build, for whatever it had already started to fetch.
-  if (message.wpdf === 'apply-update') event.waitUntil(self.skipWaiting());
+  if (message.wpdf === 'apply-update') event.waitUntil(scope.skipWaiting());
 });

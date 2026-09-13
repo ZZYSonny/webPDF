@@ -4,13 +4,13 @@
  * Drives the real UI (the sample picker) in a real browser and waits for the
  * render to actually complete, then reports what is in the DOM.
  *
- *   node tests/browser/demo.mjs [url] [outPng]
+ *   node tests/browser/demo.ts [url] [outPng]
  */
 
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { launch } from './cdp.mjs';
+import { launch } from './cdp.ts';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const url = process.argv[2] ?? 'http://127.0.0.1:5175/';
@@ -21,7 +21,7 @@ const url = process.argv[2] ?? 'http://127.0.0.1:5175/';
  * are planned, and then every page once (see `RenderMode`) - and the checks below
  * are about the *planned* document: one document, one face per font, every face
  * before the first page and none after it. So this run asks for that mode
- * explicitly. What each mode draws while the plan is walking is `modes.mjs`.
+ * explicitly. What each mode draws while the plan is walking is `modes.ts`.
  */
 const at = `${url}${url.includes('?') ? '&' : '?'}mode=global`;
 const out = process.argv[3] ?? path.join(here, 'out', 'demo.png');
@@ -38,7 +38,7 @@ fs.mkdirSync(path.dirname(out), { recursive: true });
 const PUBLIC_EXAMPLE = 'https://arxiv.org/pdf/1706.03762v7';
 const CACHED_PREFIX = '/pdf/';
 
-const fail = (msg) => {
+const fail = (msg: string) => {
   console.error('FAIL: ' + msg);
   process.exitCode = 1;
 };
@@ -147,6 +147,48 @@ await page.send('Page.addScriptToEvaluateOnNewDocument', {
 });
 
 /**
+ * The helpers the script above installs in the page.
+ *
+ * They are page globals rather than module exports, because the checks reach
+ * them by evaluating source *in* the page: what the browser runs is the text
+ * above, so nothing here can be imported. Declaring them is what lets those
+ * expressions be written as functions and typechecked; each one is read the way
+ * the script above writes it.
+ */
+interface WpdfDemoPage {
+  /** Every `font-family` the document was told about, from before it booted. */
+  __faces: string[];
+  /** The pages on screen, inside the viewer's shadow root. */
+  __pages(): HTMLElement[];
+  /** The SVG one page element draws into. */
+  __pageSvg(el: Element): SVGElement | null;
+  /** Every page that is drawn. */
+  __pageSvgs(): SVGElement[];
+  /** The page with this number, or null while it is not drawn. */
+  __svgOfPage(n: number | string): SVGElement | null;
+  /** The link annotations of one kind, across the drawn pages. */
+  __pageLinks(kind: string): Element[];
+  /** What is on screen: the numbers a failure is read against. */
+  __diag(): Record<string, unknown>;
+  /** A rect in the page's own coordinates. */
+  __pageRect(el: Element): { left: number; top: number; right: number; bottom: number; width: number; height: number };
+  /** What is really under a point, through the viewer's shadow root. */
+  __elementAt(x: number, y: number): Element | null;
+  /** Every text element the drawn pages carry. */
+  __pageTexts(): SVGTextElement[];
+  /** Every stylesheet the pages' document carries: the faces are registered there. */
+  __pageCss(): string;
+  /** The faces each document reachable from here was told about. */
+  __allFaces(): { id: string; faces: string[] }[];
+  /** Windows this page asked to open, as `[url, target, features]`. */
+  __opened: [string, string, string][];
+}
+
+declare global {
+  interface Window extends WpdfDemoPage {}
+}
+
+/**
  * A page that has never been asked to draw anything.
  *
  * The memory belongs to the page - it is read once, at start-up, and written back
@@ -176,7 +218,7 @@ const forgetMemory = async () => {
  * The value is embedded in the expression because `page.evaluate(fn, args)` takes
  * evaluation options as its second argument, not arguments for the function.
  */
-const open = async (value) => {
+const open = async (value: string) => {
   const before = await page.evaluate('document.title');
   await page.evaluate(`document.getElementById('example-btn').click()`);
   await page.evaluate(`(() => {
@@ -188,7 +230,8 @@ const open = async (value) => {
   try {
     // A predicate that carries the old title: `waitFor` calls what it is given
     // with no arguments, so the value has to be inside it.
-    await page.waitFor(new Function(`return document.title !== ${JSON.stringify(before)};`), {
+    const changed = new Function(`return document.title !== ${JSON.stringify(before)};`) as () => boolean;
+    await page.waitFor(changed, {
       label: `the document at ${value}`,
       timeout: 120000,
     });
@@ -213,7 +256,7 @@ const open = async (value) => {
   // it is over when no slot holds two.
   await page.waitFor(
     () => {
-      if (window.webpdf.plan()?.ready !== true) return false;
+      if (window.webpdf!.plan()?.ready !== true) return false;
       const sr = document.getElementById('viewer')?.shadowRoot;
       const pages = [...(sr?.querySelectorAll('.wpdf-page') ?? [])];
       return pages.length > 0 && pages.every((el) => el.querySelectorAll('svg.wpdf-page-svg').length === 1);
@@ -244,19 +287,28 @@ const open = async (value) => {
  * Nothing has to be waited out of the way first: an open document says nothing
  * at all, so the picture is the document and the bar and nothing else.
  */
-const shot = async (file) => {
+const shot = async (file: string) => {
   await page.screenshot(file);
   fs.copyFileSync(file, path.join(here, '..', '..', 'imgs', 'demo.png'));
   console.log('screenshot: ' + file + ' (+ imgs/demo.png)');
 };
 
+/** What the find bar says: the page's own words, as the checks compare them. */
+interface SearchState {
+  count: string;
+  pageno: string;
+  highlights: number;
+  activeHighlights: number;
+  bandsOnPage: number;
+}
+
 /** What the find bar says, and how much of it is boxed on the visible page. */
-const searchState = () =>
-  page.evaluate(() => {
-    const sr = document.getElementById('viewer').shadowRoot;
-    const page = document.getElementById('pageno').value;
+const searchState = (): Promise<SearchState> =>
+  page.evaluate<SearchState>(() => {
+    const sr = document.getElementById('viewer')!.shadowRoot!;
+    const page = document.querySelector<HTMLInputElement>('#pageno')!.value;
     const box = sr.querySelector(`.wpdf-page[data-page="${page}"]`);
-    const bands = (root) => root.querySelectorAll('rect[data-wpdf-search]').length;
+    const bands = (root: ParentNode) => root.querySelectorAll('rect[data-wpdf-search]').length;
     // A band is a child of the page's own `svg`, so it is counted there rather
     // than in the document: the pages share one document now, and a
     // document-wide count would be every page's bands at once.
@@ -269,7 +321,7 @@ const searchState = () =>
         .__pageSvgs()
         .reduce((n, svg) => n + svg.querySelectorAll('rect[data-wpdf-search="active"]').length, 0),
       // Boxes on the page we are looking at, active and inactive together.
-      bandsOnPage: box && window.__pageSvg(box) ? bands(window.__pageSvg(box)) : 0,
+      bandsOnPage: box && window.__pageSvg(box) ? bands(window.__pageSvg(box)!) : 0,
     };
   });
 
@@ -280,8 +332,22 @@ const searchState = () =>
  * click. A link under the sticky bar, or half off the viewport, cannot be
  * clicked, so it is not a candidate.
  */
-const linkCandidates = (kind) =>
-  page.evaluate(`(() => {
+/** One hit area on screen, with the point to click and where it points. */
+interface LinkCandidate {
+  /** The page slot it is on, as a string, or null. */
+  slot: string | null;
+  page: string | null;
+  dest: string | null;
+  uri: string | null;
+  href: string | null;
+  tabindex: string | null;
+  /** The centre of the rect, in viewport coordinates. */
+  cx: number;
+  cy: number;
+}
+
+const linkCandidates = (kind: string): Promise<LinkCandidate[]> =>
+  page.evaluate<LinkCandidate[]>(`(() => {
     const sr = document.getElementById('viewer').shadowRoot;
     const chrome = document.querySelector('.topbar')?.offsetHeight ?? 0;
     const out = [];
@@ -305,9 +371,17 @@ const linkCandidates = (kind) =>
     return out;
   })()`);
 
+/** What the browser actually hits at a point: the tag, and the link it is in. */
+interface HitAt {
+  tag: string | null;
+  kind: string | null;
+  page: string | null;
+  uri: string | null;
+}
+
 /** What the browser actually hits at a point - the transparent rect, hopefully. */
-const whatIsAt = (cx, cy) =>
-  page.evaluate(`(() => {
+const whatIsAt = (cx: number, cy: number): Promise<HitAt> =>
+  page.evaluate<HitAt>(`(() => {
     const el = window.__elementAt(${cx}, ${cy});
     const a = el && el.closest ? el.closest('a[data-wpdf-link]') : null;
     return {
@@ -318,9 +392,22 @@ const whatIsAt = (cx, cy) =>
     };
   })()`);
 
+/** Where a destination ended up, and what the page said on the way. */
+interface Landing {
+  pageno: string;
+  scrollY: number;
+  /** The destination point in the viewport it was supposed to land in. */
+  top: number | null;
+  /** How much of the top of the window the sticky bar takes. */
+  chrome: number;
+  hash: string;
+  href: string;
+  toast: string;
+}
+
 /** Where a destination ended up, and whether anything navigated to get there. */
-const landed = (page_, y) =>
-  page.evaluate(`(() => {
+const landed = (page_: number | string, y: number): Promise<Landing> =>
+  page.evaluate<Landing>(`(() => {
     const sr = document.getElementById('viewer').shadowRoot;
     const box = sr.querySelector('.wpdf-page[data-page="${page_}"]');
     const viewer = window.webpdf.viewer();
@@ -343,7 +430,7 @@ const landed = (page_, y) =>
     };
   })()`);
 
-const mouseClick = async (cx, cy) => {
+const mouseClick = async (cx: number, cy: number) => {
   await page.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: cx, y: cy, button: 'none', buttons: 0 });
   await page.send('Input.dispatchMouseEvent', { type: 'mousePressed', x: cx, y: cy, button: 'left', buttons: 1, clickCount: 1 });
   await page.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: cx, y: cy, button: 'left', buttons: 0, clickCount: 1 });
@@ -356,7 +443,7 @@ const pressEnter = async () => {
 };
 
 /** Press Ctrl+<key> through the browser's own input pipeline, as a reader would. */
-const pressCtrl = async (key) => {
+const pressCtrl = async (key: string) => {
   const virtualKey = key.toUpperCase().charCodeAt(0);
   for (const type of ['keyDown', 'keyUp']) {
     await page.send('Input.dispatchKeyEvent', {
@@ -372,7 +459,13 @@ const pressCtrl = async (key) => {
 };
 
 /** Wait for a download to land, and to stop growing. */
-const waitForFile = async (dir, seconds) => {
+/** A download that has landed and stopped growing. */
+interface LandedFile {
+  name: string;
+  size: number;
+}
+
+const waitForFile = async (dir: string, seconds: number): Promise<LandedFile | null> => {
   const deadline = Date.now() + seconds * 1000;
   while (Date.now() < deadline) {
     const name = fs.readdirSync(dir).find((each) => !each.endsWith('.crdownload'));
@@ -386,20 +479,26 @@ const waitForFile = async (dir, seconds) => {
   return null;
 };
 
-/** Wait for an expression *string* to become truthy (the page's number is in it). */
-const waitUntil = async (expression, label, timeout = 30000) => {
+/**
+ * Wait for an expression *string* to become truthy, and hand its value back.
+ *
+ * The expression is source, so what it produces is only known to the caller:
+ * `T` is named at the call sites that want the value, and left off at the ones
+ * that only want the wait.
+ */
+const waitUntil = async <T = unknown>(expression: string, label: string, timeout = 30000): Promise<T> => {
   const deadline = Date.now() + timeout;
-  let last;
+  let last: unknown;
   while (Date.now() < deadline) {
     last = await page.evaluate(expression);
-    if (last) return last;
+    if (last) return last as T;
     await new Promise((r) => setTimeout(r, 150));
   }
   throw new Error(`Timed out waiting for ${label} (last value: ${JSON.stringify(last)})`);
 };
 
 /** Wait for a page's SVG to be in the DOM, so its links can be clicked. */
-const waitForPage = async (n, timeout = 30000) => {
+const waitForPage = async (n: number, timeout = 30000): Promise<void> => {
   await waitUntil(
     `(() => {
       const sr = document.getElementById('viewer')?.shadowRoot;
@@ -423,13 +522,15 @@ try {
   const beforeLoad = await page.evaluate(() => ({
     // The bar is the *document's* chrome: with no document open there is
     // nothing for it to hold, and the card that offers one stands alone.
-    barHidden: document.querySelector('.topbar')?.hidden === true,
+    barHidden: document.querySelector<HTMLElement>('.topbar')?.hidden === true,
     emptyHidden: document.getElementById('empty')?.hidden,
     offered: ['example-btn', 'empty-open', 'mode-btn'].map((id) => !!document.getElementById(id)?.offsetParent),
     // Nothing that opens a document, and none of the controls that were taken
     // off the bar, is still in the document at all.
     gone: ['open', 'sample', 'prev', 'next', 'zoom-in', 'zoom-out', 'stats'].filter((id) => document.getElementById(id)),
-    options: [...document.querySelectorAll('#example-menu .menu-option')].map((o) => o.dataset.url).filter(Boolean),
+    options: [...document.querySelectorAll<HTMLElement>('#example-menu .menu-option')]
+      .map((o) => o.dataset.url)
+      .filter((url): url is string => Boolean(url)),
   }));
   if (!beforeLoad.barHidden) fail('the bar should not be in the way before a document is open');
   if (beforeLoad.emptyHidden !== false) fail('the empty state should be showing before a document is open');
@@ -440,17 +541,17 @@ try {
   // recommended mode, and the row in force is the one the menu marks as selected.
   // This run asks for `global` on the URL, so that is the choice; the mode a
   // reader gets with no URL at all, and the one they are remembered as having
-  // chosen, are `modes.mjs`.
+  // chosen, are `modes.ts`.
   const chosenMode = await page.evaluate('window.webpdf.mode()');
   const modes = await page.evaluate(() => {
-    document.getElementById('mode-btn').click();
-    return [...document.querySelectorAll('#mode-menu .menu-option')].map((o) => ({
+    document.getElementById('mode-btn')!.click();
+    return [...document.querySelectorAll<HTMLElement>('#mode-menu .menu-option')].map((o) => ({
       mode: o.dataset.mode,
       starred: !!o.querySelector('.star'),
       selected: o.getAttribute('aria-selected') === 'true',
     }));
   });
-  await page.evaluate(() => document.getElementById('mode-btn').click());
+  await page.evaluate(() => document.getElementById('mode-btn')!.click());
   const starred = modes.filter((row) => row.starred).map((row) => row.mode);
   const selected = modes.filter((row) => row.selected).map((row) => row.mode);
   if (modes.length !== 2) fail(`the rendering mode should offer two modes, got ${JSON.stringify(modes)}`);
@@ -480,8 +581,8 @@ try {
   await new Promise((r) => setTimeout(r, 1500));
 
   const report = await page.evaluate(() => {
-    const host = document.getElementById('viewer');
-    const sr = host.shadowRoot;
+    const host = document.getElementById('viewer')!;
+    const sr = host.shadowRoot!;
     const svgs = window.__pageSvgs();
     // A page's faces live in the page's own document, either in an adopted
     // stylesheet or in a <style> element; the viewer's own document is not told
@@ -494,7 +595,7 @@ try {
     return {
       toast: document.getElementById('toast')?.textContent,
       pageCount: document.getElementById('pagecount')?.textContent,
-      zoom: document.getElementById('zoom-value')?.value,
+      zoom: document.querySelector<HTMLInputElement>('#zoom-value')?.value,
       zoomMenu: [...document.querySelectorAll('#zoom-menu .menu-option')].map((o) => o.textContent),
       zoomMenuOpen: document.getElementById('zoom-menu')?.hidden === false,
       // Any element of the bar that says "fit width"/"fit page" while neither
@@ -505,7 +606,7 @@ try {
       tocEntries: document.querySelectorAll('#toc-body .toc-item').length,
       tocOpen: document.getElementById('toc')?.hidden === false,
       emptyHidden: document.getElementById('empty')?.hidden,
-      barHidden: document.querySelector('.topbar')?.hidden,
+      barHidden: document.querySelector<HTMLElement>('.topbar')?.hidden,
       barHeight: Math.round(document.querySelector('.topbar')?.getBoundingClientRect().height ?? 0),
       barOverflow: Math.round((document.querySelector('.topbar')?.scrollWidth ?? 0) - (document.querySelector('.topbar')?.clientWidth ?? 0)),
       // Every control that is only a mark: no word spelled out on the bar.
@@ -520,7 +621,7 @@ try {
       hasExport: !!document.getElementById('export'),
       hasSearch: !!document.getElementById('search'),
       shadowRoot: !!sr,
-      rendersInWorker: window.webpdf.viewer()?.rendersInWorker ?? null,
+      rendersInWorker: window.webpdf!.viewer()?.rendersInWorker ?? null,
       slots: sr.querySelectorAll('.wpdf-page').length,
       renderedPages: svgs.length,
       textElements: window.__pageTexts().length,
@@ -537,6 +638,10 @@ try {
         range.selectNodeContents(firstText);
         return range.toString().length;
       })(),
+      // Measured after the report is read - the probe waits for the face to be
+      // applied - so it is filled in below rather than returned with it. It sits
+      // here, null, only so that assigning it is part of the report's own shape.
+      fontApplied: null as FontProbe | null,
     };
   });
 
@@ -544,14 +649,21 @@ try {
   // its own document - so the probe has to measure *there*, not in the viewer's.
   // It also has to wait: a probe taken during the `font-display: block` window
   // still reports fallback metrics.
-  const applied = await page.evaluate(async () => {
+/** Widths of the same sample string, in the generated face and in a fallback. */
+interface FontProbe {
+  family: string;
+  withGenerated: number;
+  withFallback: number;
+}
+
+  const applied = await page.evaluate(async (): Promise<FontProbe | null> => {
     const svg = window.__pageSvgs()[0];
     const family = window.__pageTexts()[0]?.getAttribute('font-family');
     if (!svg || !family) return null;
     const doc = svg.ownerDocument;
     const box = doc.createElement('div');
     box.style.cssText = 'position:absolute;left:-9999px;top:0;font-size:100px;white-space:nowrap';
-    const make = (f) => {
+    const make = (f: string) => {
       const span = doc.createElement('span');
       span.textContent = 'Hamburgefonstiv 0123';
       span.style.fontFamily = `'${f}'`;
@@ -583,7 +695,9 @@ try {
     fail(`generated font is not being applied: ${JSON.stringify(applied)}`);
   }
   if ((report.sampleText ?? '').length < 4) fail('first text element is empty');
-  if (report.selectable < 4) fail('text is not selectable');
+  // `false` when there is no text at all, which `Number` reads as 0 - the same
+  // comparison the value made before it was a count.
+  if (Number(report.selectable) < 4) fail('text is not selectable');
   if (report.tocEntries < 5) fail('outline did not populate');
   if (report.emptyHidden !== true) fail('empty state still visible');
   if (report.barHidden !== false) fail('the bar should be there once a document is open');
@@ -593,7 +707,7 @@ try {
   // The tab names the document: its own title, else the file, else where it
   // came from - never a URL with its scheme on.
   if (!report.title || /:\/\//.test(report.title)) fail(`the tab title should name the document, got ${JSON.stringify(report.title)}`);
-  if (!report.title.endsWith(document_.split('/').pop())) {
+  if (!report.title.endsWith(document_.split('/').pop() ?? '')) {
     fail(`the tab title should name ${JSON.stringify(document_)}, got ${JSON.stringify(report.title)}`);
   }
   if (report.hasStatusBar) fail('the status bar should be gone');
@@ -624,7 +738,7 @@ try {
   // A document opens one level below fit-width, not at it.
   console.log('— the starting level is the rung below fit width —');
   const startLevel = await page.evaluate(() => {
-    const v = window.webpdf.viewer();
+    const v = window.webpdf!.viewer()!;
     return { zoom: v.zoom, mode: v.zoomMode, fitWidth: v.resolveZoom('fit-width') };
   });
   if (startLevel.mode === 'fit-width') fail('a document should not open at fit width');
@@ -632,11 +746,11 @@ try {
     fail(`the starting level should be below fit width (${startLevel.fitWidth}), got ${startLevel.zoom}`);
   }
   // Nothing sits between: one step up must land exactly on fit width.
-  await page.evaluate(() => window.webpdf.viewer().zoomIn());
+  await page.evaluate(() => window.webpdf!.viewer()!.zoomIn());
   await new Promise((r) => setTimeout(r, 500));
   const steppedUp = await page.evaluate(() => {
-    const v = window.webpdf.viewer();
-    return { mode: v.zoomMode, box: document.getElementById('zoom-value').value };
+    const v = window.webpdf!.viewer()!;
+    return { mode: v.zoomMode, box: document.querySelector<HTMLInputElement>('#zoom-value')!.value };
   });
   if (steppedUp.mode !== 'fit-width') {
     fail(`stepping up from the start should land on fit width, got ${steppedUp.mode} (${steppedUp.box})`);
@@ -644,7 +758,7 @@ try {
   console.log(`start ${Math.round(startLevel.zoom * 100)}% (${startLevel.mode}) -> fit width ${Math.round(startLevel.fitWidth * 100)}%`);
   // Back to the level a document opens at: the state everything below assumes,
   // and the level the screenshot ends up showing.
-  await page.evaluate(() => window.webpdf.viewer().zoomOut());
+  await page.evaluate(() => window.webpdf!.viewer()!.zoomOut());
   await new Promise((r) => setTimeout(r, 500));
 
   // The outline floats over the pages: toggling it must not touch the document's
@@ -652,26 +766,26 @@ try {
   console.log('— the outline floats, so it cannot re-zoom the document —');
   const outlineState = () =>
     page.evaluate(() => ({
-      open: document.getElementById('toc').hidden === false,
-      position: getComputedStyle(document.getElementById('toc')).position,
-      zoom: window.webpdf.viewer().zoom,
-      width: document.getElementById('viewer').clientWidth,
+      open: document.getElementById('toc')!.hidden === false,
+      position: getComputedStyle(document.getElementById('toc')!).position,
+      zoom: window.webpdf!.viewer()!.zoom,
+      width: document.getElementById('viewer')!.clientWidth,
       pageBox: (() => {
-        const r = document.getElementById('viewer').shadowRoot.querySelector('.wpdf-page')?.getBoundingClientRect();
+        const r = document.getElementById('viewer')!.shadowRoot!.querySelector('.wpdf-page')?.getBoundingClientRect();
         return r ? Math.round(r.width) : 0;
       })(),
     }));
   const closedByDefault = await outlineState();
   if (closedByDefault.open) fail('the outline should start closed');
-  await page.evaluate(() => document.getElementById('toc-toggle').click());
+  await page.evaluate(() => document.getElementById('toc-toggle')!.click());
   await new Promise((r) => setTimeout(r, 500));
   const openOutline = await outlineState();
   if (!openOutline.open) fail('the outline toggle did not open it');
   if (openOutline.position !== 'fixed') fail(`the outline should float, got position: ${openOutline.position}`);
-  await page.evaluate(() => document.getElementById('toc-close').click());
+  await page.evaluate(() => document.getElementById('toc-close')!.click());
   await new Promise((r) => setTimeout(r, 500));
   const closedOutline = await outlineState();
-  await page.evaluate(() => document.getElementById('toc-toggle').click());
+  await page.evaluate(() => document.getElementById('toc-toggle')!.click());
   await new Promise((r) => setTimeout(r, 500));
   const reopened = await outlineState();
   if (closedOutline.open || !reopened.open) fail('the outline toggle did not work');
@@ -682,14 +796,14 @@ try {
   // Paging works, the window is wider than the viewport, and pages far outside
   // it are unloaded. The window is deliberately not "the visible pages": a page
   // is rendered a viewport before it is read, so that arriving at it is free.
-  await page.evaluate(() => window.webpdf.viewer().nextPage());
+  await page.evaluate(() => window.webpdf!.viewer()!.nextPage());
   await new Promise((r) => setTimeout(r, 1200));
-  await page.evaluate(() => window.webpdf.viewer().nextPage());
+  await page.evaluate(() => window.webpdf!.viewer()!.nextPage());
   await new Promise((r) => setTimeout(r, 1200));
   const after = await page.evaluate(() => {
-    const sr = document.getElementById('viewer').shadowRoot;
-    const chrome = document.querySelector('.topbar')?.offsetHeight ?? 0;
-    const slots = [...sr.querySelectorAll('.wpdf-page')].map((el) => {
+    const sr = document.getElementById('viewer')!.shadowRoot!;
+    const chrome = document.querySelector<HTMLElement>('.topbar')?.offsetHeight ?? 0;
+    const slots = [...sr.querySelectorAll<HTMLElement>('.wpdf-page')].map((el) => {
       const r = el.getBoundingClientRect();
       return {
         page: Number(el.dataset.page),
@@ -699,14 +813,14 @@ try {
       };
     });
     return {
-      pageno: document.getElementById('pageno').value,
+      pageno: document.querySelector<HTMLInputElement>('#pageno')!.value,
       slots: slots.length,
       rendered: slots.filter((s) => s.rendered).length,
       pages: slots.map((s) => s.page),
       visible: slots.filter((s) => s.away === 0).map((s) => s.page),
       outside: slots.filter((s) => s.away > 0),
       // What the viewer thinks it has in hand but has not put on screen.
-      prepared: window.webpdf.viewer().preparedPages,
+      prepared: window.webpdf!.viewer()!.preparedPages,
     };
   });
   console.log('after paging: ' + JSON.stringify(after));
@@ -742,7 +856,7 @@ try {
    * a blank page is worse than a dropped frame.
    */
   console.log('— a scroll defers what is not being looked at —');
-  await page.evaluate(() => window.webpdf.viewer().goToPage(3));
+  await page.evaluate(() => window.webpdf!.viewer()!.goToPage(3));
   await new Promise((r) => setTimeout(r, 1500));
   const seen = [];
   for (let i = 0; i < 40; i++) {
@@ -750,7 +864,7 @@ try {
     // again while the reader is still moving - which is the case the deferral
     // exists for. (A mode change is the honest way to cause it: it is what a
     // reader does to a document that is already in front of them.)
-    if (i === 4) await page.evaluate(() => window.webpdf.viewer().setBionic(true, 0.5));
+    if (i === 4) await page.evaluate(() => window.webpdf!.viewer()!.setBionic(true, 0.5));
     await page.send('Input.dispatchMouseEvent', {
       type: 'mouseWheel',
       x: 640,
@@ -762,10 +876,10 @@ try {
     await new Promise((r) => setTimeout(r, 16));
     seen.push(
       await page.evaluate(() => {
-        const sr = document.getElementById('viewer').shadowRoot;
-        const prepared = new Set(window.webpdf.viewer().preparedPages);
+        const sr = document.getElementById('viewer')!.shadowRoot!;
+        const prepared = new Set(window.webpdf!.viewer()!.preparedPages);
         const waiting = [];
-        for (const el of sr.querySelectorAll('.wpdf-page')) {
+        for (const el of sr.querySelectorAll<HTMLElement>('.wpdf-page')) {
           if (window.__pageSvg(el)) continue;
           const page = Number(el.dataset.page);
           const r = el.getBoundingClientRect();
@@ -795,9 +909,9 @@ try {
   // Once the scroll stops, everything in the window is in the document - and
   // the mode that forced the renders is turned back off.
   await new Promise((r) => setTimeout(r, 1500));
-  await page.evaluate(() => window.webpdf.viewer().setBionic(false));
+  await page.evaluate(() => window.webpdf!.viewer()!.setBionic(false));
   await new Promise((r) => setTimeout(r, 1500));
-  const blank = await page.evaluate(`(() => {
+  const blank = await page.evaluate<number[]>(`(() => {
     const sr = document.getElementById('viewer').shadowRoot;
     return [...sr.querySelectorAll('.wpdf-page')].filter((el) => !window.__pageSvg(el)).map((el) => Number(el.dataset.page));
   })()`);
@@ -817,11 +931,11 @@ try {
     // one.
     console.log('— searching the document —');
     for (const wait of [600, 1200]) {
-      await page.evaluate(() => window.webpdf.viewer().prevPage());
+      await page.evaluate(() => window.webpdf!.viewer()!.prevPage());
       await new Promise((r) => setTimeout(r, wait));
     }
     await page.evaluate(() => {
-      const input = document.getElementById('search');
+      const input = document.getElementById('search') as HTMLInputElement;
       input.focus();
       input.value = 'encoder';
       input.dispatchEvent(new Event('input', { bubbles: true }));
@@ -843,7 +957,7 @@ try {
 
     // Enter still means "next", not "first".
     await page.evaluate(() => {
-      const input = document.getElementById('search');
+      const input = document.getElementById('search') as HTMLInputElement;
       input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
     });
     await new Promise((r) => setTimeout(r, 500));
@@ -851,7 +965,7 @@ try {
     console.log('after Enter: ' + JSON.stringify(next));
     if (next.count !== `2/${total}`) fail(`Enter should move to the second match, got ${next.count}`);
 
-    await page.evaluate(() => document.getElementById('search-next').click());
+    await page.evaluate(() => document.getElementById('search-next')!.click());
     await new Promise((r) => setTimeout(r, 500));
     const jumped = await searchState();
     console.log('after one more match: ' + JSON.stringify(jumped));
@@ -862,13 +976,13 @@ try {
 
     // Chrome's other habit: clearing the query clears the boxes.
     await page.evaluate(() => {
-      const input = document.getElementById('search');
+      const input = document.getElementById('search') as HTMLInputElement;
       input.value = '';
       input.dispatchEvent(new Event('input', { bubbles: true }));
     });
     await new Promise((r) => setTimeout(r, 400));
     const cleared = await page.evaluate(() => ({
-      count: document.getElementById('search-count').textContent,
+      count: document.getElementById('search-count')!.textContent,
       highlights: window.__pageSvgs().reduce((n, svg) => n + svg.querySelectorAll('rect[data-wpdf-search]').length, 0),
     }));
     if (cleared.highlights !== 0 || cleared.count !== '') fail(`clearing should remove the boxes, got ${JSON.stringify(cleared)}`);
@@ -884,7 +998,7 @@ try {
     console.log('— links: an internal jump —');
     // Page 1 of the paper is its title page and carries no links at all; the
     // citations start on page 2.
-    await page.evaluate(() => window.webpdf.viewer().goToPage(2));
+    await page.evaluate(() => window.webpdf!.viewer()!.goToPage(2));
     await waitForPage(2);
 
     const internal = (await linkCandidates('internal')).filter((l) => Number(l.page) !== 2);
@@ -902,7 +1016,7 @@ try {
     await mouseClick(jump.cx, jump.cy);
     await waitUntil(`document.getElementById('pageno').value === ${JSON.stringify(jump.page)}`, `jump to page ${jump.page}`);
     await new Promise((r) => setTimeout(r, 400));
-    const after = await landed(jump.page, jump.dest === null ? 0 : Number(jump.dest));
+    const after = await landed(jump.page ?? 0, jump.dest === null ? 0 : Number(jump.dest));
     console.log(`clicked a link to page ${jump.page} (y=${jump.dest}): ` + JSON.stringify(after));
     if (after.pageno !== jump.page) fail(`the jump should land on page ${jump.page}, got ${after.pageno}`);
     // The destination is put at the top of the viewport, clear of the sticky bar
@@ -935,16 +1049,16 @@ try {
     await page.evaluate('history.forward()');
     await waitUntil(`document.getElementById('pageno').value === ${JSON.stringify(jump.page)}`, `Forward to page ${jump.page}`);
     await new Promise((r) => setTimeout(r, 400));
-    const wentForward = await landed(jump.page, jump.dest === null ? 0 : Number(jump.dest));
+    const wentForward = await landed(jump.page ?? 0, jump.dest === null ? 0 : Number(jump.dest));
     console.log(`after Forward: page ${wentForward.pageno}, scrollY ${wentForward.scrollY} (was ${after.scrollY})`);
     if (Math.abs(wentForward.scrollY - after.scrollY) > 2) {
       fail(`Forward should return to the link's destination (${after.scrollY}), it is at ${wentForward.scrollY}`);
     }
 
     console.log('— links: the keyboard reaches them too —');
-    await page.evaluate(() => window.webpdf.viewer().goToPage(2));
+    await page.evaluate(() => window.webpdf!.viewer()!.goToPage(2));
     await waitForPage(2);
-    const focused = await page.evaluate(`(() => {
+    const focused = await page.evaluate<{ page: string | null; active: boolean } | null>(`(() => {
       const sr = document.getElementById('viewer').shadowRoot;
       const a = [...window.__pageLinks('internal')]
         .find((el) => el.getAttribute('data-wpdf-page') !== '2');
@@ -968,11 +1082,11 @@ try {
     await page.evaluate(() => {
       window.__opened = [];
       window.open = (uri, target, features) => {
-        window.__opened.push([uri, target, features]);
+        window.__opened.push([String(uri), String(target), String(features)]);
         return null;
       };
     });
-    let external = [];
+    let external: LinkCandidate[] = [];
     for (const n of [9, 10, 11, 8]) {
       await page.evaluate(`window.webpdf.viewer().goToPage(${n})`);
       await waitForPage(n);
@@ -987,11 +1101,11 @@ try {
       if (hit.kind !== 'external' || hit.uri !== link.uri) {
         fail(`the click point should hit the external link, got ${JSON.stringify(hit)}`);
       }
-      const before = await landed(link.slot, 0);
+      const before = await landed(link.slot ?? 0, 0);
       await mouseClick(link.cx, link.cy);
       await new Promise((r) => setTimeout(r, 600));
-      const opened = await page.evaluate('window.__opened');
-      const after = await landed(link.slot, 0);
+      const opened = await page.evaluate<[string, string, string][]>('window.__opened');
+      const after = await landed(link.slot ?? 0, 0);
       console.log('opened: ' + JSON.stringify(opened));
       if (opened.length !== 1) fail(`exactly one link should have been opened, got ${JSON.stringify(opened)}`);
       else {
@@ -1054,8 +1168,8 @@ try {
         if (hit.uri !== link.uri) fail(`the click point should hit the link itself, got ${JSON.stringify(hit)}`);
         await mouseClick(link.cx, link.cy);
         await new Promise((r) => setTimeout(r, 500));
-        const openedLinks = await page.evaluate('window.__opened');
-        const said = await page.evaluate("document.getElementById('toast')?.textContent ?? ''");
+        const openedLinks = await page.evaluate<[string, string, string][]>('window.__opened');
+        const said = await page.evaluate<string>("document.getElementById('toast')?.textContent ?? ''");
         console.log(`said: ${JSON.stringify(said)}`);
         if (openedLinks.length !== 0) fail(`nothing should have been opened, got ${JSON.stringify(openedLinks)}`);
         if (!/cannot open/.test(said)) fail(`the demo should say the link cannot be opened, got ${JSON.stringify(said)}`);
@@ -1083,8 +1197,39 @@ try {
   await waitForPage(1);
 
   /** Everything about the crop control and the page in front of the reader. */
-  const cropState = () =>
-    page.evaluate(`(() => {
+  interface CropState {
+    /** Where the control lives: the instruction was "after the search". */
+    afterSearch: boolean;
+    rows: (string | undefined)[];
+    names: string[];
+    patterns: string[];
+    customRows: number;
+    addError: string;
+    checked: (string | undefined)[];
+    disabledRows: (string | undefined)[];
+    menuOpen: boolean;
+    lit: string | undefined;
+    face: string | null;
+    status: string | null;
+    allHidden: boolean;
+    noneHidden: boolean;
+    /** The rule the menu recommends: starred, and still unchecked. */
+    starred: (string | undefined)[];
+    padding: string;
+    paddingOff: boolean;
+    page: string;
+    scrollY: number;
+    pageTop: number | null;
+    pageWidth: number | null;
+    pageHeight: number | null;
+    viewBox: string | null;
+    elements: number;
+    texts: number;
+    docHeight: number;
+  }
+
+  const cropState = (): Promise<CropState> =>
+    page.evaluate<CropState>(`(() => {
       const sr = document.getElementById('viewer').shadowRoot;
       const host = document.getElementById('viewer');
       const shown = document.getElementById('pageno').value;
@@ -1136,8 +1281,16 @@ try {
    * something a reader needed. Every glyph is measured through the SVG's own
    * matrix, so this is the geometry the browser itself uses to draw.
    */
-  const cutText = () =>
-    page.evaluate(`(() => {
+  /** Text a crop sliced through, and the page box it was measured against. */
+  interface CutText {
+    box: number[];
+    /** `[text, top, bottom]` of each run that is half in and half out. */
+    cut: (string | number)[][];
+    cutCount: number;
+  }
+
+  const cutText = (): Promise<CutText | null> =>
+    page.evaluate<CutText | null>(`(() => {
       const sr = document.getElementById('viewer').shadowRoot;
       const shown = document.getElementById('pageno').value;
       const svg = window.__svgOfPage(shown);
@@ -1189,7 +1342,7 @@ try {
   if (start.addError) fail(`the add form should show no error to start with, got ${JSON.stringify(start.addError)}`);
   // Nothing is selected, and nothing has happened to the document.
   if (start.checked.length) fail(`cropping should start with nothing selected, got ${JSON.stringify(start.checked)}`);
-  if (!/shown whole/.test(start.status)) fail(`the menu should say the pages are untouched, got ${JSON.stringify(start.status)}`);
+  if (!/shown whole/.test(start.status ?? '')) fail(`the menu should say the pages are untouched, got ${JSON.stringify(start.status)}`);
   if (start.lit !== 'false') fail(`the crop control should be plain while nothing is checked, got ${JSON.stringify(start.lit)}`);
   // One bulk button at a time, and it says what is left to do.
   if (start.allHidden || !start.noneHidden) fail('with nothing checked, "Enable all" should be the only bulk action');
@@ -1211,10 +1364,10 @@ try {
   const before = await cropState();
 
   console.log('— a rule is checked —');
-  await page.evaluate(() => document.getElementById('crop-btn').click());
+  await page.evaluate(() => document.getElementById('crop-btn')!.click());
   const opened = await cropState();
   if (!opened.menuOpen) fail('the crop button should open the dropdown');
-  await page.evaluate(() => document.getElementById('crop-all').click());
+  await page.evaluate(() => document.getElementById('crop-all')!.click());
   const all = await waitUntil(
     `(() => {
       const status = document.getElementById('crop-status').textContent;
@@ -1246,12 +1399,12 @@ try {
   // The face of the control says "on" the way bionic reading's does, and says
   // nothing about how many rules that took.
   if (cropped.lit !== 'true') fail(`the crop control should light up while it is cropping, got ${JSON.stringify(cropped.lit)}`);
-  if (/\d/.test(cropped.face)) fail(`the crop control should not count its rules on the bar, got ${JSON.stringify(cropped.face)}`);
+  if (/\d/.test(cropped.face ?? '')) fail(`the crop control should not count its rules on the bar, got ${JSON.stringify(cropped.face)}`);
   // A crop is a smaller window onto the page: inside it, and smaller than it.
   if (!(px > 0 && py >= 0 && pw > 0 && ph > 0)) fail(`the cropped viewBox is not a box: ${cropped.viewBox}`);
   if (!(px + pw <= 612.001 && py + ph <= 792.001)) fail(`the crop is not inside the page: ${cropped.viewBox}`);
   if (!(pw < 612 && ph < 792)) fail(`the crop did not trim the page: ${cropped.viewBox}`);
-  if (!(cropped.pageWidth < before.pageWidth && cropped.pageHeight < before.pageHeight)) fail('the page box did not follow the crop');
+  if (!(cropped.pageWidth! < before.pageWidth! && cropped.pageHeight! < before.pageHeight!)) fail('the page box did not follow the crop');
   if (!(cropped.docHeight < before.docHeight)) fail('the document is no shorter than before the crop');
   // Nothing was removed to achieve it: same elements, same text runs.
   if (cropped.elements !== before.elements) fail(`cropping changed the page's elements (${before.elements} -> ${cropped.elements})`);
@@ -1285,28 +1438,28 @@ try {
     else if (Math.abs(after.top - after.chrome) > 3) {
       fail(`a cropped destination should still sit just below the bar (${after.chrome}px), it is at ${after.top}px`);
     }
-    await page.evaluate(() => window.webpdf.viewer().goToPage(3));
+    await page.evaluate(() => window.webpdf!.viewer()!.goToPage(3));
     await waitForPage(3);
   }
   // The reader kept their page, and their place on it.
   if (cropped.page !== before.page) fail(`the reader moved from page ${before.page} to ${cropped.page}`);
-  if (Math.abs(cropped.pageTop - before.pageTop) > 6) fail(`the page moved on screen by ${Math.abs(cropped.pageTop - before.pageTop)}px`);
+  if (Math.abs(cropped.pageTop! - before.pageTop!) > 6) fail(`the page moved on screen by ${Math.abs(cropped.pageTop! - before.pageTop!)}px`);
   // The bulk button says what is left to do: with everything on, the only move
   // left is back.
   if (!cropped.allHidden || cropped.noneHidden) fail('once every usable rule is on, "Disable all" should be the only bulk action');
-  if (!/\+6 pt/.test(cropped.status)) fail(`the default margin should be 6pt, got ${JSON.stringify(cropped.status)}`);
+  if (!/\+6 pt/.test(cropped.status ?? '')) fail(`the default margin should be 6pt, got ${JSON.stringify(cropped.status)}`);
 
   // The margin is a control, not a re-measurement: it grows the box the SVG is
   // given and the pages re-lay-out around the reader.
   console.log('— a margin around the content —');
-  const setPadding = async (value) => {
+  const setPadding = async (value: number): Promise<string> => {
     await page.evaluate(`(() => {
       const input = document.getElementById('crop-padding');
       input.value = ${JSON.stringify(String(value))};
       input.dispatchEvent(new Event('input', { bubbles: true }));
       input.dispatchEvent(new Event('change', { bubbles: true }));
     })()`);
-    return waitUntil(
+    return waitUntil<string>(
       `(() => {
         const status = document.getElementById('crop-status').textContent;
         const want = ${JSON.stringify(value)} > 0 ? ', +${value} pt' : 'minus';
@@ -1334,7 +1487,7 @@ try {
     fail(`6pt should add 6pt on every side, got ${defaulted} from ${exact}`);
   }
 
-  const padded = await setPadding(8);
+  const padded: string = await setPadding(8);
   const withMargin = await cropState();
   console.log('padded by 8 : ' + JSON.stringify({ viewBox: padded, box: [withMargin.pageWidth, withMargin.pageHeight], status: withMargin.status }));
   const [qx, qy, qw, qh] = padded.split(/\s+/).map(Number);
@@ -1344,17 +1497,17 @@ try {
   if (Math.abs(qw - (ew + (ex - qx) + 8)) > 0.01 || Math.abs(qh - (eh + (ey - qy) + 8)) > 0.01) {
     fail(`padding should add 8pt on every side, got ${padded} from ${exact}`);
   }
-  if (!(withMargin.pageWidth > cropped.pageWidth && withMargin.pageHeight > cropped.pageHeight)) fail('the page box did not follow the margin');
+  if (!(withMargin.pageWidth! > cropped.pageWidth! && withMargin.pageHeight! > cropped.pageHeight!)) fail('the page box did not follow the margin');
   if (withMargin.elements !== cropped.elements || withMargin.texts !== cropped.texts) fail('padding changed what is in the page');
-  if (withMargin.page !== cropped.page || Math.abs(withMargin.pageTop - cropped.pageTop) > 6) fail('padding moved the reader');
-  if (!/\+8 pt/.test(withMargin.status)) fail(`the menu should say what the margin is, got ${JSON.stringify(withMargin.status)}`);
+  if (withMargin.page !== cropped.page || Math.abs(withMargin.pageTop! - cropped.pageTop!) > 6) fail('padding moved the reader');
+  if (!/\+8 pt/.test(withMargin.status ?? '')) fail(`the menu should say what the margin is, got ${JSON.stringify(withMargin.status)}`);
   // And back to the content box, exactly where it started.
   const unpadded = await setPadding(0);
   if (unpadded !== exact.join(' ')) fail(`a margin of 0 should be the crop itself (${exact.join(' ')} -> ${unpadded})`);
 
   console.log('— one rule off, then all of them —');
-  await page.evaluate(() => document.querySelector('#crop-list .crop-option[data-id="page-number"]').click());
-  const one = await waitUntil(
+  await page.evaluate(() => document.querySelector<HTMLElement>('#crop-list .crop-option[data-id="page-number"]')!.click());
+  const one = await waitUntil<string>(
     `(() => {
       const status = document.getElementById('crop-status').textContent;
       const svg = window.__pageSvgs()[0];
@@ -1366,11 +1519,14 @@ try {
   const single = await cropState();
   console.log('one rule off: ' + JSON.stringify({ viewBox: one, checked: single.checked.length }));
   if (single.checked.includes('page-number')) fail('clicking a checked rule should uncheck it');
-  if (single.enableAllOff) fail('"Enable all" should be live again once a rule is off');
+  // The field this read was `enableAllOff`, which the bulk-action state stopped
+  // carrying when it moved from `disabled` to `hidden` - so the check was dead.
+  // What says the same thing now is that "Enable all" is showing again.
+  if (single.allHidden) fail('"Enable all" should be live again once a rule is off');
   if (one === cropped.viewBox) fail('removing a rule should change the box it produced');
 
-  await page.evaluate(() => document.getElementById('crop-none').click());
-  const back = await waitUntil(
+  await page.evaluate(() => document.getElementById('crop-none')!.click());
+  const back = await waitUntil<string>(
     `(() => {
       const shown = document.getElementById('pageno').value;
       const svg = window.__svgOfPage(shown);
@@ -1397,7 +1553,7 @@ try {
     input.dispatchEvent(new Event('change'));
   })()`);
   await waitForPage(5);
-  await page.evaluate(() => document.querySelector('#crop-list .crop-option[data-id="page-number"]').click());
+  await page.evaluate(() => document.querySelector<HTMLElement>('#crop-list .crop-option[data-id="page-number"]')!.click());
   await waitUntil(
     `(() => {
       const shown = document.getElementById('pageno').value;
@@ -1415,7 +1571,7 @@ try {
   if (numbered.page !== '5') fail(`expected to be on page 5, got ${numbered.page}`);
   if (sliced?.cutCount) fail(`the crop cut through ${sliced.cutCount} piece(s) of text: ${JSON.stringify(sliced.cut)}`);
 
-  await page.evaluate(() => document.getElementById('crop-none').click());
+  await page.evaluate(() => document.getElementById('crop-none')!.click());
   await waitUntil(
     `(() => {
       const shown = document.getElementById('pageno').value;
@@ -1431,7 +1587,7 @@ try {
   // Nothing is checked at this point, so the page is the whole page again.
   console.log('— a rule the reader typed —');
   /** Fill the add form and submit it, the way the reader's Enter key would. */
-  const submitRule = (name, pattern) =>
+  const submitRule = (name: string, pattern: string): Promise<void> =>
     page.evaluate(`(() => {
       document.getElementById('crop-new-name').value = ${JSON.stringify(name)};
       document.getElementById('crop-new-pattern').value = ${JSON.stringify(pattern)};
@@ -1440,7 +1596,7 @@ try {
 
   const beforeBad = await cropState();
   await submitRule('Not a rule', '^(');
-  const refused = await waitUntil(
+  const refused = await waitUntil<string>(
     `(() => document.getElementById('crop-new-error').textContent || false)()`,
     'the core to refuse the expression',
     60000,
@@ -1470,7 +1626,7 @@ try {
   if (custom.customRows !== 1) fail(`the row should carry a remove mark, got ${custom.customRows}`);
   if (custom.checked.join() !== 'custom-1') fail(`the new rule should be the checked one, got ${JSON.stringify(custom.checked)}`);
 
-  await page.evaluate(() => document.querySelector('#crop-list .crop-remove').click());
+  await page.evaluate(() => document.querySelector<HTMLElement>('#crop-list .crop-remove')!.click());
   const backFromRule = await waitUntil(
     `(() => {
       const shown = document.getElementById('pageno').value;
@@ -1517,7 +1673,7 @@ try {
    * - off, or a fade - so this is how the mode is turned on, turned off, and
    * moved to another value.
    */
-  const chooseBionic = async (match) => {
+  const chooseBionic = async (match: string): Promise<void> => {
     await page.evaluate(`document.getElementById('bionic-btn').click()`);
     await page.evaluate(`(() => {
       const want = ${JSON.stringify(match)};
@@ -1528,10 +1684,17 @@ try {
     })()`);
   };
 
+  /** What the bionic menu offers, which row is chosen, and which is starred. */
+  interface BionicMenu {
+    rows: string[];
+    star: string;
+    chosen: string[];
+  }
+
   /** The value in force, and what the menu says about it. */
-  const bionicMenu = async () => {
+  const bionicMenu = async (): Promise<BionicMenu> => {
     await page.evaluate(`document.getElementById('bionic-btn').click()`);
-    const state = await page.evaluate(`(() => {
+    const state = await page.evaluate<BionicMenu>(`(() => {
       const rows = [...document.querySelectorAll('#bionic-menu .menu-option')];
       const name = (el) => el.querySelector('.menu-name').textContent.replace('★', '').trim();
       return {
@@ -1545,8 +1708,31 @@ try {
   };
 
   /** The control, and the page in front of the reader, character by character. */
-  const bionicState = () =>
-    page.evaluate(`(() => {
+  /** Everything about bionic reading: the control, and the page it re-drew. */
+  interface BionicState {
+    exists: boolean;
+    afterSearch: boolean;
+    afterCrop: boolean;
+    face: string;
+    on: boolean;
+    dim: number;
+    viewBox: string | null;
+    texts: number;
+    chars: number;
+    words: number;
+    perWord: number;
+    prose: string;
+    full: string;
+    faded: number;
+    opacity: string | null;
+    weighted: number;
+    weight: string | null;
+    /** Every character's own start position, as `"x,y"`. */
+    starts: string[];
+  }
+
+  const bionicState = (): Promise<BionicState> =>
+    page.evaluate<BionicState>(`(() => {
       const sr = document.getElementById('viewer').shadowRoot;
       const shown = document.getElementById('pageno').value;
       const svg = window.__svgOfPage(shown);
@@ -1714,8 +1900,17 @@ try {
    * the SVG the viewer would export, so this is the drawing itself and not the
    * attributes that asked for it.
    */
-  const ink = () =>
-    page.evaluate(`(async () => {
+  /** How much ink is on the page, and where its edges are. */
+  interface InkState {
+    dark: number;
+    mass: number;
+    perMille: number;
+    /** `[left, top, right, bottom]`, or `-1` on an edge with no ink. */
+    box: number[];
+  }
+
+  const ink = (): Promise<InkState> =>
+    page.evaluate<InkState>(`(async () => {
       const markup = await window.webpdf.viewer().exportSvg(1);
       const url = URL.createObjectURL(new Blob([markup], { type: 'image/svg+xml;charset=utf-8' }));
       try {
@@ -1786,8 +1981,8 @@ try {
 
   // The crop and bionic controls are independent: a crop is a window onto the
   // page, and how the text in it is drawn cannot move the window.
-  await page.evaluate(() => document.querySelector('#crop-list .crop-option[data-id="page-number"]').click());
-  const croppedBox = await waitUntil(
+  await page.evaluate(() => document.querySelector<HTMLElement>('#crop-list .crop-option[data-id="page-number"]')!.click());
+  const croppedBox = await waitUntil<string>(
     `(() => {
       const shown = document.getElementById('pageno').value;
       const svg = window.__svgOfPage(shown);
@@ -1812,7 +2007,7 @@ try {
   if (croppedFaded.viewBox !== croppedBox) fail(`bionic reading changed the crop (${croppedBox} -> ${croppedFaded.viewBox})`);
   // Back to nothing at all, which is where the next section finds the reader.
   await chooseBionic('Off');
-  await page.evaluate(() => document.getElementById('crop-none').click());
+  await page.evaluate(() => document.getElementById('crop-none')!.click());
   await waitUntil(
     `(() => {
       const shown = document.getElementById('pageno').value;
@@ -1840,7 +2035,7 @@ try {
   console.log('— every face goes in once, when the plan is ready —');
   await page.waitFor(
     () => {
-      if (window.webpdf.plan()?.ready !== true) return false;
+      if (window.webpdf!.plan()?.ready !== true) return false;
       const sr = document.getElementById('viewer')?.shadowRoot;
       const pages = [...(sr?.querySelectorAll('.wpdf-page') ?? [])];
       return pages.length > 0 && pages.every((el) => el.querySelectorAll('svg.wpdf-page-svg').length === 1);
@@ -1850,15 +2045,21 @@ try {
       timeout: 90000,
     },
   );
-  const facesBefore = await page.evaluate('window.__allFaces()');
-  await page.evaluate(() => window.webpdf.viewer().setBionic(true, 0.4));
+  /** One document the probe walked, and the faces it was told about. */
+  interface FontFaces {
+    id: string;
+    faces: string[];
+  }
+
+  const facesBefore = await page.evaluate<FontFaces[]>('window.__allFaces()');
+  await page.evaluate(() => window.webpdf!.viewer()!.setBionic(true, 0.4));
   await new Promise((r) => setTimeout(r, 1500));
-  await page.evaluate(() => window.webpdf.viewer().setBionic(false));
+  await page.evaluate(() => window.webpdf!.viewer()!.setBionic(false));
   await new Promise((r) => setTimeout(r, 1500));
-  const facesAfter = await page.evaluate('window.__allFaces()');
-  const total = (docs) => docs.reduce((n, d) => n + d.faces.length, 0);
+  const facesAfter = await page.evaluate<FontFaces[]>('window.__allFaces()');
+  const total = (docs: FontFaces[]): number => docs.reduce((n, d) => n + d.faces.length, 0);
   const repeated = facesAfter.flatMap((d) => {
-    const seen = new Set();
+    const seen = new Set<string>();
     return d.faces.filter((f) => (seen.has(f) ? true : (seen.add(f), false))).map((f) => `${d.id}:${f}`);
   });
   const top = facesAfter.find((d) => d.id === 'top');
@@ -1895,7 +2096,7 @@ try {
   })()`);
   await waitForPage(far);
   await new Promise((r) => setTimeout(r, 900));
-  const facesLast = await page.evaluate('window.__allFaces()');
+  const facesLast = await page.evaluate<FontFaces[]>('window.__allFaces()');
   const framesAfter = await page.evaluate(
     "document.getElementById('viewer').shadowRoot.querySelectorAll('iframe').length",
   );
@@ -1914,13 +2115,13 @@ try {
    * looking (see the check on the empty state above).
    */
   console.log('— the bar, at every width —');
-  const barAt = async (width) => {
+  const barAt = async (width: number) => {
     await page.setViewport(width, 820);
     await new Promise((r) => setTimeout(r, 450));
     return page.evaluate(() => {
-      const bar = document.querySelector('.topbar');
+      const bar = document.querySelector<HTMLElement>('.topbar')!;
       const r = bar.getBoundingClientRect();
-      const bionic = document.getElementById('bionic-btn').getBoundingClientRect();
+      const bionic = document.getElementById('bionic-btn')!.getBoundingClientRect();
       return {
         width: innerWidth,
         height: Math.round(r.height),
@@ -1949,10 +2150,10 @@ try {
   console.log('— a scroll puts the chrome away —');
   const chromeState = () =>
     page.evaluate(() => ({
-      outline: document.getElementById('toc').hidden === false,
-      zoom: document.getElementById('zoom-menu').hidden === false,
-      crop: document.getElementById('crop-menu').hidden === false,
-      bionic: document.getElementById('bionic-menu').hidden === false,
+      outline: document.getElementById('toc')!.hidden === false,
+      zoom: document.getElementById('zoom-menu')!.hidden === false,
+      crop: document.getElementById('crop-menu')!.hidden === false,
+      bionic: document.getElementById('bionic-menu')!.hidden === false,
     }));
   await page.evaluate(`(() => {
     document.getElementById('toc-toggle').click();
@@ -1961,7 +2162,7 @@ try {
   await new Promise((r) => setTimeout(r, 250));
   const chromeOpen = await chromeState();
   if (!chromeOpen.outline || !chromeOpen.zoom) fail(`the outline and the dropdown should both be open, got ${JSON.stringify(chromeOpen)}`);
-  await page.evaluate(() => window.webpdf.viewer().goToPage(3));
+  await page.evaluate(() => window.webpdf!.viewer()!.goToPage(3));
   await waitForPage(3);
   const afterJump = await chromeState();
   if (!afterJump.outline || !afterJump.zoom) fail('a page jump the reader asked for should leave the chrome alone');
@@ -1981,7 +2182,9 @@ try {
   // ------------------------------------------------------------- the icon
   console.log('— the site icon —');
   const icon = await page.evaluate(async () => {
-    const link = document.querySelector('link[rel="icon"][type="image/svg+xml"]') ?? document.querySelector('link[rel="icon"]');
+    const link =
+      document.querySelector<HTMLLinkElement>('link[rel="icon"][type="image/svg+xml"]') ??
+      document.querySelector<HTMLLinkElement>('link[rel="icon"]');
     if (!link) return { href: null };
     const res = await fetch(link.href);
     const body = await res.text();
@@ -2007,14 +2210,14 @@ try {
   );
   await new Promise((r) => setTimeout(r, 1500));
   const remote = await page.evaluate(() => {
-    const sr = document.getElementById('viewer').shadowRoot;
+    const sr = document.getElementById('viewer')!.shadowRoot!;
     const text = window.__pageTexts().map((t) => t.textContent).join(' ');
     return {
       pages: document.getElementById('pagecount')?.textContent,
       textElements: window.__pageTexts().length,
       outline: document.querySelectorAll('#toc-body .toc-item').length,
       title: document.title,
-      rendersInWorker: window.webpdf.viewer()?.rendersInWorker ?? null,
+      rendersInWorker: window.webpdf!.viewer()?.rendersInWorker ?? null,
       prose: /encoder/i.test(text),
     };
   });
@@ -2030,7 +2233,7 @@ try {
 
   // The same find bar, on a document nobody wrote for this test.
   await page.evaluate(() => {
-    const input = document.getElementById('search');
+    const input = document.getElementById('search') as HTMLInputElement;
     input.value = '3';
     input.dispatchEvent(new Event('input', { bubbles: true }));
   });
@@ -2067,7 +2270,10 @@ try {
 
   console.log('— Ctrl+P prints the document, not the page —');
   await pressCtrl('p');
-  const printed = await page.evaluate(`(async () => {
+  /** The document in the print frame: the bytes, and what they say they are. */
+  type PrintedDocument = { ok: false } | { ok: true; type: string | null; size: number; magic: string };
+
+  const printed = await page.evaluate<PrintedDocument>(`(async () => {
     const deadline = Date.now() + 20000;
     let frame = null;
     while (Date.now() < deadline) {

@@ -1,7 +1,7 @@
 /**
  * The Rust core, as a JavaScript object.
  *
- * The core is compiled to a wasm module by Emscripten (`scripts/build-core-wasm.mjs`),
+ * The core is compiled to a wasm module by Emscripten (`scripts/build-core-wasm.ts`),
  * and this is the only file that knows what its exports are called or what a
  * call's answer looks like. Everything above it - `engine.ts`, and through that
  * the viewer - works in terms of documents, pages and SVGs.

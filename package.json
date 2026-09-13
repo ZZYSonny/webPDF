@@ -8,17 +8,20 @@
   "scripts": {
     "dev": "vite --config vite.demo.config.ts",
     "build": "npm run build:wasm && npm run build:demo",
-    "build:wasm": "node scripts/build-core-wasm.mjs",
+    "build:wasm": "node scripts/build-core-wasm.ts",
     "build:demo": "vite build --config vite.demo.config.ts",
-    "build:pages": "npm run build && node scripts/no-jekyll.mjs dist/demo",
-    "build:extension": "vite build --config vite.ext.config.ts && node scripts/build-extension.mjs",
+    "build:pages": "npm run build && node scripts/no-jekyll.ts dist/demo",
+    "build:extension": "vite build --config vite.ext.config.ts && node scripts/build-extension.ts",
     "preview": "vite preview --config vite.demo.config.ts",
     "typecheck": "tsc --noEmit",
-    "pdfs": "node tests/pdf-cache.mjs",
+    "pdfs": "node tests/pdf-cache.ts",
     "test": "node --test tests/*.test.ts",
     "test:core": "if [ -d .rustup ]; then export RUSTUP_HOME=\"$PWD/.rustup\"; fi; if [ -d .cargo ]; then export CARGO_HOME=\"$PWD/.cargo\"; fi; cargo test --manifest-path core/Cargo.toml",
-    "test:browser": "node tests/browser/all.mjs",
+    "test:browser": "node tests/browser/all.ts",
     "verify": "npm run typecheck && npm test && npm run test:browser"
+  },
+  "engines": {
+    "node": ">=22.18"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",

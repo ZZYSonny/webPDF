@@ -1,7 +1,7 @@
 /**
  * The host bridge, from the page's side: what happens when the host is older.
  *
- *   node tests/browser/bridge.mjs [url]
+ *   node tests/browser/bridge.ts [url]
  *
  * The viewer is redeployed whenever this repository is; the extension that frames
  * it is updated when its reader gets round to it. So the ordinary arrangement is
@@ -33,12 +33,13 @@
 import http from 'node:http';
 import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
+import type { AddressInfo } from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { attach, launch } from './cdp.mjs';
-import { PAPERS, cachedFile } from '../pdf-cache.mjs';
+import { attach, launch, type Browser } from './cdp.ts';
+import { PAPERS, cachedFile } from '../pdf-cache.ts';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const root = path.join(here, '..', '..');
@@ -71,7 +72,7 @@ const PASSWORD = 'hunter2';
  */
 const encryptBin = path.join(root, 'core', 'target', 'release', 'encrypt');
 
-function encrypted(source, password) {
+function encrypted(source: Buffer, password: string): Buffer {
   const scratch = path.join(os.tmpdir(), `webpdf-bridge-${process.pid}.pdf`);
   fs.writeFileSync(scratch, source);
   try {
@@ -84,12 +85,12 @@ function encrypted(source, password) {
 
 let failures = 0;
 const started = Date.now();
-const check = (label, ok, detail = '') => {
+const check = (label: string, ok: boolean, detail = ''): void => {
   const at = `${String(Math.round((Date.now() - started) / 1000)).padStart(3)}s`;
   console.log(`${ok ? 'ok  ' : 'FAIL'} ${at} ${label}${detail ? ` — ${detail}` : ''}`);
   if (!ok) failures++;
 };
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const sleep = (ms: number): Promise<void> => new Promise<void>((r) => setTimeout(r, ms));
 
 /* ------------------------------------------------------------ the stub host */
 
@@ -136,6 +137,28 @@ const HOST_PAGE = `<!doctype html>
 </script>
 </body>`;
 
+/**
+ * What the injected stub host records: every message it has heard from the page.
+ *
+ * The script above is source text, so nothing inside it is checked here; this is
+ * the contract that script installs, declared where it is installed. Every field
+ * is optional because a message carries only what its `kind` has to say, and the
+ * index signature leaves room for a field this test does not read.
+ */
+declare global {
+  interface Window {
+    __heard: Array<{
+      wpdf?: string;
+      kind?: string;
+      bridge?: number;
+      accepts?: readonly number[];
+      info?: { pages?: number; [key: string]: unknown } | null;
+      message?: string;
+      [key: string]: unknown;
+    }>;
+  }
+}
+
 const host = http.createServer((req, res) => {
   const body = Buffer.from(HOST_PAGE);
   res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Content-Length': String(body.length) });
@@ -144,11 +167,20 @@ const host = http.createServer((req, res) => {
 // A *different* loopback address, so the stub host and the viewer are not just
 // different origins but different sites: the frame is then a target of its own,
 // which is how this test reads the memory the page keeps for itself.
-await new Promise((resolve) => host.listen(0, '127.0.0.2', resolve));
-const hostOrigin = `http://127.0.0.2:${host.address().port}`;
-const hostPage = (n) => `${hostOrigin}/host?case=${n}#${encodeURIComponent(url)}`;
+await new Promise<void>((resolve) => host.listen(0, '127.0.0.2', resolve));
+// The server is bound to a TCP address, so `address()` is an `AddressInfo` rather
+// than the string a pipe or a Unix socket would give.
+const hostOrigin = `http://127.0.0.2:${(host.address() as AddressInfo).port}`;
+const hostPage = (n: number): string => `${hostOrigin}/host?case=${n}#${encodeURIComponent(url)}`;
 
 const base64 = bytes.toString('base64');
+
+/** One entry of `/json/list`, as far as this test reads it. */
+interface FrameTarget {
+  type: string;
+  url: string;
+  webSocketDebuggerUrl: string;
+}
 
 /**
  * Ask the viewer's own document something.
@@ -157,14 +189,14 @@ const base64 = bytes.toString('base64');
  * its own; this is the only way to look inside it, and it is exactly what the
  * host cannot do.
  */
-async function frameState(browser, prefix, expression) {
+async function frameState<T = unknown>(browser: Browser, prefix: string, expression: string): Promise<T | null> {
   for (let i = 0; i < 20; i++) {
-    const targets = await (await fetch(`http://127.0.0.1:${browser.port}/json/list`)).json();
+    const targets = (await (await fetch(`http://127.0.0.1:${browser.port}/json/list`)).json()) as FrameTarget[];
     const frame = targets.find((target) => target.type === 'iframe' && target.url.startsWith(prefix));
     if (frame) {
       const attached = await attach(frame.webSocketDebuggerUrl);
       try {
-        return await attached.evaluate(expression);
+        return await attached.evaluate<T>(expression);
       } finally {
         await attached.close();
       }
@@ -172,6 +204,37 @@ async function frameState(browser, prefix, expression) {
     await sleep(250);
   }
   return null;
+}
+
+/**
+ * The shapes the expressions below come back with.
+ *
+ * They are evaluated as source text, so nothing in them is checked here; each of
+ * these is the contract such an expression keeps, named so a reader of a `check`
+ * can see what the value it tests is.
+ */
+interface StoredMemory {
+  pos?: { page?: number; [key: string]: unknown } | null;
+  settings?: unknown;
+  keys?: number;
+}
+
+interface PasswordCard {
+  card: boolean;
+  focused: string;
+}
+
+interface UnlockedState {
+  pages: number;
+  card: boolean;
+}
+
+interface PrintedState {
+  printed: boolean;
+  size?: number;
+  pages?: number;
+  encrypted?: boolean;
+  error?: string;
 }
 
 /* ---------------------------------------------------------------- the checks */
@@ -215,7 +278,7 @@ try {
   // The memory is the page's own, in the page's own storage. It is read here the
   // way a reader's browser would: from the frame's document, which the host
   // cannot reach at all.
-  const memory = await frameState(browser, url, `(() => {
+  const memory = await frameState<StoredMemory>(browser, url, `(() => {
     const stored = JSON.parse(localStorage.getItem('webpdf.memory') ?? '{}');
     const entry = stored[${JSON.stringify('url:' + pdfUrl)}] ?? null;
     return entry && { pos: entry.pos, settings: entry.settings, keys: Object.keys(stored).length };
@@ -243,7 +306,7 @@ try {
   await page.waitFor(() => window.__heard.some((message) => message.kind === 'hello'), { label: 'the page to say hello', timeout: 30000 });
   await page.evaluate(`window.handOver(${JSON.stringify(locked)}, 'locked.pdf', ${JSON.stringify(pdfUrl + '#locked')})`);
 
-  const asked = await frameState(browser, url, `(async () => {
+  const asked = await frameState<PasswordCard>(browser, url, `(async () => {
     for (let i = 0; i < 60 && document.getElementById('password').hidden; i++) await new Promise((r) => setTimeout(r, 100));
     return { card: !document.getElementById('password').hidden, focused: document.activeElement?.id ?? '' };
   })()`);
@@ -253,7 +316,7 @@ try {
   const quiet = await page.evaluate(() => window.__heard.map((message) => message.kind));
   check('and the host is not asked about it', quiet.join() === 'hello', quiet.join() || 'nothing');
 
-  const unlocked = await frameState(browser, url, `(async () => {
+  const unlocked = await frameState<UnlockedState>(browser, url, `(async () => {
     const input = document.getElementById('password-input');
     input.value = ${JSON.stringify(PASSWORD)};
     document.getElementById('password-form').requestSubmit();
@@ -264,7 +327,7 @@ try {
     }
     return { pages: 0, card: !document.getElementById('password').hidden };
   })()`);
-  check('and the password it is given opens the document', unlocked?.pages > 1 && unlocked?.card === false, JSON.stringify(unlocked));
+  check('and the password it is given opens the document', (unlocked?.pages ?? 0) > 1 && unlocked?.card === false, JSON.stringify(unlocked));
   const told = await page
     .waitFor(() => window.__heard.find((message) => message.kind === 'opened') ?? null, { label: 'the host to hear what opened', timeout: 30000 })
     .catch(() => null);
@@ -284,7 +347,7 @@ try {
       return true;
     })()`,
   );
-  const printed = await frameState(browser, url, `(async () => {
+  const printed = await frameState<PrintedState>(browser, url, `(async () => {
     const deadline = Date.now() + 20000;
     let frame = null;
     while (Date.now() < deadline) {
@@ -303,7 +366,7 @@ try {
   })()`);
   check(
     'Ctrl+P prints it without the password',
-    printed?.printed === true && printed.pages > 1 && printed.encrypted === false,
+    printed?.printed === true && (printed.pages ?? 0) > 1 && printed.encrypted === false,
     JSON.stringify(printed),
   );
 
@@ -330,7 +393,7 @@ try {
   await page.close();
 } catch (error) {
   failures++;
-  console.error(`FAIL: ${String(error?.stack ?? error)}`);
+  console.error(`FAIL: ${String((error as { stack?: string } | null)?.stack ?? error)}`);
 } finally {
   await browser.close();
   host.close();

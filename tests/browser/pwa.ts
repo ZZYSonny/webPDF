@@ -1,7 +1,7 @@
 /**
  * The viewer with no network - and the engine it draws with.
  *
- *   node tests/browser/pwa.mjs [url]
+ *   node tests/browser/pwa.ts [url]
  *
  * `url` is where the built demo is served (the suite's preview server). Two
  * scenarios are driven here, and they answer two different questions:
@@ -9,7 +9,7 @@
  *  1. *The engine's address and its digest.* The core is built from this
  *     repository, so it is served from this site and nowhere else, and the page
  *     keeps a copy of it only after checking it against the digest the build was
- *     made with (`warmEngine` in `demo/sw.js`). What is checked is that the
+ *     made with (`warmEngine` in `demo/sw.ts`). What is checked is that the
  *     binary the viewer used is this site's own file, that it digests to exactly
  *     what `vite.demo.config.ts` wrote into the page, and that a page which has
  *     not opened a document yet has fetched no wasm at all (the engine is loaded
@@ -42,13 +42,14 @@
 
 import fs from 'node:fs';
 import http from 'node:http';
+import type { AddressInfo } from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 
-import { launch } from './cdp.mjs';
-import { PAPERS, cachedFile } from '../pdf-cache.mjs';
+import { launch, type Page } from './cdp.ts';
+import { PAPERS, cachedFile } from '../pdf-cache.ts';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const root = path.join(here, '..', '..');
@@ -63,6 +64,12 @@ if (!file) {
   process.exit(1);
 }
 const pdf = `/pdf/${path.basename(file)}`;
+/**
+ * The corpus directory, once the guard above has ruled out a cold cache. A
+ * function body does not keep the narrowing that this scope gets, so `serve`
+ * below reads this binding rather than `file` itself.
+ */
+const corpus = path.dirname(file);
 
 /**
  * The core's binary as *this* build knows it: the address the page resolves,
@@ -79,7 +86,7 @@ const coreName = 'webpdf-core.wasm';
 
 let failures = 0;
 const started = Date.now();
-const check = (label, ok, detail = '') => {
+const check = (label: string, ok: boolean, detail = ''): void => {
   const at = `${String(Math.round((Date.now() - started) / 1000)).padStart(3)}s`;
   console.log(`${ok ? 'ok  ' : 'FAIL'} ${at} ${label}${detail ? ` — ${detail}` : ''}`);
   if (!ok) failures++;
@@ -115,8 +122,30 @@ const PROBE = `(() => {
   };
 })()`;
 
+/** What the page has kept, by store: the shell's files, the engine, the documents. */
+interface Kept {
+  shell: string[];
+  engine: string[];
+  docs: string[];
+}
+
+/**
+ * The two handles `PROBE` leaves on the page. It runs before the demo's own
+ * modules - it is installed with `addScriptToEvaluateOnNewDocument` - so the
+ * globals it defines belong to no module that could declare them; they are
+ * named here, from the script above, which is the only place their shape exists.
+ */
+declare global {
+  interface Window {
+    /** The SVG of each page the viewer has drawn, in document order. */
+    __svgs(): SVGElement[];
+    /** What the page has kept for offline use. */
+    __kept(): Promise<Kept>;
+  }
+}
+
 /** What a file is, by its extension: only the types the site is made of. */
-const TYPES = {
+const TYPES: Record<string, string> = {
   '.html': 'text/html; charset=utf-8',
   '.js': 'text/javascript; charset=utf-8',
   '.css': 'text/css; charset=utf-8',
@@ -143,11 +172,11 @@ const TYPES = {
  * staleness behind it. A test server kinder than the real one would test
  * neither.
  */
-function serve(root) {
+function serve(root: string): http.Server {
   const server = http.createServer((req, res) => {
     const at = decodeURIComponent(new URL(req.url ?? '/', 'http://x').pathname).replace(/^\/+/, '');
-    const local = at.startsWith('pdf/') ? path.join(path.dirname(file), path.basename(at)) : path.join(root, at || 'index.html');
-    if (!local.startsWith(at.startsWith('pdf/') ? path.dirname(file) : root) || !fs.existsSync(local) || !fs.statSync(local).isFile()) {
+    const local = at.startsWith('pdf/') ? path.join(corpus, path.basename(at)) : path.join(root, at || 'index.html');
+    if (!local.startsWith(at.startsWith('pdf/') ? corpus : root) || !fs.existsSync(local) || !fs.statSync(local).isFile()) {
       res.writeHead(404, { 'Content-Type': 'text/plain' });
       res.end('not found');
       return;
@@ -171,7 +200,7 @@ function serve(root) {
  * The *page* is marked as well, because that is the question the rest of this
  * checks ask: which build is the reader looking at.
  */
-function redeploy(dir, marker) {
+function redeploy(dir: string, marker: string): { was: string; now: string } {
   const index = path.join(dir, 'index.html');
   let html = fs.readFileSync(index, 'utf8');
   const entry = /src="\.\/(assets\/[^"]+\.js)"/.exec(html);
@@ -198,37 +227,50 @@ function redeploy(dir, marker) {
 }
 
 /** Which build the page on screen is, or null for the one that was there first. */
-const buildOf = (page) => page.evaluate(`document.querySelector('meta[name="build"]')?.content ?? null`);
+const buildOf = (page: Page): Promise<string | null> =>
+  page.evaluate<string | null>(`document.querySelector('meta[name="build"]')?.content ?? null`);
 
 /** The shells that are kept, in order: the browser's own answer to "which builds". */
-const shellsOf = (page) =>
-  page.evaluate(`caches.keys().then((names) => names.filter((name) => name.startsWith('webpdf-shell-')).sort())`);
+const shellsOf = (page: Page): Promise<string[]> =>
+  page.evaluate<string[]>(
+    `caches.keys().then((names) => names.filter((name) => name.startsWith('webpdf-shell-')).sort())`,
+  );
 
 /** Start a server on a port of the system's choosing, and how to stop it. */
-async function listening(server) {
-  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
-  const origin = `http://127.0.0.1:${server.address().port}`;
+async function listening(server: http.Server): Promise<{ origin: string; stop(): Promise<void> }> {
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const origin = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
   return {
     origin,
     /** Stop answering, and drop the connections a browser keeps open. */
     async stop() {
       server.closeAllConnections?.();
-      await new Promise((resolve) => server.close(resolve));
+      await new Promise<void>((resolve) => server.close(() => resolve()));
     },
   };
 }
 
 /** Load the page and wait until the demo's own handle says it is wired up. */
-async function boot(page, at) {
+async function boot(page: Page, at: string): Promise<void> {
   await page.goto(at, { timeout: 20000 });
   await page.waitFor(() => !!window.webpdf?.open, { label: 'the demo to come up' });
 }
 
 /** Open a document through the page's own path, and wait for it to be drawn. */
-async function open(page, document_) {
+async function open(page: Page, document_: string): Promise<void> {
   await page.evaluate(`window.webpdf.open(${JSON.stringify(document_)})`);
   await page.waitFor(() => window.__svgs().length > 0, { label: 'the first page to be drawn' });
 }
+
+/** The parts of the fetched web app manifest this file reads. */
+interface Manifest {
+  display: string;
+  start_url: string;
+  icons: Array<{ src: string; sizes: string }>;
+}
+
+/** The engine binary, as the page's own fetch can report it. */
+type ServedEngine = { ok: true; size: number; integrity: string } | { ok: false; status: number };
 
 /* ------------------------------------------------- the engine's own address */
 
@@ -240,24 +282,24 @@ console.log('› the engine, and where the page was told to find it');
   await page.send('Page.addScriptToEvaluateOnNewDocument', { source: PROBE });
   await boot(page, url);
 
-  const booted = await page.evaluate(`performance.getEntriesByType('resource').map((entry) => entry.name)`);
+  const booted = await page.evaluate<string[]>(`performance.getEntriesByType('resource').map((entry) => entry.name)`);
   check(
     'nothing fetches the engine until a document needs it',
     !booted.some((name) => name.endsWith('.wasm')),
     `${booted.length} resources at start-up, none of them wasm`,
   );
 
-  const manifest = await page.evaluate(`fetch('./manifest.webmanifest').then((r) => r.json())`);
-  const icons = await page.evaluate(
+  const manifest = await page.evaluate<Manifest>(`fetch('./manifest.webmanifest').then((r) => r.json())`);
+  const icons = await page.evaluate<boolean[]>(
     `Promise.all(${JSON.stringify(manifest.icons.map((icon) => icon.src))}.map(async (src) => (await fetch(src, { method: 'HEAD' })).ok))`,
   );
   check(
     'the manifest is installable, and its icons are real files',
-    manifest.display === 'standalone' && manifest.start_url && manifest.icons.length >= 2 && icons.every(Boolean),
+    !!(manifest.display === 'standalone' && manifest.start_url && manifest.icons.length >= 2 && icons.every(Boolean)),
     `${manifest.icons.length} icons (${manifest.icons.map((icon) => icon.sizes).join(', ')}), start_url ${manifest.start_url}`,
   );
 
-  const worker = await page.evaluate(
+  const worker = await page.evaluate<{ scope: string; state: ServiceWorkerState | null }>(
     `(async () => { const registration = await navigator.serviceWorker.ready; return { scope: registration.scope, state: registration.active?.state ?? null }; })()`,
   );
   // `ready` resolves as soon as there is an active worker, which it can be while
@@ -276,7 +318,7 @@ console.log('› the engine, and where the page was told to find it');
     return kept.shell.length > 0;
   }, { label: 'the shell to be precached' });
 
-  const shell = await page.evaluate(`window.__kept()`);
+  const shell = await page.evaluate<Kept>(`window.__kept()`);
   check(
     'the shell is cached whole, page and manifest included',
     shell.shell.some((name) => name.endsWith('/index.html')) &&
@@ -290,7 +332,7 @@ console.log('› the engine, and where the page was told to find it');
     label: 'the engine to be kept for offline',
     timeout: 90000,
   });
-  const kept = await page.evaluate(`window.__kept()`);
+  const kept = await page.evaluate<Kept>(`window.__kept()`);
   const engine = kept.engine[0] ?? '';
   // There is one source now and it is this site's own - the core is built from
   // this repository rather than installed from a registry - so the question is
@@ -303,7 +345,7 @@ console.log('› the engine, and where the page was told to find it');
   // handed and will not keep what it did not expect (see `warmEngine`), so a
   // service worker holding anything else is a service worker serving a stale
   // engine.
-  const served = await page.evaluate(`(async () => {
+  const served = await page.evaluate<ServedEngine>(`(async () => {
     const response = await fetch(${JSON.stringify(local)});
     if (!response.ok) return { ok: false, status: response.status };
     const bytes = await response.arrayBuffer();
@@ -351,7 +393,7 @@ console.log('\n› the same viewer with no network at all');
     timeout: 90000,
   });
 
-  const kept = await page.evaluate(`window.__kept()`);
+  const kept = await page.evaluate<Kept>(`window.__kept()`);
   check(
     'and the engine is kept from this site, with no name resolving at all',
     kept.engine.length === 1 && kept.engine[0].startsWith(server.origin) && kept.engine[0].endsWith(coreName),
@@ -360,16 +402,16 @@ console.log('\n› the same viewer with no network at all');
 
   // Now take the only server away. What is left is the browser's own storage:
   // the worker has the shell and the engine, the page has the document.
-  const before = await page.evaluate(`window.webpdf.info()?.pageCount ?? 0`);
+  const before = await page.evaluate<number>(`window.webpdf.info()?.pageCount ?? 0`);
   await server.stop();
   await boot(page, server.origin);
 
-  const up = await page.evaluate(`!!window.webpdf?.open && !!navigator.serviceWorker.controller`);
+  const up = await page.evaluate<boolean>(`!!window.webpdf?.open && !!navigator.serviceWorker.controller`);
   check('the page comes up with nothing to fetch it from', up, `${server.origin} is not answering any more`);
 
   await open(page, pdf);
-  const again = await page.evaluate(`window.webpdf.info()?.pageCount ?? 0`);
-  const onScreen = await page.evaluate(`window.__svgs().length`);
+  const again = await page.evaluate<number>(`window.webpdf.info()?.pageCount ?? 0`);
+  const onScreen = await page.evaluate<number>(`window.__svgs().length`);
   check(
     'and the same document still opens, and is still drawn',
     again === before && again > 1 && onScreen > 0,
@@ -399,7 +441,7 @@ console.log('\n› a redeploy, and what the page does about it');
    * waiting. What the reader is on while the offer is up is the answer that
    * matters, so it is read before either button is pressed.
    */
-  const toldAbout = async () => {
+  const toldAbout = async (): Promise<{ said: string; kept: string | null; label: string | null }> => {
     await boot(page, server.origin);
     const said = await page.waitFor(
       () => {
@@ -413,14 +455,16 @@ console.log('\n› a redeploy, and what the page does about it');
       { label: 'the page to say a new build is waiting', timeout: 30000 },
     );
     const kept = await buildOf(page);
-    const label = await page.evaluate(
+    const label = await page.evaluate<string | null>(
       `document.getElementById('toast-action')?.hidden === false ? document.getElementById('toast-action').textContent : null`,
     );
-    return { said, kept, label };
+    // `waitFor` resolves only on a truthy answer, and the predicate's only
+    // truthy answer is the toast's own wording, so `said` is the text by here.
+    return { said: said as string, kept, label };
   };
 
   /** Press the offer's own button, and wait for the page to be the new build. */
-  const takeTheOffer = async (marker) => {
+  const takeTheOffer = async (marker: string): Promise<string> => {
     await page.evaluate(`document.getElementById('toast-action').click()`);
     return await untilBuild(marker);
   };
@@ -433,9 +477,9 @@ console.log('\n› a redeploy, and what the page does about it');
    * the page is one build until it happens. The navigation also throws away the
    * context an evaluation runs in, halfway through it.
    */
-  const untilBuild = async (marker, timeout = 30000) => {
+  const untilBuild = async (marker: string, timeout = 30000): Promise<string> => {
     const deadline = Date.now() + timeout;
-    let last = null;
+    let last: string | null = null;
     while (Date.now() < deadline) {
       try {
         last = await buildOf(page);
@@ -449,15 +493,15 @@ console.log('\n› a redeploy, and what the page does about it');
   };
 
   /** Whether a file the page is made of is still answered for, from the page. */
-  const stillServed = (file) =>
-    page.evaluate(`fetch(${JSON.stringify('./' + file)}).then((response) => response.ok).catch(() => false)`);
+  const stillServed = (file: string): Promise<boolean> =>
+    page.evaluate<boolean>(`fetch(${JSON.stringify('./' + file)}).then((response) => response.ok).catch(() => false)`);
 
   try {
     await boot(page, server.origin);
     await page.waitFor(() => navigator.serviceWorker.controller !== null, { label: 'the first worker to take the site over' });
     await page.waitFor(async () => (await window.__kept()).shell.length > 0, { label: 'the first shell to be precached' });
     const first = await shellsOf(page);
-    const firstToast = await page.evaluate(`document.getElementById('toast-text')?.textContent ?? ''`);
+    const firstToast = await page.evaluate<string>(`document.getElementById('toast-text')?.textContent ?? ''`);
     check(
       'a first visit installs one shell, and is not an update',
       first.length === 1 && (await buildOf(page)) === null && !/newer version/i.test(firstToast),
@@ -488,7 +532,7 @@ console.log('\n› a redeploy, and what the page does about it');
     await page.evaluate(`document.getElementById('toast-dismiss').click()`);
     check(
       'putting the notice down does not put the update on',
-      (await page.evaluate(`document.getElementById('toast').hidden`)) && (await buildOf(page)) === null,
+      (await page.evaluate<boolean>(`document.getElementById('toast').hidden`)) && (await buildOf(page)) === null,
       'the notice is gone and the page is still the old build',
     );
     const again = await toldAbout();
@@ -525,7 +569,7 @@ console.log('\n› a redeploy, and what the page does about it');
     await boot(page, server.origin);
     check(
       'after two updates the page still comes up with nothing to fetch it from',
-      (await page.evaluate(`!!window.webpdf?.open && !!navigator.serviceWorker.controller`)) && (await buildOf(page)) === 'third',
+      (await page.evaluate<boolean>(`!!window.webpdf?.open && !!navigator.serviceWorker.controller`)) && (await buildOf(page)) === 'third',
       `${server.origin} is not answering any more`,
     );
   } finally {

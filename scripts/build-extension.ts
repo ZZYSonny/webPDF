@@ -9,7 +9,7 @@
  * worker and page script, the page they belong to, the manifest, the icon, and
  * one file saying which viewer this build points at.
  *
- *   node scripts/build-extension.mjs [--out DIR] [--remote URL] [--key FILE]
+ *   node scripts/build-extension.ts [--out DIR] [--remote URL] [--key FILE]
  *                                    [--no-zip] [--no-crx]
  *
  * What it writes, in `--out` (default `dist/ext`):
@@ -22,7 +22,7 @@
  * The key is read from `--key`, from `$WEBPDF_EXT_KEY` (a path or the PEM itself),
  * or from `ext/key.pem`, which is gitignored and made on the first build; with
  * none of those, a key is made for this build alone and the extension id changes
- * with it - see `scripts/crx.mjs`. The id is the reader's addresses: the browser
+ * with it - see `scripts/crx.ts`. The id is the reader's addresses: the browser
  * files remembered positions under it, so keep the key if they are to survive.
  *
  * `--remote` is what makes the build testable: point it at a local server and the
@@ -41,7 +41,7 @@ import { deflateRawSync } from 'node:zlib';
 
 import { createPublicKey } from 'node:crypto';
 
-import { packCrx, signingKey } from './crx.mjs';
+import { packCrx, signingKey } from './crx.ts';
 
 const root = path.resolve(import.meta.dirname, '..');
 const pkg = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));
@@ -52,13 +52,19 @@ const PUBLISHED = 'https://zzysonny.github.io/webPDF/';
 /* --------------------------------------------------------------- arguments */
 
 const argv = process.argv.slice(2);
-function option(name, fallback = null) {
+
+/**
+ * What `--name` was given: its value, the fallback when it is absent, or `true`
+ * when it was written with nothing after it - which for every option here means
+ * "asked for, but nothing to go with it".
+ */
+function option(name: string, fallback: string | null = null): string | true | null {
   const at = argv.indexOf(`--${name}`);
   if (at < 0) return fallback;
   const next = argv[at + 1];
   return !next || next.startsWith('--') ? true : next;
 }
-const flag = (name) => argv.includes(`--${name}`);
+const flag = (name: string): boolean => argv.includes(`--${name}`);
 
 const outDir = path.resolve(root, String(option('out', 'dist/ext')));
 const into = path.join(outDir, 'webpdf');
@@ -69,17 +75,23 @@ const packing = !flag('no-crx');
 
 /* ----------------------------------------------------------------- helpers */
 
-const log = (message) => console.log(`  ${message}`);
+const log = (message: string): void => console.log(`  ${message}`);
 
 /** Copy a file or a tree, making the directories on the way. */
-function copy(from, to) {
+function copy(from: string, to: string): void {
   if (!fs.existsSync(from)) throw new Error(`missing ${path.relative(root, from)}`);
   fs.cpSync(from, to, { recursive: true });
 }
 
+/** One staged file: where it is, and the name it gets inside the archive. */
+interface StagedFile {
+  full: string;
+  name: string;
+}
+
 /** Every file under a directory, in a stable order, as archive-relative names. */
-function filesIn(dir, base = dir) {
-  const found = [];
+function filesIn(dir: string, base: string = dir): StagedFile[] {
+  const found: StagedFile[] = [];
   for (const entry of fs.readdirSync(dir, { withFileTypes: true }).sort((a, b) => (a.name < b.name ? -1 : 1))) {
     const full = path.join(dir, entry.name);
     if (entry.isDirectory()) found.push(...filesIn(full, base));
@@ -105,7 +117,7 @@ const CRC_TABLE = (() => {
   return table;
 })();
 
-function crc32(buffer) {
+function crc32(buffer: Buffer): number {
   let c = -1;
   for (let i = 0; i < buffer.length; i++) c = CRC_TABLE[(c ^ buffer[i]) & 0xff] ^ (c >>> 8);
   return (c ^ -1) >>> 0;
@@ -119,9 +131,18 @@ function crc32(buffer) {
  * not a release, and CI can tell. `unzip -t` reads it, which is what the tests
  * check it with.
  */
-function zipDirectory(dir, target) {
-  const entries = [];
-  const body = [];
+/** One archive entry, as the central directory has to restate it. */
+interface ZipEntry {
+  nameBytes: Buffer;
+  sum: number;
+  compressed: number;
+  size: number;
+  offset: number;
+}
+
+function zipDirectory(dir: string, target: string): number {
+  const entries: ZipEntry[] = [];
+  const body: Buffer[] = [];
   let offset = 0;
 
   for (const { full, name } of filesIn(dir)) {
@@ -148,7 +169,7 @@ function zipDirectory(dir, target) {
     offset += local.length + nameBytes.length + deflated.length;
   }
 
-  const directory = [];
+  const directory: Buffer[] = [];
   for (const entry of entries) {
     const head = Buffer.alloc(46);
     head.writeUInt32LE(0x02014b50, 0);
@@ -191,8 +212,15 @@ if (!fs.existsSync(path.join(build, 'background.js')) || !fs.existsSync(path.joi
 /* ----------------------------------------------------------------- staging */
 
 const keyFile = path.join(root, 'ext/key.pem');
+// `--key` first, then the environment, then the gitignored file the first build
+// left behind; `signingKey` makes one for this build alone when all are absent.
+const namedKey = option('key');
 const key = packing
-  ? signingKey(option('key', null) ?? process.env.WEBPDF_EXT_KEY ?? (fs.existsSync(keyFile) ? keyFile : null))
+  ? signingKey(
+      typeof namedKey === 'string'
+        ? namedKey
+        : process.env.WEBPDF_EXT_KEY ?? (fs.existsSync(keyFile) ? keyFile : null),
+    )
   : null;
 
 fs.rmSync(into, { recursive: true, force: true });
@@ -234,8 +262,8 @@ if (zipping || packing) {
 }
 // A crx is that same zip with a signed header in front of it, so the archive is
 // written either way and removed again when nobody asked to keep it.
-let crx = null;
-if (packing) {
+let crx: { file: string; id: string } | null = null;
+if (packing && key) {
   const packed = packCrx(fs.readFileSync(archive), key.privateKey);
   crx = { file: path.join(outDir, `webpdf-${pkg.version}.crx`), id: packed.extensionId };
   fs.writeFileSync(crx.file, packed.crx);
