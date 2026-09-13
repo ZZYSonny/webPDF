@@ -285,9 +285,10 @@ const bionicMenu: Menu = createMenu({
  *   - `'global'` draws nothing at all until the plan is ready, and then draws
  *     once: the page a reader sees is never drawn twice. This is the mode the
  *     page starts in and stars.
- *   - `'progressive'` draws at once - outlines, which look like the page they
- *     are - and redraws everything under the document's faces the moment they
- *     are ready, handing each page over without the reader seeing it.
+ *   - `'progressive'` is the fallback path: pages are drawn incrementally as
+ *     outlines, which look like the page they are, and are never blocked by the
+ *     font conversion. Each is redrawn under the document's faces the moment
+ *     they are ready, handing over without the reader seeing it.
  */
 const RENDER_MODES: ReadonlyArray<{ id: RenderMode; label: string; note: string }> = [
   {
@@ -297,8 +298,8 @@ const RENDER_MODES: ReadonlyArray<{ id: RenderMode; label: string; note: string 
   },
   {
     id: 'progressive',
-    label: 'Draw at Once, Then Text',
-    note: 'the page immediately as outlines, then the document’s faces — handed over without the reader seeing it',
+    label: 'Start with Outline',
+    note: 'the fallback path — pages render incrementally as outlines, not blocked by the font conversion, then redraw under the document’s faces',
   },
 ];
 

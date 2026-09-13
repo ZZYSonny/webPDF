@@ -384,6 +384,7 @@ try {
     label: (document.getElementById('mode-label') as HTMLElement).textContent,
   }));
   if (chosen.mode !== 'progressive') fail(`choosing progressive should take effect before the next document, got ${chosen.mode}`);
+  if (chosen.label !== 'Start with Outline') fail(`the card should name the chosen mode, got ${JSON.stringify(chosen.label)}`);
   // Read a document under the chosen mode, which is what writes the choice down.
   await openExample('progressive');
   // The memory is written once the reader settles into the document.

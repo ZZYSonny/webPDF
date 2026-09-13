@@ -162,7 +162,7 @@ gives the reader selection across pages, find-in-page over the paper, and a
 caret.
 
 The one case where a face is written late at all is a page drawn before the plan
-is ready, which is what *Draw at Once, Then Text* is for. That page is drawn as
+is ready, which is what *Start with Outline* is for. That page is drawn as
 **outlines**, and outlines name no face: they are paths. It is drawn again once
 the plan lands, and the document's faces went in before that redraw. So even
 there the write happens once, and there is still no per-page face and still
@@ -296,9 +296,10 @@ pages' zoom belongs to the viewer:
   * *Global Font Only* draws nothing until the plan is ready, and then draws each
     page once, as text. This is the default and the starred row, and it is the
     most performant path: no page is ever drawn twice.
-  * *Draw at Once, Then Text* draws immediately (as outlines), and hands each
-    page over to the document's faces when they arrive, with the outlines staying
-    on screen underneath until the new page has painted.
+  * *Start with Outline* is the fallback path: pages render incrementally as
+    outlines, not blocked by the font conversion, and each is handed over to the
+    document's faces when they arrive, with the outlines staying on screen
+    underneath until the new page has painted.
 
   A star here is a recommendation and not a state (the same as the crop menu's),
   and the row in force is the one the menu opens on and colours. The choice is
