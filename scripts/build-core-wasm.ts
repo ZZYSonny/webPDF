@@ -27,7 +27,17 @@
  * alive by `webpdf_core::wasm::keep_exports`, because an rlib's `#[no_mangle]`
  * functions are not linker roots on their own.
  *
- *   node scripts/build-core-wasm.ts [--out <dir>]
+ * There are two builds, and they are the two halves of one bargain. What ships
+ * (`npm run build:wasm`) is `wasm-release`: the profile in `core/Cargo.toml`
+ * generates the desktop release's code - `-Oz` is deliberately not asked for,
+ * because smaller code draws pages more slowly, and this is a page renderer
+ * before it is a download - and links it as one LTO module. What is used while
+ * working on the core (`npm run build:wasm:dev`) is `wasm-dev`, which asks for
+ * `-O0` C and no LTO and produces a much larger module in a fraction of the
+ * time. Both write the same two files, so a host - the demo, the extension, the
+ * tests - cannot tell which one it got except by the size.
+ *
+ *   node scripts/build-core-wasm.ts [--dev] [--out <dir>]
  */
 import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
@@ -36,9 +46,13 @@ import path from 'node:path';
 const root = path.resolve(import.meta.dirname, '..');
 const outIndex = process.argv.indexOf('--out');
 const outDir = path.resolve(root, outIndex >= 0 ? process.argv[outIndex + 1] : 'demo/engine');
+const dev = process.argv.includes('--dev');
 
 /** The two files Emscripten writes, and where the page looks for them. */
 const NAME = 'webpdf-core';
+
+/** The cargo profile this run links, and what it means for the C. */
+const PROFILE = dev ? 'wasm-dev' : 'wasm-release';
 
 /** Every `wpdf_*` export, plus the allocator the glue writes arguments through. */
 const EXPORTS = [
@@ -107,21 +121,27 @@ for (const [key, dir] of [
 ]) {
   if (!process.env[key] && fs.existsSync(path.join(root, dir))) env[key] = path.join(root, dir);
 }
-// See the header: the C and the link have to share one exception model.
-env.CFLAGS_wasm32_unknown_emscripten = '-fwasm-exceptions';
+// See the header: the C and the link have to share one exception model. The dev
+// build asks for `-O0` on top of whatever mupdf-sys decided, and it is the last
+// word because these flags are handed to `make` as `XCFLAGS`: compiling MuPDF
+// is the whole cost of this script, and unoptimized C is what makes the loop
+// short.
+env.CFLAGS_wasm32_unknown_emscripten = ['-fwasm-exceptions', dev ? '-O0' : '']
+  .filter(Boolean)
+  .join(' ');
 env.RUSTFLAGS = [...SETTINGS.map((setting) => `-Clink-arg=-s${setting}`), env.RUSTFLAGS ?? '']
   .filter(Boolean)
   .join(' ');
 
 const target = 'wasm32-unknown-emscripten';
-console.log(`building ${NAME} for ${target} (${SETTINGS.length} settings)`);
-execFileSync('cargo', ['build', '--release', '--target', target, '--bin', 'engine'], {
+console.log(`building ${NAME} for ${target} (${PROFILE}, ${SETTINGS.length} settings)`);
+execFileSync('cargo', ['build', '--profile', PROFILE, '--target', target, '--bin', 'engine'], {
   cwd: path.join(root, 'core'),
   env,
   stdio: 'inherit',
 });
 
-const built = path.join(root, 'core', 'target', target, 'release');
+const built = path.join(root, 'core', 'target', target, PROFILE);
 fs.mkdirSync(outDir, { recursive: true });
 for (const extension of ['js', 'wasm']) {
   const from = path.join(built, `engine.${extension}`);

@@ -272,6 +272,32 @@ are explained at the top of that file: the C has to be compiled with
 an `rlib` because a `cdylib` is linked as a side module, which only `dlopen` can
 start.
 
+Most of the binary is not the settings, though; it is MuPDF, and most of MuPDF
+is for documents this core never opens. `core/Cargo.toml` depends on `mupdf`
+with `default-features = false`, which leaves out XPS, SVG and image documents,
+CBZ, the HTML/EPUB/Office engine (and HarfBuzz, Gumbo and the hyphenation
+dictionaries under it), PDF JavaScript, the OCR pipeline, the DOCX writer and
+the Brotli stream filter (MuPDF's own extension to PDF's compression, not a
+filter the standard defines) — about a third of the bytes, and none of them
+reachable from a PDF page. What
+stays is what a PDF can actually need: the JPEG, JPEG 2000, JBIG2, CCITT and
+Flate decoders, ICC colour management, the built-in CJK CMaps, and the URW
+base14 faces a PDF without embedded fonts draws with. Those are fidelity, not
+slack, and they are the floor this build is at. The SVG is not on the list at
+all: it is this crate's own device, written as the page is walked.
+
+There are two builds of the same code. `npm run build:wasm` links the
+`wasm-release` profile: the desktop release's `opt-level = 3` — `-Oz` is
+deliberately not asked for, because smaller code draws pages more slowly, and
+this is a page renderer before it is a download — plus what linking can give
+away for free: one LTO module, one codegen unit, `panic = "abort"`, no symbols.
+`npm run build:wasm:dev` links `wasm-dev` instead, which compiles the C
+unoptimized and skips LTO. A full build is roughly the same either way, since
+MuPDF's C is the cost of both, but the loop after touching a Rust file is a
+fraction of a second instead of several. Both write the same two files, so the
+demo, the extension and the tests cannot tell which one they got except by the
+size.
+
 ---
 
 ## The demo
@@ -376,7 +402,7 @@ pages' zoom belongs to the viewer:
 A reader who has opened the viewer once can open it again on a train. The service
 worker (`demo/sw.ts`) precaches the shell — the page, its scripts, its styles,
 its manifest and icons, and the core's Emscripten glue — and nothing else. The
-9 MB binary and the documents are kept the first time they are actually used, and
+6 MB binary and the documents are kept the first time they are actually used, and
 both are kept *by the page*: the engine's wasm only after the page has checked it
 against the digest the build was made with, and a document only when the reader
 opened it. The list of documents is capped at eight, and the cap is visible: it
@@ -456,7 +482,7 @@ demo/                       the viewer (the Vite root, and the site)
   host.ts                   the bridge to a host page (the extension)
 
 ext/                        the browser extension: a shell around the viewer
-scripts/build-core-wasm.ts  the wasm build (Emscripten, and why the flags)
+scripts/build-core-wasm.ts  the wasm build: two profiles, and why the flags
 scripts/build-extension.ts  staging and packing, from the compiled extension
 scripts/crx.ts              CRX3: the signing, the header, and reading one back
 scripts/no-jekyll.ts        the marker GitHub Pages needs
@@ -474,6 +500,9 @@ vite.ext.config.ts          the extension build
 ```
 npm run build:wasm     build the core for the browser (needs .emsdk/, and a
                        rustc with the wasm32-unknown-emscripten target)
+npm run build:wasm:dev the same, unoptimized: the loop while working on the
+                       Rust, where a rebuild is a fraction of a second rather
+                       than the several an LTO link takes
 npm run dev            the demo, with the core served from demo/engine/
 npm run build          the wasm, then the demo, into dist/demo
 npm run typecheck      tsc over demo/, ext/, scripts/ and tests/
@@ -550,9 +579,13 @@ wants; the published site is `dist/demo`, and the extension points at it.
   missing font is substituted by MuPDF, an image is the image, and a page whose
   content is a bitmap becomes that bitmap. Fidelity is measured against MuPDF's
   own rendering, not against the paper it was printed from.
-* **The wasm binary is 9 MB.** It is compressed on the wire (~4.4 MB gzipped),
-  fetched only when a document is actually opened, and kept for the next visit —
-  but it is not precached on install, deliberately.
+* **The wasm binary is 6 MB.** It was 9 MB when the crate took the `mupdf`
+  defaults and MuPDF built every format it knows how to read; it is compressed on
+  the wire (~2.9 MB gzipped), fetched only when a document is actually opened, and
+  kept for the next visit — but it is not precached on install, deliberately. It
+  is not smaller than that because the rest is not slack: colour management, the
+  decoders and the built-in fonts are what the pages are made of, and `-Oz` would
+  buy a few hundred kilobytes with a slower page.
 * **The crop rules are heuristics.** Six of them, lifted from PaperCutter into
   regular expressions, and each one is a pattern over the page's text runs. They
   are wrong on some documents; that is why none of them is on by default, and why

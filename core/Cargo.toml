@@ -19,7 +19,17 @@ name = "webpdf-core"
 path = "src/main.rs"
 
 [dependencies]
-mupdf = "0.8"
+# MuPDF, with everything this core does not draw left out at the source. The
+# `mupdf` crate's defaults build XPS, SVG and image documents, CBZ, the
+# HTML/EPUB/Office engine (and HarfBuzz and Gumbo under it), PDF JavaScript, the
+# OCR pipeline and the DOCX writer; a reader of PDFs that emits its own SVG
+# needs none of them, and a crate feature is the only honest way to say so -
+# MuPDF's own `make` turns each one into `-D`s that keep the sources, the
+# third-party libraries and the built-in tables out of the link.
+#
+# `base14-fonts` is the one that stays and is not optional: a PDF that does not
+# embed its text fonts is ordinary, and the URW faces are what draws it.
+mupdf = { version = "0.8", default-features = false, features = ["base14-fonts"] }
 # The same MuPDF the safe wrapper links, for the calls it does not expose: a
 # shading's own geometry and colour ramp, and a soft mask's transfer function.
 # See `src/ffi.rs` for why those cannot be reached through `mupdf` alone.
@@ -37,3 +47,27 @@ regex = "1"
 
 [profile.release]
 opt-level = 3
+
+# The browser build. What it *does not* do is ask for smaller code: `-Oz` trades
+# drawing speed for bytes, and this is a page renderer before it is a download.
+# The code generation is the desktop release's, and the `-Oz` that mupdf-sys
+# would have taken from `opt-level` is deliberately not asked for.
+#
+# What is free is the linking: one LTO module instead of many, one codegen unit,
+# no unwind tables behind a Rust `panic` that would abort anyway, no symbols.
+# `npm run build:wasm` uses it; `npm run build:wasm:dev` is the fast loop.
+[profile.wasm-release]
+inherits = "release"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+# The other half of that bargain: `npm run build:wasm:dev` links this one, where
+# the build time is what hurts and nobody is paying for the bytes yet. The C is
+# compiled unoptimized (the build script asks for `-O0` on top of whatever
+# mupdf-sys would have used), and no LTO pass walks the module.
+[profile.wasm-dev]
+inherits = "dev"
+opt-level = 0
+debug = false

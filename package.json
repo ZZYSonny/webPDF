@@ -9,6 +9,7 @@
     "dev": "vite --config vite.demo.config.ts",
     "build": "npm run build:wasm && npm run build:demo",
     "build:wasm": "node scripts/build-core-wasm.ts",
+    "build:wasm:dev": "node scripts/build-core-wasm.ts --dev",
     "build:demo": "vite build --config vite.demo.config.ts",
     "build:pages": "npm run build && node scripts/no-jekyll.ts dist/demo",
     "build:extension": "vite build --config vite.ext.config.ts && node scripts/build-extension.ts",
