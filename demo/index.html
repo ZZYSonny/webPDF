@@ -288,8 +288,11 @@
               the bar is the *document's* chrome and is not on screen, and this
               card is the one thing that is read before the first document
               rather than during one. The rows are the keys this page takes over
-              from the browser - the four that act on the document, the zoom
-              chords, the two page keys - and the find box's own. Ctrl+0 and the
+              from the browser - the four that act on the document, the two zoom
+              chords, the two page keys - and the find box's own. Each chord gets
+              its own row: `Ctrl+=` and `Ctrl+-` move in opposite directions and
+              so do `Home` and `End`, and one line naming both could only
+              describe each of them halfway. Ctrl+0 and the
               bare `+`/`-` are not among them: the fit levels are named in the
               zoom list, and an unmodified key is a convenience rather than a key
               taken over. `tests/browser` presses every chord below. The modifier
@@ -307,13 +310,14 @@
                 <dd>Save the document</dd>
                 <dt><span class="chord"><kbd class="mod-key">Ctrl</kbd>+<kbd>P</kbd></span></dt>
                 <dd>Print the document</dd>
-                <dt>
-                  <span class="chord"><kbd class="mod-key">Ctrl</kbd>+<kbd>=</kbd></span> /
-                  <span class="chord"><kbd class="mod-key">Ctrl</kbd>+<kbd>-</kbd></span>
-                </dt>
-                <dd>Zoom in and out</dd>
-                <dt><span class="chord"><kbd>Home</kbd></span> / <span class="chord"><kbd>End</kbd></span></dt>
-                <dd>Jump to the first or the last page</dd>
+                <dt><span class="chord"><kbd class="mod-key">Ctrl</kbd>+<kbd>=</kbd></span></dt>
+                <dd>Zoom in</dd>
+                <dt><span class="chord"><kbd class="mod-key">Ctrl</kbd>+<kbd>-</kbd></span></dt>
+                <dd>Zoom out</dd>
+                <dt><span class="chord"><kbd>Home</kbd></span></dt>
+                <dd>Jump to the first page</dd>
+                <dt><span class="chord"><kbd>End</kbd></span></dt>
+                <dd>Jump to the last page</dd>
                 <dt><span class="chord"><kbd>Enter</kbd></span></dt>
                 <dd>Next match in the find box</dd>
                 <dt><span class="chord"><kbd>Esc</kbd></span></dt>

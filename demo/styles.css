@@ -1008,8 +1008,14 @@ html.wpdf-host .empty {
  * what they do are two columns rather than a sentence, because a shortcut is
  * looked up and not read. `Ctrl` is `⌘` on Apple hardware (`main.ts`); the
  * markup is the label, the handler takes either modifier.
+ *
+ * The rectangle is as wide as its widest row and no wider - a key column and a
+ * column of one-line descriptions - so the frame hugs the table instead of
+ * padding it out to a width nothing in it reaches. It stays centred under the
+ * card, and `max-width` is only a ceiling for a description that grows.
  */
 .shortcuts {
+  width: fit-content;
   max-width: 440px;
   margin: 18px auto 0;
   padding: 11px 14px 12px;
