@@ -297,6 +297,9 @@ struct FontGlyph<'a> {
     source: &'a OutlineGlyph,
     codes: Vec<u32>,
     advance: i32,
+    /// The outline's box, read once: everything below wants it, and walking
+    /// every command for each of them is work a face should pay for once.
+    bounds: Bounds,
 }
 
 /// The `CFF ` table for a font whose glyph 0 is `.notdef`.
@@ -337,7 +340,7 @@ fn cff_table(glyphs: &[FontGlyph<'_>], family: &str, upem: f32) -> Vec<u8> {
     let (mut bbox_x0, mut bbox_y0) = (f32::INFINITY, f32::INFINITY);
     let (mut bbox_x1, mut bbox_y1) = (f32::NEG_INFINITY, f32::NEG_INFINITY);
     for g in glyphs {
-        let b = g.source.bounds();
+        let b = g.bounds;
         bbox_x0 = bbox_x0.min(b.x0);
         bbox_y0 = bbox_y0.min(b.y0);
         bbox_x1 = bbox_x1.max(b.x1);
@@ -1004,6 +1007,7 @@ pub fn build_font(
             source: g,
             codes,
             advance: (advance_em * upem).round() as i32,
+            bounds,
         });
     }
 
@@ -1044,7 +1048,7 @@ pub fn build_font(
     let (mut x0, mut y0) = (f32::INFINITY, f32::INFINITY);
     let (mut x1, mut y1) = (f32::NEG_INFINITY, f32::NEG_INFINITY);
     for g in &font_glyphs {
-        let b = g.source.bounds();
+        let b = g.bounds;
         if b.y1 > ascender_em {
             ascender_em = b.y1;
         }
@@ -1089,7 +1093,7 @@ pub fn build_font(
         if advance > advance_max {
             advance_max = advance;
         }
-        let lsb = (g.source.bounds().x0 * upem).floor() as i32;
+        let lsb = (g.bounds.x0 * upem).floor() as i32;
         u16be(&mut hmtx, advance);
         i16be(&mut hmtx, lsb.clamp(-32768, 32767) as i16);
     }

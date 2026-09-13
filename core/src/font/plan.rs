@@ -38,7 +38,7 @@ use super::build::{build_font, Cmd, Ligature, OutlineGlyph, PUA_BASE, PUA_LIMIT}
 use super::program::{
     font_objects, page_encodings, program_id, programs_on_page, FontEncoding, Program,
 };
-use crate::util::{base64, char_count, content_hash, OrderedMap};
+use crate::util::{base64, char_count, Digest, OrderedMap};
 
 /// A built face, and everything a host needs to install it.
 #[derive(Clone, Debug)]
@@ -574,30 +574,27 @@ impl Plan {
                     .unwrap_or(true)
             })
             .collect();
-        let signature = content_hash(
-            &gids.iter()
-                .map(|gid| {
-                    format!(
-                        "{gid}:{}:{}",
-                        self.entries[index]
-                            .outlines
-                            .get(gid)
-                            .and_then(|o| o.as_ref())
-                            .map(|c| outline_signature(c))
-                            .unwrap_or_default(),
-                        self.entries[index]
-                            .codes_by_gid
-                            .get(gid)
-                            .map(|codes| codes
-                                .iter()
-                                .map(|c| c.to_string())
-                                .collect::<Vec<_>>()
-                                .join(","))
-                            .unwrap_or_default()
-                    )
-                })
-                .collect::<Vec<_>>(),
-        );
+        // What this face is, hashed from the outlines' own numbers: spelling a
+        // glyph out as text costs a `format!` per path command, and a
+        // specification's faces hold hundreds of thousands of them.
+        let signature = {
+            let mut digest = Digest::new();
+            for gid in &gids {
+                digest.u32(*gid);
+                if let Some(Some(cmds)) = self.entries[index].outlines.get(gid) {
+                    for cmd in cmds {
+                        hash_cmd(&mut digest, *cmd);
+                    }
+                }
+                if let Some(codes) = self.entries[index].codes_by_gid.get(gid) {
+                    for code in codes {
+                        digest.u32(*code);
+                    }
+                }
+                digest.end_field();
+            }
+            digest.name()
+        };
         if self.entries[index].face.is_some() && self.entries[index].signature == signature {
             return;
         }
@@ -768,32 +765,33 @@ impl Plan {
             return;
         }
 
-        let family = format!(
-            "wpdf-{}",
-            content_hash(
-                &std::iter::once(entry.key.clone())
-                    .chain(glyphs.iter().map(|g| format!(
-                        "{}:{}:{}",
-                        g.gid,
-                        g.codes
-                            .iter()
-                            .map(|c| c.to_string())
-                            .collect::<Vec<_>>()
-                            .join("."),
-                        outline_signature(&g.cmds)
-                    )))
-                    .chain(ligatures.iter().map(|l| format!(
-                        "liga:{}<{}>",
-                        l.by,
-                        l.letters
-                            .iter()
-                            .map(|g| g.to_string())
-                            .collect::<Vec<_>>()
-                            .join(",")
-                    )))
-                    .collect::<Vec<_>>()
-            )
-        );
+        // The name *is* the face: it is what a page's `<text>` names and what
+        // the URI is built from, so it is a hash of everything the face holds -
+        // the program it came from, the glyphs, the codes they answer to, and
+        // the ligatures written for them.
+        let mut digest = Digest::new();
+        // The program comes first: two subsets of one font are different faces
+        // even when they draw the same glyphs under the same codes.
+        digest.bytes(entry.key.as_bytes());
+        digest.end_field();
+        for g in &glyphs {
+            digest.u32(g.gid);
+            for code in &g.codes {
+                digest.u32(*code);
+            }
+            for cmd in &g.cmds {
+                hash_cmd(&mut digest, *cmd);
+            }
+            digest.end_field();
+        }
+        for ligature in &ligatures {
+            digest.u32(ligature.by);
+            for gid in &ligature.letters {
+                digest.u32(*gid);
+            }
+            digest.end_field();
+        }
+        let family = format!("wpdf-{}", digest.name());
         let Some(built) = build_font(&glyphs, &ligatures, &family, 1000) else {
             return;
         };
@@ -861,18 +859,28 @@ fn descriptor_name(font: &mupdf::pdf::PdfObject) -> Option<String> {
     }
 }
 
-/// The bytes of an outline, for the signature that says whether a face is stale.
-fn outline_signature(cmds: &[Cmd]) -> String {
-    let mut out = String::new();
-    for cmd in cmds {
-        match *cmd {
-            Cmd::Move(x, y) => out.push_str(&format!("M{x},{y}")),
-            Cmd::Line(x, y) => out.push_str(&format!("L{x},{y}")),
-            Cmd::Curve(a, b, c, d, e, f) => out.push_str(&format!("C{a},{b},{c},{d},{e},{f}")),
-            Cmd::Close => out.push('Z'),
+/// Feed one outline command into a digest, tagged so that two commands of
+/// different kinds cannot read as one.
+fn hash_cmd(digest: &mut Digest, cmd: Cmd) {
+    match cmd {
+        Cmd::Move(x, y) => {
+            digest.u32(0);
+            digest.f32(x);
+            digest.f32(y);
         }
+        Cmd::Line(x, y) => {
+            digest.u32(1);
+            digest.f32(x);
+            digest.f32(y);
+        }
+        Cmd::Curve(cx1, cy1, cx2, cy2, x, y) => {
+            digest.u32(2);
+            for value in [cx1, cy1, cx2, cy2, x, y] {
+                digest.f32(value);
+            }
+        }
+        Cmd::Close => digest.u32(3),
     }
-    out
 }
 
 /// The letters each ligature character stands for, by code point.
