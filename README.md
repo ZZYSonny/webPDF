@@ -349,13 +349,22 @@ pages' zoom belongs to the viewer:
   letters of every word are held at full strength and the rest is faded with
   `fill-opacity` — the string, the character order and every position are
   untouched, so copying a page gives the document's own text.
-* **Ctrl+F finds, Ctrl+S saves, Ctrl+P prints, Ctrl+O opens.** Saving and
-  printing both hand over the *document*, not the drawing of it: what the reader
-  brought (a file, a host's bytes) goes back untouched, and a document this page
-  only has the URL of is written out by the core. A document that had to be
-  unlocked is always written out by the core, because the file on disk still
-  carries the password and whatever a printer is handed would ask for it in a
-  frame nobody can see.
+* **Ctrl+F finds, Ctrl+S saves, Ctrl+P prints, Ctrl+O opens — and the card
+  writes the keyboard down.** With nothing open there is no bar to look in, so
+  the keys this page takes over from the browser are rows in a box under the
+  three ways in: the four that act on the document, the zoom chords (`Ctrl+=`,
+  `Ctrl+-`), `Home`/`End`, and the find box's own `Enter` and `Esc`. It is the
+  keys that are *taken over* rather than every key that works: `Ctrl+0` still
+  means fit width and the bare `+`/`-` still step the same ladder, but the fit
+  levels are named in the zoom list and an unmodified key asks nothing of the
+  browser. The modifier is `⌘` on Apple hardware, in that box and in the find
+  box's tooltip, which is a label and nothing more: every handler takes either
+  modifier. Saving and printing both hand over the *document*, not the drawing
+  of it: what the reader brought (a file, a host's bytes) goes back untouched,
+  and a document this page only has the URL of is written out by the core. A
+  document that had to be unlocked is always written out by the core, because
+  the file on disk still carries the password and whatever a printer is handed
+  would ask for it in a frame nobody can see.
 * **A page is rendered about a viewport before it can be read**, the window is
   deliberately wider than the viewport, and a finished page is installed at a
   quiet moment — unless the reader is looking at it or one page away, in which

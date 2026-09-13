@@ -240,8 +240,13 @@ async function crossPage() {
   return { before, after: await state() };
 }
 
-async function chord(key: string, code: string, vk: number) {
-  const base = { modifiers: 2, key, code, windowsVirtualKeyCode: vk, nativeVirtualKeyCode: vk } satisfies KeyEventParams;
+/**
+ * Press a chord. `modifiers` is the CDP bitfield - 2 is Ctrl, 4 is the Command
+ * key - because the viewer's zoom handler takes either, and the card names `⌘`
+ * on Apple hardware.
+ */
+async function chord(key: string, code: string, vk: number, modifiers = 2) {
+  const base = { modifiers, key, code, windowsVirtualKeyCode: vk, nativeVirtualKeyCode: vk } satisfies KeyEventParams;
   await page.send('Input.dispatchKeyEvent', { ...base, type: 'rawKeyDown' });
   await page.send('Input.dispatchKeyEvent', { ...base, type: 'keyUp' });
   await sleep(300);
@@ -428,6 +433,13 @@ try {
   await chord('0', 'Digit0', 48);
   const home = await state();
   check('Ctrl+0 returns to the fit mode', home.mode === 'fit-width', `${home.box} (${home.mode})`);
+  // Command is the same key on Apple hardware, which is what the card's label
+  // promises there: the handler takes `metaKey` as readily as `ctrlKey`.
+  await chord('-', 'Minus', 189, 4);
+  const commandDown = await state();
+  check('Command+- steps the same ladder', commandDown.scale! < home.scale!,
+    `${home.box} -> ${commandDown.box} (${commandDown.mode})`);
+  await chord('0', 'Digit0', 48);
 
   console.log('\n— the zoom dropdown picks a level —');
   // The `+`/`-` buttons are gone from the bar; the list is the control, and the

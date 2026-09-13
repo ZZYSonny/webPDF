@@ -1514,6 +1514,20 @@ els.tocClose.addEventListener('click', () => setOutline(false));
 
 dismissOnScroll();
 
+/**
+ * What the keyboard in front of the reader calls the shortcut key: `⌘` on Apple
+ * hardware, `Ctrl` everywhere else. Every shortcut below and in `viewer.ts`
+ * takes either modifier (`event.ctrlKey || event.metaKey`), so this is a label
+ * and nothing else - but it is the label the card writes its rows with and the
+ * one the find box's tooltip names, and `Ctrl` on a Mac keyboard would name a
+ * key that is not what a reader there presses.
+ */
+const MOD_LABEL = /mac|iphone|ipad|ipod/i.test(navigator.platform || navigator.userAgent) ? '⌘' : 'Ctrl';
+for (const key of document.querySelectorAll<HTMLElement>('.mod-key')) key.textContent = MOD_LABEL;
+for (const el of document.querySelectorAll<HTMLElement>('[data-mod-title]')) {
+  el.title = (el.dataset.modTitle ?? '').split('{mod}').join(MOD_LABEL);
+}
+
 window.addEventListener('keydown', (event) => {
   if (!viewer) return;
   const mod = event.metaKey || event.ctrlKey;

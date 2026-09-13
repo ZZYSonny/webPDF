@@ -101,7 +101,7 @@
               autocomplete="off"
               spellcheck="false"
               aria-label="Find in document"
-              title="Find in document (Ctrl+F) — Enter for the next match, Shift+Enter for the previous one"
+              data-mod-title="Find in document ({mod}+F) — Enter for the next match, Shift+Enter for the previous one"
             />
             <span id="search-count" class="search-count mono" aria-live="polite"></span>
             <button id="search-prev" class="btn tiny" type="button" title="Previous match (Shift+Enter)" hidden>↑</button>
@@ -282,6 +282,43 @@
                 </button>
                 <div id="mode-menu" class="menu mode-menu" role="listbox" aria-label="Rendering mode" hidden></div>
               </div>
+            </div>
+            <!--
+              The keyboard, written down where the reader has nothing open yet:
+              the bar is the *document's* chrome and is not on screen, and this
+              card is the one thing that is read before the first document
+              rather than during one. The rows are the keys this page takes over
+              from the browser - the four that act on the document, the zoom
+              chords, the two page keys - and the find box's own. Ctrl+0 and the
+              bare `+`/`-` are not among them: the fit levels are named in the
+              zoom list, and an unmodified key is a convenience rather than a key
+              taken over. `tests/browser` presses every chord below. The modifier
+              is `Ctrl` in the markup and is relabelled `⌘` on Apple hardware by
+              `main.ts`; the handlers take either, so only the label changes.
+            -->
+            <div class="shortcuts">
+              <h2 class="shortcuts-title">Keyboard shortcuts</h2>
+              <dl class="shortcuts-list">
+                <dt><span class="chord"><kbd class="mod-key">Ctrl</kbd>+<kbd>O</kbd></span></dt>
+                <dd>Open a document</dd>
+                <dt><span class="chord"><kbd class="mod-key">Ctrl</kbd>+<kbd>F</kbd></span></dt>
+                <dd>Find in the document</dd>
+                <dt><span class="chord"><kbd class="mod-key">Ctrl</kbd>+<kbd>S</kbd></span></dt>
+                <dd>Save the document</dd>
+                <dt><span class="chord"><kbd class="mod-key">Ctrl</kbd>+<kbd>P</kbd></span></dt>
+                <dd>Print the document</dd>
+                <dt>
+                  <span class="chord"><kbd class="mod-key">Ctrl</kbd>+<kbd>=</kbd></span> /
+                  <span class="chord"><kbd class="mod-key">Ctrl</kbd>+<kbd>-</kbd></span>
+                </dt>
+                <dd>Zoom in and out</dd>
+                <dt><span class="chord"><kbd>Home</kbd></span> / <span class="chord"><kbd>End</kbd></span></dt>
+                <dd>Jump to the first or the last page</dd>
+                <dt><span class="chord"><kbd>Enter</kbd></span></dt>
+                <dd>Next match in the find box</dd>
+                <dt><span class="chord"><kbd>Esc</kbd></span></dt>
+                <dd>Clear the find box</dd>
+              </dl>
             </div>
           </div>
         </div>

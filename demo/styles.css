@@ -877,6 +877,12 @@ body {
   inset: 0;
   display: grid;
   place-items: center;
+  /* The card can be taller than a short window now that it carries the
+     shortcuts, so the state scrolls rather than clipping it: `safe` drops the
+     centring when there is no room for it, which is the one case where a
+     centred overflowing box loses its top. */
+  align-items: safe center;
+  overflow: auto;
   padding: 24px;
   background: var(--stage);
 }
@@ -993,6 +999,72 @@ html.wpdf-host .empty {
   flex-wrap: wrap;
   gap: 8px;
   justify-content: center;
+}
+
+/**
+ * The keyboard, in a rectangle under the three ways in. The bar is the
+ * document's chrome and is not on screen yet, so the card is where a reader
+ * with nothing open can be told which keys this page owns - and the keys and
+ * what they do are two columns rather than a sentence, because a shortcut is
+ * looked up and not read. `Ctrl` is `⌘` on Apple hardware (`main.ts`); the
+ * markup is the label, the handler takes either modifier.
+ */
+.shortcuts {
+  max-width: 440px;
+  margin: 18px auto 0;
+  padding: 11px 14px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-sunken);
+  text-align: left;
+}
+
+.shortcuts-title {
+  margin: 0 0 8px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  text-align: center;
+}
+
+.shortcuts-list {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  align-items: baseline;
+  gap: 1px 12px;
+  margin: 0;
+  line-height: 1.35;
+}
+
+.shortcuts-list dt {
+  color: var(--text);
+}
+
+.shortcuts-list dd {
+  margin: 0;
+  color: var(--text-muted);
+}
+
+/* A chord is one thing to press: `Ctrl` and `+` must not be split across lines. */
+.chord {
+  white-space: nowrap;
+}
+
+.shortcuts kbd {
+  display: inline-block;
+  min-width: 17px;
+  padding: 1px 4px;
+  border: 1px solid var(--border);
+  border-bottom-width: 2px;
+  border-radius: 4px;
+  background: var(--bg-elevated);
+  color: var(--text);
+  font-family: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace;
+  font-size: 11px;
+  line-height: 1.25;
+  text-align: center;
 }
 
 .progress {

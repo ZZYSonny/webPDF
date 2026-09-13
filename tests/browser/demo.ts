@@ -442,13 +442,16 @@ const pressEnter = async () => {
   await page.send('Input.dispatchKeyEvent', { type: 'keyUp', ...key });
 };
 
-/** Press Ctrl+<key> through the browser's own input pipeline, as a reader would. */
-const pressCtrl = async (key: string) => {
+/** Press a chord through the browser's own input pipeline, as a reader would. */
+const pressMod = async (key: string, modifiers = 2) => {
+  // `modifiers` is the CDP bitfield: 2 is Ctrl, 4 is the Command key. Both reach
+  // the same handler (`event.metaKey || event.ctrlKey`), which is how a Mac
+  // keyboard presses the shortcuts the card names with `⌘`.
   const virtualKey = key.toUpperCase().charCodeAt(0);
   for (const type of ['keyDown', 'keyUp']) {
     await page.send('Input.dispatchKeyEvent', {
       type,
-      modifiers: 2, // ctrl
+      modifiers,
       key,
       code: `Key${key.toUpperCase()}`,
       windowsVirtualKeyCode: virtualKey,
@@ -531,6 +534,24 @@ try {
     options: [...document.querySelectorAll<HTMLElement>('#example-menu .menu-option')]
       .map((o) => o.dataset.url)
       .filter((url): url is string => Boolean(url)),
+    // The keyboard, as the card writes it down: rows of chords and what they
+    // do, in a box under the three ways in.
+    shortcuts: (() => {
+      const box = document.querySelector<HTMLElement>('#empty .shortcuts');
+      const actions = document.querySelector<HTMLElement>('#empty .empty-actions');
+      if (!box || !actions || !box.offsetParent) return null;
+      const style = getComputedStyle(box);
+      return {
+        platform: navigator.platform,
+        rectangle: style.borderTopStyle === 'solid' && style.borderTopWidth !== '0px',
+        below: box.getBoundingClientRect().top >= actions.getBoundingClientRect().bottom,
+        rows: [...box.querySelectorAll('dt')].map((dt) => ({
+          keys: [...dt.querySelectorAll('.chord')].map((chord) => chord.textContent ?? ''),
+          what: dt.nextElementSibling?.textContent?.trim() ?? '',
+        })),
+      };
+    })(),
+    findTooltip: document.getElementById('search')?.title ?? '',
   }));
   if (!beforeLoad.barHidden) fail('the bar should not be in the way before a document is open');
   if (beforeLoad.emptyHidden !== false) fail('the empty state should be showing before a document is open');
@@ -561,6 +582,30 @@ try {
   if (beforeLoad.gone.length) fail(`the bar still carries ${beforeLoad.gone.join(', ')}`);
   if (!beforeLoad.options.includes(PUBLIC_EXAMPLE)) {
     fail(`the picker should offer the public example ${PUBLIC_EXAMPLE}, got ${JSON.stringify(beforeLoad.options)}`);
+  }
+  // The keyboard, written down on the card: with nothing open there is no bar to
+  // look in, so the keys this page owns are a box under the three ways in. The
+  // handlers are the territory and the suites press them - Ctrl+S and Ctrl+P
+  // below, Ctrl+F in `extension.ts`, the zoom chords in `pinch.ts` - so this
+  // checks that every shortcut is on the card, in the right place, and named
+  // with the modifier this keyboard actually has.
+  const written = beforeLoad.shortcuts;
+  const mac = /mac|iphone|ipad|ipod/i.test(written?.platform ?? '');
+  const mod = mac ? '⌘' : 'Ctrl';
+  if (!written) fail('the empty card should write the keyboard shortcuts down');
+  else {
+    if (!written.rectangle) fail('the shortcuts should be in a rectangle box');
+    if (!written.below) fail('the shortcut box should sit under the three ways in');
+    const chords = written.rows.flatMap((row) => row.keys);
+    const wanted = ['O', 'F', 'S', 'P']
+      .map((key) => `${mod}+${key}`)
+      .concat([`${mod}+=`, `${mod}+-`, 'Home', 'End', 'Enter', 'Esc']);
+    const missing = wanted.filter((chord) => !chords.includes(chord));
+    if (missing.length) fail(`the card should write down ${missing.join(', ')} — it has ${JSON.stringify(chords)}`);
+    if (written.rows.some((row) => !row.what)) fail(`every shortcut should say what it does, got ${JSON.stringify(written.rows)}`);
+    if (!beforeLoad.findTooltip.includes(`${mod}+F`) || beforeLoad.findTooltip.includes('{mod}')) {
+      fail(`the find box should name the same key as the card, got ${JSON.stringify(beforeLoad.findTooltip)}`);
+    }
   }
   // The local copy of a cached paper, when the cache behind `/pdf` has one.
   const cachedDoc = beforeLoad.options.find((value) => value.startsWith(CACHED_PREFIX)) ?? null;
@@ -2257,7 +2302,7 @@ interface FontProbe {
   fs.rmSync(downloads, { recursive: true, force: true });
   fs.mkdirSync(downloads, { recursive: true });
   await browser.send('Browser.setDownloadBehavior', { behavior: 'allow', downloadPath: downloads, eventsEnabled: true });
-  await pressCtrl('s');
+  await pressMod('s');
   const saved = await waitForFile(downloads, 20);
   const magic = saved ? fs.readFileSync(path.join(downloads, saved.name)).subarray(0, 5).toString('latin1') : '';
   console.log('saved: ' + JSON.stringify(saved) + ' starting ' + JSON.stringify(magic));
@@ -2269,7 +2314,7 @@ interface FontProbe {
   else if (magic !== '%PDF-') fail(`Ctrl+S wrote bytes starting ${JSON.stringify(magic)}, which is not a PDF`);
 
   console.log('— Ctrl+P prints the document, not the page —');
-  await pressCtrl('p');
+  await pressMod('p');
   /** The document in the print frame: the bytes, and what they say they are. */
   type PrintedDocument = { ok: false } | { ok: true; type: string | null; size: number; magic: string };
 
@@ -2300,6 +2345,19 @@ interface FontProbe {
   else if (!saved || Math.abs(printed.size - saved.size) > 4096) {
     fail(`the printed document is ${printed.size} bytes and the saved one ${saved?.size ?? 0}`);
   }
+
+  // ------------------------------------------- the same keys on a Mac keyboard
+  // A reader on Apple hardware presses Command where everyone else presses Ctrl,
+  // and the handlers take either (`event.metaKey || event.ctrlKey` in `main.ts`
+  // and `viewer.ts`) - the card names `⌘` there and nothing else changes. This
+  // is that path, through the same pipeline as the two above: the one shortcut
+  // on the card that can be checked without writing a file or printing one.
+  console.log('— Command+F, as a Mac keyboard sends it —');
+  await page.evaluate(() => (document.getElementById('search') as HTMLInputElement).blur());
+  await pressMod('f', 4);
+  const focusedByCommand = await page.evaluate(() => document.activeElement?.id ?? '');
+  if (focusedByCommand !== 'search') fail(`Command+F should focus the find box, got ${JSON.stringify(focusedByCommand)}`);
+  await page.evaluate(() => (document.getElementById('search') as HTMLInputElement).blur());
 
   await shot(out);
 } finally {
