@@ -1983,14 +1983,27 @@ export class PdfViewer {
     }
     if (mod || event.altKey) return;
     // Unmodified keys belong to whatever the user is typing into: a search box
-    // needs its '-' and its Home/End far more than the viewer needs the zoom.
+    // needs its '-' and its Home/End far more than the viewer needs the zoom,
+    // and its `n` and `k` are a query rather than a page turn.
     if (isEditable(event.target)) return;
-    switch (event.key) {
+    // A letter is the same command with Caps Lock on or off.
+    const key = event.key.length === 1 ? event.key.toLowerCase() : event.key;
+    switch (key) {
       case 'Home':
         this.goToPage(1);
         break;
       case 'End':
         this.goToPage(this.pageCount);
+        break;
+      // Turn one page. Arrows, space and PageUp/PageDown scroll the document
+      // natively, so what a letter is for is the *next page* whatever the zoom
+      // is - and `nextPage`/`prevPage` measure that from the page being read,
+      // not from the pixel at the top edge.
+      case 'n':
+        this.nextPage();
+        break;
+      case 'k':
+        this.prevPage();
         break;
       case '+':
       case '=':

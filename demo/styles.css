@@ -1009,20 +1009,30 @@ html.wpdf-host .empty {
  * looked up and not read. `Ctrl` is `⌘` on Apple hardware (`main.ts`); the
  * markup is the label, the handler takes either modifier.
  *
- * The rectangle is as wide as its widest row and no wider - a key column and a
- * column of one-line descriptions - so the frame hugs the table instead of
- * padding it out to a width nothing in it reaches. It stays centred under the
- * card, and `max-width` is only a ceiling for a description that grows.
+ * Twelve keys are two columns of six, split by how they are pressed - every
+ * chord with the modifier held down on the left, every bare key on the right,
+ * as the markup says - so the box is a rectangle instead of a column as tall as
+ * the card. The rectangle is as wide as its widest row and no wider - a key
+ * column and a column of one-line descriptions per group - so the frame hugs
+ * the table instead of padding it out to a width nothing in it reaches. Each
+ * group's descriptions line up with each other and not with the other group's:
+ * they are two tables, and one shared width would buy nothing but a gutter.
  */
 .shortcuts {
   width: fit-content;
-  max-width: 440px;
+  max-width: 100%;
   margin: 18px auto 0;
   padding: 11px 14px 12px;
   border: 1px solid var(--border);
   border-radius: var(--radius);
   background: var(--bg-sunken);
   text-align: left;
+}
+
+.shortcuts-columns {
+  display: grid;
+  grid-template-columns: max-content max-content;
+  gap: 2px 28px;
 }
 
 .shortcuts-title {
@@ -1221,6 +1231,16 @@ body.wpdf-zoomed .toast {
 
   .zoom-input {
     width: 28px;
+  }
+
+  /**
+   * The shortcut table goes whole. It is not part of the bar and is not giving
+   * anything up for it: a phone has no keyboard to press these on, and two
+   * columns of keys do not fit beside the card's own padding. A screen that
+   * cannot type them loses nothing by not having them written down.
+   */
+  .shortcuts {
+    display: none;
   }
 }
 

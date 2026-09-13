@@ -442,6 +442,15 @@ const pressEnter = async () => {
   await page.send('Input.dispatchKeyEvent', { type: 'keyUp', ...key });
 };
 
+/** Press one key through the browser's own input pipeline; `text` types it. */
+const pressKey = async (key: string, text?: string) => {
+  const code = `Key${key.toUpperCase()}`;
+  const virtualKey = key.toUpperCase().charCodeAt(0);
+  const base = { key, code, windowsVirtualKeyCode: virtualKey, nativeVirtualKeyCode: virtualKey };
+  await page.send('Input.dispatchKeyEvent', text ? { type: 'keyDown', ...base, text, unmodifiedText: text } : { type: 'keyDown', ...base });
+  await page.send('Input.dispatchKeyEvent', { type: 'keyUp', ...base });
+};
+
 /** Press a chord through the browser's own input pipeline, as a reader would. */
 const pressMod = async (key: string, modifiers = 2) => {
   // `modifiers` is the CDP bitfield: 2 is Ctrl, 4 is the Command key. Both reach
@@ -599,7 +608,7 @@ try {
     const chords = written.rows.flatMap((row) => row.keys);
     const wanted = ['O', 'F', 'S', 'P']
       .map((key) => `${mod}+${key}`)
-      .concat([`${mod}+=`, `${mod}+-`, 'Home', 'End', 'Enter', 'Esc']);
+      .concat([`${mod}+=`, `${mod}+-`, 'Home', 'End', 'n', 'k', 'Enter', 'Esc']);
     const missing = wanted.filter((chord) => !chords.includes(chord));
     if (missing.length) fail(`the card should write down ${missing.join(', ')} — it has ${JSON.stringify(chords)}`);
     if (written.rows.some((row) => !row.what)) fail(`every shortcut should say what it does, got ${JSON.stringify(written.rows)}`);
@@ -607,6 +616,41 @@ try {
       fail(`the find box should name the same key as the card, got ${JSON.stringify(beforeLoad.findTooltip)}`);
     }
   }
+  // The table is two columns of six now, which makes it the widest thing on the
+  // card: it fits beside the card's own padding down to the narrow-window
+  // breakpoint, and below that the card does not write it down at all - a phone
+  // has no keyboard to press these on. Measured here, where the card stands
+  // alone, and not after a document is open, when the card is gone.
+  console.log('— the shortcut table, wide and narrow —');
+  const shortcutsAt = async (width: number) => {
+    await page.setViewport(width, 900);
+    await new Promise((r) => setTimeout(r, 250));
+    return page.evaluate(() => {
+      const box = document.querySelector<HTMLElement>('#empty .shortcuts')!;
+      const r = box.getBoundingClientRect();
+      return {
+        shown: getComputedStyle(box).display !== 'none',
+        width: Math.round(r.width),
+        inside: r.left >= 0 && r.right <= innerWidth,
+        columns: [...box.querySelectorAll<HTMLElement>('.shortcuts-list')].map((list) => Math.round(list.getBoundingClientRect().width)),
+        overflow: document.documentElement.scrollWidth - innerWidth,
+      };
+    });
+  };
+  for (const width of [1440, 900, 700, 561]) {
+    const state = await shortcutsAt(width);
+    console.log(`  ${width}px: ${JSON.stringify(state)}`);
+    if (!state.shown) fail(`the shortcut table should be written down at ${width}px`);
+    if (!state.inside) fail(`the shortcut table runs outside the window at ${width}px (${JSON.stringify(state)})`);
+    if (state.overflow > 0) fail(`the card overflows the window at ${width}px by ${state.overflow}px`);
+  }
+  for (const width of [560, 430, 360]) {
+    const state = await shortcutsAt(width);
+    console.log(`  ${width}px: ${JSON.stringify(state)}`);
+    if (state.shown) fail(`the shortcut table should not be written down on a phone (${width}px)`);
+  }
+  await page.setViewport(1440, 900);
+  await new Promise((r) => setTimeout(r, 250));
   // The local copy of a cached paper, when the cache behind `/pdf` has one.
   const cachedDoc = beforeLoad.options.find((value) => value.startsWith(CACHED_PREFIX)) ?? null;
   const document_ = cachedDoc ?? PUBLIC_EXAMPLE;
@@ -1031,6 +1075,47 @@ interface FontProbe {
       highlights: window.__pageSvgs().reduce((n, svg) => n + svg.querySelectorAll('rect[data-wpdf-search]').length, 0),
     }));
     if (cleared.highlights !== 0 || cleared.count !== '') fail(`clearing should remove the boxes, got ${JSON.stringify(cleared)}`);
+
+    // `n` and `k` turn a page - and inside the find box they are still just
+    // letters, because a reader typing a query that contains them is not asking
+    // for a page. The query is nonsense on purpose: no match can move the page
+    // either, so any move here is the viewer claiming the keystroke.
+    console.log('— n and k turn a page, and are letters in the find box —');
+    await page.evaluate(() => (document.getElementById('search') as HTMLInputElement).focus());
+    const typedFrom = await page.evaluate(() => ({
+      page: document.querySelector<HTMLInputElement>('#pageno')!.value,
+      scrollY: Math.round(window.scrollY),
+    }));
+    for (const letter of ['z', 'z', 'n', 'k']) await pressKey(letter, letter);
+    await new Promise((r) => setTimeout(r, 500));
+    const typed = await page.evaluate(() => ({
+      query: (document.getElementById('search') as HTMLInputElement).value,
+      page: document.querySelector<HTMLInputElement>('#pageno')!.value,
+      scrollY: Math.round(window.scrollY),
+    }));
+    console.log('  typed "zznk" into the find box: ' + JSON.stringify(typed));
+    if (typed.query !== 'zznk') fail(`the find box should hold what was typed into it, got ${JSON.stringify(typed.query)}`);
+    if (typed.page !== typedFrom.page || typed.scrollY !== typedFrom.scrollY) {
+      fail(`typing in the find box turned the page: ${JSON.stringify(typedFrom)} -> ${JSON.stringify(typed)}`);
+    }
+
+    // Out of the box, the same two letters are the page turn the card names.
+    await page.evaluate(() => {
+      const input = document.getElementById('search') as HTMLInputElement;
+      input.value = '';
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      input.blur();
+    });
+    const from = Number(typed.page);
+    await pressKey('n');
+    await new Promise((r) => setTimeout(r, 900));
+    const turned = await page.evaluate(() => document.querySelector<HTMLInputElement>('#pageno')!.value);
+    if (turned !== String(from + 1)) fail(`n should turn to page ${from + 1}, got ${turned}`);
+    await pressKey('k');
+    await new Promise((r) => setTimeout(r, 900));
+    const back = await page.evaluate(() => document.querySelector<HTMLInputElement>('#pageno')!.value);
+    if (back !== String(from)) fail(`k should come back to page ${from}, got ${back}`);
+    console.log(`  n took page ${from} to ${turned}, k brought it back to ${back}`);
   }
 
   // ----------------------------------------------------------------- links

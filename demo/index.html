@@ -287,42 +287,62 @@
               The keyboard, written down where the reader has nothing open yet:
               the bar is the *document's* chrome and is not on screen, and this
               card is the one thing that is read before the first document
-              rather than during one. The rows are the keys this page takes over
-              from the browser - the four that act on the document, the two zoom
-              chords, the two page keys - and the find box's own. Each chord gets
-              its own row: `Ctrl+=` and `Ctrl+-` move in opposite directions and
-              so do `Home` and `End`, and one line naming both could only
-              describe each of them halfway. Ctrl+0 and the
-              bare `+`/`-` are not among them: the fit levels are named in the
-              zoom list, and an unmodified key is a convenience rather than a key
-              taken over. `tests/browser` presses every chord below. The modifier
-              is `Ctrl` in the markup and is relabelled `⌘` on Apple hardware by
-              `main.ts`; the handlers take either, so only the label changes.
+              rather than during one. Twelve keys in one column would make the
+              card a page of its own, so they are two columns of six, split by
+              how they are pressed: everything held down with the modifier on the
+              left - the document's own four keys and the two zoom chords - and
+              everything pressed on its own on the right: the two page turns,
+              either end of the document, and the find box's Enter and Esc.
+              Every key gets its own row - `Ctrl+=` and `Ctrl+-` move in
+              opposite directions, and so do `n` and `k`, and one line naming
+              both could only describe each of them halfway. `n` and `k` are the
+              two unmodified letters this page takes over, and a key pressed
+              into the find box is the find box's: its `n` and `k` are a query,
+              not a page turn (`isEditable` in `viewer.ts`). Ctrl+0 and the bare
+              `+`/`-` are not among them: the fit levels are named in the zoom
+              list, and an unmodified key is a convenience rather than a key
+              taken over - `n` and `k` earn their row by being the page turn a
+              reader's hands already know. `tests/browser` presses every key
+              below. The modifier is `Ctrl` in the markup and is relabelled `⌘`
+              on Apple hardware by `main.ts`; the handlers take either, so only
+              the label changes. A phone is shown neither column: there is no
+              keyboard to press it on, and at that width the two columns stop
+              fitting (see the narrow-window rules in `styles.css`).
             -->
             <div class="shortcuts">
               <h2 class="shortcuts-title">Keyboard shortcuts</h2>
-              <dl class="shortcuts-list">
-                <dt><span class="chord"><kbd class="mod-key">Ctrl</kbd>+<kbd>O</kbd></span></dt>
-                <dd>Open a document</dd>
-                <dt><span class="chord"><kbd class="mod-key">Ctrl</kbd>+<kbd>F</kbd></span></dt>
-                <dd>Find in the document</dd>
-                <dt><span class="chord"><kbd class="mod-key">Ctrl</kbd>+<kbd>S</kbd></span></dt>
-                <dd>Save the document</dd>
-                <dt><span class="chord"><kbd class="mod-key">Ctrl</kbd>+<kbd>P</kbd></span></dt>
-                <dd>Print the document</dd>
-                <dt><span class="chord"><kbd class="mod-key">Ctrl</kbd>+<kbd>=</kbd></span></dt>
-                <dd>Zoom in</dd>
-                <dt><span class="chord"><kbd class="mod-key">Ctrl</kbd>+<kbd>-</kbd></span></dt>
-                <dd>Zoom out</dd>
-                <dt><span class="chord"><kbd>Home</kbd></span></dt>
-                <dd>Jump to the first page</dd>
-                <dt><span class="chord"><kbd>End</kbd></span></dt>
-                <dd>Jump to the last page</dd>
-                <dt><span class="chord"><kbd>Enter</kbd></span></dt>
-                <dd>Next match in the find box</dd>
-                <dt><span class="chord"><kbd>Esc</kbd></span></dt>
-                <dd>Clear the find box</dd>
-              </dl>
+              <div class="shortcuts-columns">
+                <!-- Everything pressed with the modifier held down. -->
+                <dl class="shortcuts-list">
+                  <dt><span class="chord"><kbd class="mod-key">Ctrl</kbd>+<kbd>O</kbd></span></dt>
+                  <dd>Open a document</dd>
+                  <dt><span class="chord"><kbd class="mod-key">Ctrl</kbd>+<kbd>S</kbd></span></dt>
+                  <dd>Save the document</dd>
+                  <dt><span class="chord"><kbd class="mod-key">Ctrl</kbd>+<kbd>P</kbd></span></dt>
+                  <dd>Print the document</dd>
+                  <dt><span class="chord"><kbd class="mod-key">Ctrl</kbd>+<kbd>F</kbd></span></dt>
+                  <dd>Find in the document</dd>
+                  <dt><span class="chord"><kbd class="mod-key">Ctrl</kbd>+<kbd>=</kbd></span></dt>
+                  <dd>Zoom in</dd>
+                  <dt><span class="chord"><kbd class="mod-key">Ctrl</kbd>+<kbd>-</kbd></span></dt>
+                  <dd>Zoom out</dd>
+                </dl>
+                <!-- Everything pressed on its own, no modifier. -->
+                <dl class="shortcuts-list">
+                  <dt><span class="chord"><kbd>n</kbd></span></dt>
+                  <dd>Next page</dd>
+                  <dt><span class="chord"><kbd>k</kbd></span></dt>
+                  <dd>Previous page</dd>
+                  <dt><span class="chord"><kbd>Home</kbd></span></dt>
+                  <dd>Jump to the first page</dd>
+                  <dt><span class="chord"><kbd>End</kbd></span></dt>
+                  <dd>Jump to the last page</dd>
+                  <dt><span class="chord"><kbd>Enter</kbd></span></dt>
+                  <dd>Next match in the find box</dd>
+                  <dt><span class="chord"><kbd>Esc</kbd></span></dt>
+                  <dd>Clear the find box</dd>
+                </dl>
+              </div>
             </div>
           </div>
         </div>
