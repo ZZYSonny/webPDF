@@ -88,6 +88,16 @@ with it about.
   pages one document — registering a face re-lays-out every text run in the
   document it is registered in, so it is done once and all at once rather than
   once per page.
+* **A face crosses to the host as bytes, served from a URI — not as base64 in the
+  stylesheet.** A rule says *where* its face is (`src:url("wpdf-<hash>.woff")`)
+  and `wpdf_fonts(id)` hands over the bytes behind every one of those URIs, which
+  the host answers with a URL of its own — a `blob:` in a browser. Inlining would
+  put 4/3 of every font inside the stylesheet, and the browser would parse it as
+  text and decode it back to bytes; this way the bytes arrive as bytes and a rule
+  is a filename. The exceptions are the pages that have to stand alone, and they
+  are the reason the inline form still exists at all: a standalone SVG has no host
+  to serve a URI, and a page drawn before the plan is ready has no document face
+  to name.
 * **The plan is cheap.** Walking 756 pages and building 48 faces takes **0.92 s**
   natively and a few seconds in wasm; the 100-page GPT-4 report is **0.20 s** and
   87 faces. It still runs in slices (`wpdf_plan(id, pages)`) so the page stays
@@ -217,7 +227,8 @@ writes a document back out with a password on it.
 let mut core = Core::open(&bytes, "application/pdf")?;
 core.authenticate("hunter2")?;          // only when `info().encrypted`
 core.plan_fonts()?;                     // or plan_start/plan_step, a slice at a time
-let css = core.stylesheet();            // one @font-face per font, for the document
+let css = core.stylesheet();            // one @font-face per font, naming each by URI
+let faces = core.faces();               // the bytes to serve at those URIs
 let page = core.render_page(0, &options)?;   // svg, width, height, stats, links
 let patterns = crop::compile(&["^arXiv:".to_string()])?;  // the marks to leave out
 let box = core.measure_crop(0, &patterns)?;  // the content box, before padding
@@ -241,8 +252,16 @@ the same shape:
 with the answer read from a pointer the module owns (`wpdf_out_ptr`). Arguments
 are strings or bytes the caller allocates with `malloc`; an error is a header
 with `"error"` in it. The exports are `wpdf_open`, `wpdf_password`, `wpdf_close`,
-`wpdf_info`, `wpdf_plan`, `wpdf_stylesheet`, `wpdf_render`, `wpdf_measure_crop`,
-`wpdf_crop_check`, `wpdf_links`, `wpdf_save` and `wpdf_out_ptr`.
+`wpdf_info`, `wpdf_plan`, `wpdf_stylesheet`, `wpdf_fonts`, `wpdf_render`,
+`wpdf_measure_crop`, `wpdf_crop_check`, `wpdf_links`, `wpdf_save` and
+`wpdf_out_ptr`.
+
+`wpdf_stylesheet` and `wpdf_fonts` are one exchange in two calls: the first is
+the rules, each naming its face by URI, and the second is the bytes behind every
+one of those URIs — a header listing family, URI, media type, size and offset per
+face, and the bytes themselves one face after another. A host serves each slice
+at its URI and writes its own URL into the rule, so the document's fonts are a
+handful of `blob:` fetches rather than a stylesheet with every face in it.
 
 `wpdf_render` takes a flag word — responsive, embed the page's fonts, bionic,
 link hit areas, crop — and, when cropping, the `viewBox` to draw into. A crop is

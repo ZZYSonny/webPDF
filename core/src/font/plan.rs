@@ -24,7 +24,7 @@
 //! page: only a page handle can draw those glyphs, and only the display list
 //! says which ones a page used.
 
-use std::cell::RefCell;
+use std::cell::{OnceCell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
@@ -46,13 +46,52 @@ pub struct Face {
     /// The CSS family the `<text>` elements name.
     pub family: String,
     /// A complete `@font-face` rule, sans the surrounding `<style>` element.
+    ///
+    /// Its `src` names [`Face::uri`] and not the face's bytes: the core has no
+    /// URL namespace to serve a font from, so the rule says *where* the face is
+    /// and the host puts its own URL there - `blob:` in a browser, a path beside
+    /// the page in a reader that writes one.
     pub css: String,
+    /// What [`Face::css`] names the face as, relative to the document that got
+    /// the rule: `wpdf-<hash>.woff`. Unique to the face, so a host can serve it
+    /// and put its own URL in the rule's place without guessing which face a
+    /// rule is about.
+    pub uri: String,
+    /// The media type of the bytes at [`Face::uri`].
+    pub mime: &'static str,
     /// Container the bytes are in: `woff`, or the raw OpenType/CFF font.
     pub format: &'static str,
+    /// Size of [`Face::payload`] in bytes.
     pub bytes: usize,
     pub glyph_count: usize,
-    /// The compiled font.
+    /// The compiled font, as `build_font` wrote it. Kept because `dump` holds a
+    /// face to the outlines it was built from, which is a question about the
+    /// OpenType the glyphs went into rather than about a container.
     pub data: Vec<u8>,
+    /// The bytes a host serves at [`Face::uri`]: the same font, in `format`.
+    pub payload: Vec<u8>,
+    /// The rule with the bytes inline, built the first time a page that has to
+    /// stand alone asks for one. A page drawn before the plan is ready carries
+    /// its own faces, and a standalone SVG is opened with no host to serve them,
+    /// so that form has to exist - but it is base64 and 4/3 the size, so a
+    /// document whose faces are served never builds it at all.
+    embedded: OnceCell<String>,
+}
+
+impl Face {
+    /// The rule with the face's bytes in it, for a page with no host to serve it.
+    pub fn embedded_css(&self) -> &str {
+        self.embedded.get_or_init(|| {
+            format!(
+                "@font-face{{font-family:'{}';src:url(data:{};base64,{}) format('{}');\
+                 font-weight:normal;font-style:normal;font-display:block}}",
+                self.family,
+                self.mime,
+                base64(&self.payload),
+                self.format,
+            )
+        })
+    }
 }
 
 /// One face's input: what it was compiled from, glyph by glyph.
@@ -174,6 +213,11 @@ impl Plan {
     }
 
     /// Every `@font-face` rule, in the order the faces were built.
+    ///
+    /// Each rule names its face by URI, and the bytes behind every one of those
+    /// URIs are [`Face::payload`] - a host serves them and puts its own URL in
+    /// the rule, which is what keeps a quarter of a megabyte of font out of the
+    /// stylesheet it writes into the document.
     pub fn stylesheet(&self) -> String {
         self.faces
             .iter()
@@ -258,10 +302,12 @@ impl Plan {
             .collect()
     }
 
-    /// The `@font-face` rule of the face that draws an entry, when it has one.
+    /// The `@font-face` rule of the face that draws an entry, with its bytes in
+    /// it - what a page that has to stand alone carries, since nothing is going
+    /// to serve a URI it names.
     pub fn face_css(&self, entry: usize) -> Option<&str> {
         let entry = self.entries.get(entry)?;
-        Some(self.faces.get(entry.face?)?.css.as_str())
+        Some(self.faces.get(entry.face?)?.embedded_css())
     }
 
     /// The face that draws one of a page's fonts, or `None` when the plan has
@@ -751,24 +797,31 @@ impl Plan {
         let Some(built) = build_font(&glyphs, &ligatures, &family, 1000) else {
             return;
         };
-        // WOFF where deflating helps, which is nearly always: the whole face
-        // rides in a data URI on every page that names it.
-        let (payload, format, mime, label) = match super::woff::encode(&built.data) {
-            Some(woff) => (woff, "woff", "font/woff", "woff"),
-            None => (built.data.clone(), "opentype", "font/otf", "opentype"),
+        // WOFF where deflating helps, which is nearly always: the face is handed
+        // over as one blob per document and served from a URI, so the container
+        // is the whole of what a browser has to fetch for it.
+        let (payload, format, mime, label, ext) = match super::woff::encode(&built.data) {
+            Some(woff) => (woff, "woff", "font/woff", "woff", "woff"),
+            None => (built.data.clone(), "opentype", "font/otf", "opentype", "otf"),
         };
+        // The family is already a content hash, so the URI it names is unique to
+        // this face and stable for this document.
+        let uri = format!("{family}.{ext}");
         let css = format!(
-            "@font-face{{font-family:'{family}';src:url(data:{mime};base64,{}) format('{label}');\
-             font-weight:normal;font-style:normal;font-display:block}}",
-            base64(&payload)
+            "@font-face{{font-family:'{family}';src:url(\"{uri}\") format('{label}');\
+             font-weight:normal;font-style:normal;font-display:block}}"
         );
         let face = Face {
             family,
             css,
+            uri,
+            mime,
             format,
             bytes: payload.len(),
             glyph_count: built.glyph_count,
             data: built.data.clone(),
+            payload,
+            embedded: OnceCell::new(),
         };
         self.faces.push(face);
         let entry = &mut self.entries[index];

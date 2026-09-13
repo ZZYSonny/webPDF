@@ -716,7 +716,13 @@ try {
       textElements: window.__pageTexts().length,
       outlineUses: svgs.reduce((n, svg) => n + svg.querySelectorAll('use').length, 0),
       fontFaces: (css.match(/@font-face/g) || []).length,
-      fontBytes: (css.match(/base64,([A-Za-z0-9+/=]+)/g) || []).reduce((a, m) => a + m.length, 0),
+      // A face is not in the rule: the rule names a URI and the host serves the
+      // bytes there. So this is a number that has to stay zero - a rule that
+      // went back to carrying its font inline would show up here.
+      inlineFontBytes: (css.match(/base64,([A-Za-z0-9+/=]+)/g) || []).reduce((a, m) => a + m.length, 0),
+      // ...and this one has to be the face count: every rule served from a URL
+      // this document owns, which is what makes the faces render at all.
+      fontUrls: new Set(css.match(/@font-face[^}]*url\(["']?blob:[^"')]+/g) || []).size,
       familiesUsed: families.length,
       firstSvgBox: box ? [box.x, box.y, box.width, box.height].map((n) => Math.round(n)) : null,
       sampleText: (firstText?.textContent ?? '').slice(0, 64),
@@ -780,6 +786,12 @@ interface FontProbe {
   if (report.renderedPages < 1) fail('no page rendered');
   if (report.textElements < 1) fail('no text elements produced');
   if (report.fontFaces < 1) fail('no @font-face rules injected');
+  if (report.inlineFontBytes !== 0) {
+    fail(`a face is carried in the stylesheet as base64: ${report.inlineFontBytes} characters of it`);
+  }
+  if (report.fontUrls < report.fontFaces) {
+    fail(`only ${report.fontUrls} of ${report.fontFaces} faces are served from a URL`);
+  }
   if (!applied || Math.abs(applied.withGenerated - applied.withFallback) < 0.5) {
     fail(`generated font is not being applied: ${JSON.stringify(applied)}`);
   }

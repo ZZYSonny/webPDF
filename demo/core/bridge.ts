@@ -41,6 +41,7 @@ export interface CoreModule {
   readonly _wpdf_info: (id: number) => number;
   readonly _wpdf_plan: (id: number, pages: number) => number;
   readonly _wpdf_stylesheet: (id: number) => number;
+  readonly _wpdf_fonts: (id: number) => number;
   readonly _wpdf_render: (
     id: number,
     page: number,
@@ -65,7 +66,29 @@ export interface CoreModule {
 /** A call's answer, split into the part a human reads and the part a browser does. */
 export interface Frame {
   header: Record<string, unknown>;
-  payload: Uint8Array;
+  /**
+   * The blob itself. `frame` copies it out of wasm memory, so it is backed by
+   * its own `ArrayBuffer` - which is what lets it be handed to `Blob` as it is.
+   */
+  payload: Uint8Array<ArrayBuffer>;
+}
+
+/**
+ * One face, as `wpdf_fonts` describes it: where its bytes are, and the URI the
+ * document's stylesheet names it by.
+ */
+export interface CoreFace {
+  family: string;
+  /** What the face's `@font-face` rule names it as: `wpdf-<hash>.woff`. */
+  uri: string;
+  format: 'woff' | 'opentype';
+  /** The media type of the bytes at `uri`. */
+  mime: string;
+  /** How many bytes of the payload are this face's. */
+  bytes: number;
+  /** Where those bytes start. */
+  offset: number;
+  glyphs: number;
 }
 
 /** Which render options a call set, as the bits the core reads. */
@@ -180,6 +203,18 @@ export class Core {
   /** Every `@font-face` rule the document's faces need. */
   stylesheet(id: number): string {
     return new TextDecoder().decode(this.frame(this.module._wpdf_stylesheet(id), 'stylesheet').payload);
+  }
+
+  /**
+   * Every face's bytes, and the URI the stylesheet names each of them by.
+   *
+   * The bytes come back as one buffer with the faces laid end to end; `offset`
+   * and `bytes` say which slice is which. `frame` copies the answer out of wasm
+   * memory, so the slices outlive the module's own buffer.
+   */
+  fonts(id: number): { faces: CoreFace[]; bytes: Uint8Array<ArrayBuffer> } {
+    const { header, payload } = this.frame(this.module._wpdf_fonts(id), 'fonts');
+    return { faces: (header.faces ?? []) as CoreFace[], bytes: payload };
   }
 
   render(

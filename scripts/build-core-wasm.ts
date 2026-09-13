@@ -64,6 +64,7 @@ const EXPORTS = [
   '_wpdf_info',
   '_wpdf_plan',
   '_wpdf_stylesheet',
+  '_wpdf_fonts',
   '_wpdf_render',
   '_wpdf_measure_crop',
   '_wpdf_links',

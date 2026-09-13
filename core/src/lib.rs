@@ -152,12 +152,14 @@ impl Core {
         &self.plan
     }
 
-    /// Every face the plan built, for a host that registers them all at once.
+    /// Every face the plan built: the bytes to serve, and the URI
+    /// [`stylesheet`](Core::stylesheet) names each of them by.
     pub fn faces(&self) -> &[Face] {
         self.plan.faces()
     }
 
-    /// Every `@font-face` rule the document's faces need.
+    /// Every `@font-face` rule the document's faces need, each naming its face
+    /// by URI. The bytes at those URIs are [`Face::payload`], from [`faces`](Core::faces).
     pub fn stylesheet(&self) -> String {
         self.plan.stylesheet()
     }

@@ -244,14 +244,53 @@ pub extern "C" fn wpdf_plan(id: u32, pages: i32) -> i32 {
 /// Every `@font-face` rule the document's faces need, as the payload.
 ///
 /// This is what makes the document one document: the host writes the rules into
-/// its page once, and every page drawn after that names the same faces. The
-/// alternative - embedding the rules in each page - is what a standalone SVG
+/// its page once, and every page drawn after that names the same faces. A rule
+/// names its face by URI rather than carrying it, so this goes with
+/// [`wpdf_fonts`], which is where the bytes behind those URIs come from.
+///
+/// The alternative - embedding the bytes in each page - is what a standalone SVG
 /// needs, and is `EMBED_FONTS` on a render.
 #[no_mangle]
 pub extern "C" fn wpdf_stylesheet(id: u32) -> i32 {
     call(|state| {
         let core = state.docs.get(&id).ok_or("no such document")?;
         Ok(("{}".to_string(), core.stylesheet().into_bytes()))
+    })
+}
+
+/// Every face's bytes, and the URI the stylesheet names each of them by.
+///
+/// The header lists the faces in the order their rules were written, each with
+/// its family, its URI, the media type and size of its bytes and where those
+/// bytes start in the payload; the payload is the bytes themselves, one face
+/// after another.
+///
+/// This is the other half of [`wpdf_stylesheet`]: a host serves each face at its
+/// URI - in a browser, `URL.createObjectURL` over the slice - and puts that URL
+/// where the rule names the URI. The font crosses the boundary as bytes, and the
+/// rule the browser has to parse is a filename rather than the font itself,
+/// 4/3 of it again, in base64.
+#[no_mangle]
+pub extern "C" fn wpdf_fonts(id: u32) -> i32 {
+    call(|state| {
+        let core = state.docs.get(&id).ok_or("no such document")?;
+        let mut payload: Vec<u8> = Vec::new();
+        let mut faces: Vec<String> = Vec::new();
+        for face in core.faces() {
+            let offset = payload.len();
+            payload.extend_from_slice(&face.payload);
+            faces.push(format!(
+                "{{\"family\":{},\"uri\":{},\"format\":\"{}\",\"mime\":\"{}\",\
+                 \"bytes\":{},\"offset\":{offset},\"glyphs\":{}}}",
+                crate::json::quote(&face.family),
+                crate::json::quote(&face.uri),
+                face.format,
+                face.mime,
+                face.bytes,
+                face.glyph_count,
+            ));
+        }
+        Ok((format!("{{\"faces\":[{}]}}", faces.join(",")), payload))
     })
 }
 

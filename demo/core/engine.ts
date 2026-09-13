@@ -19,9 +19,14 @@
  * The per-page font plan the TypeScript pipeline also had is deliberately gone:
  * it existed to make a long plan bearable, and this one walks a 756-page
  * specification in about a second.
+ *
+ * The faces themselves come back as bytes with a URI each, and this is where
+ * they become URLs: `serveFonts` mints one `blob:` per face and puts it in the
+ * rule, so what the viewer writes into the document is a rule about a URL rather
+ * than a font spelled out in base64.
  */
 
-import { Core, loadCore } from './bridge.ts';
+import { Core, loadCore, type CoreFace } from './bridge.ts';
 import { cropBox, padBox } from './crop.ts';
 import {
   DocumentNotOpenError,
@@ -144,10 +149,14 @@ function familyOf(css: string): string {
 /**
  * Split a document stylesheet into one asset per rule.
  *
- * The core joins its rules with a newline and a rule never contains one - it is
- * a single `@font-face` with a base64 payload - so the split is exact. One asset
- * per rule rather than one blob matters: a viewer writes each into a stylesheet
- * with `insertRule`, which takes a rule and not a document.
+ * The core joins its rules with a newline and a rule never contains one, so the
+ * split is exact. One asset per rule rather than one blob matters: a viewer
+ * writes each into a stylesheet with `insertRule`, which takes a rule and not a
+ * document.
+ *
+ * A rule comes out naming its face by URI, which is not yet something a browser
+ * can fetch - `PdfEngine.serveFonts` is what puts a URL this host owns in its
+ * place.
  */
 export function stylesheetAssets(css: string): FontAsset[] {
   return css
@@ -172,6 +181,8 @@ export class PdfEngine implements PdfEngineLike {
   private boxCache = new Map<string, CropRect | null>();
   /** The document's faces, once the plan has built them. */
   private faces: FontAsset[] | null = null;
+  /** The `blob:` URLs those faces are served from, to revoke with the document. */
+  private objectUrls: string[] = [];
   /** The walk itself, so a caller can wait for the planned document. */
   private planning: Promise<void> | null = null;
   private progress: FontPlanProgress | null = null;
@@ -275,7 +286,7 @@ export class PdfEngine implements PdfEngineLike {
         if (step.done) break;
         await turn();
       }
-      this.faces = stylesheetAssets(this.core.stylesheet(id));
+      this.faces = this.serveFonts(id, this.core.stylesheet(id));
     } catch (error) {
       this.opts.onWarn?.(`the document's fonts could not be planned: ${String(error)}`);
       this.progress = this.progress ? { ...this.progress, ready: true } : null;
@@ -288,6 +299,47 @@ export class PdfEngine implements PdfEngineLike {
         this.opts.onWarn?.(`a plan-ready listener failed: ${String(error)}`);
       }
     }
+  }
+
+  /**
+   * The document's faces, each served from a URL of this host's own.
+   *
+   * The core wrote a rule per face that *names* it by URI and handed the bytes
+   * behind every one of those URIs over separately; this is the other half of
+   * that exchange - one `blob:` per face, put in the rule where the URI was. So
+   * a font crosses the core-to-host boundary as bytes rather than as base64, and
+   * the rule the browser parses is a filename rather than the font written out
+   * again, 4/3 of it, as text.
+   *
+   * The URLs are the engine's to revoke and [`close`](PdfEngine.close) does,
+   * since the bytes they point at belong to a document that is gone.
+   */
+  private serveFonts(id: number, css: string): FontAsset[] {
+    const { faces, bytes } = this.core.fonts(id);
+    const byFamily = new Map<string, CoreFace>(faces.map((face) => [face.family, face]));
+    return stylesheetAssets(css).map((asset) => {
+      const face = byFamily.get(asset.family);
+      // A rule the core did not list bytes for is left as it is: it names a URI
+      // nothing serves, which costs a page its font and not its layout.
+      if (!face) return asset;
+      const url = URL.createObjectURL(
+        new Blob([bytes.subarray(face.offset, face.offset + face.bytes)], { type: face.mime }),
+      );
+      this.objectUrls.push(url);
+      return {
+        family: asset.family,
+        css: asset.css.replace(`"${face.uri}"`, `"${url}"`),
+        format: face.format,
+        bytes: face.bytes,
+        glyphCount: face.glyphs,
+      };
+    });
+  }
+
+  /** Let go of the served faces: nothing draws them once their document is gone. */
+  private unserveFonts(): void {
+    for (const url of this.objectUrls) URL.revokeObjectURL(url);
+    this.objectUrls = [];
   }
 
   /**
@@ -408,6 +460,7 @@ export class PdfEngine implements PdfEngineLike {
     }
     this.info = null;
     this.faces = null;
+    this.unserveFonts();
     this.progress = null;
     this.planning = null;
     this.boxCache.clear();
