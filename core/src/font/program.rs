@@ -18,6 +18,7 @@
 //! charstring.
 
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 
 use mupdf::pdf::{PdfObject, PdfPage};
 
@@ -49,25 +50,32 @@ pub struct Program {
     pub name: String,
     pub key: ProgramKey,
     pub bytes: Vec<u8>,
+    /// The identity below, worked out where the bytes were read.
+    id: String,
 }
 
-/// An identity for a program that two pages of the same document agree on.
-///
-/// Content-addressed, because that is what a family name has to be: two subsets
-/// are the same font exactly when their bytes are, and the subset prefix a
-/// producer chose is not evidence either way.
-pub fn program_id(program: &Program) -> String {
+impl Program {
+    /// An identity for a program that two pages of the same document agree on.
+    ///
+    /// Content-addressed, because that is what a family name has to be: two
+    /// subsets are the same font exactly when their bytes are, and the subset
+    /// prefix a producer chose is not evidence either way.
+    ///
+    /// Computed once, when the program is read, and not on every page that draws
+    /// the font: the hash is over the whole program, and a page of a
+    /// specification names as much as a megabyte of it.
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+}
+
+fn program_id(key: ProgramKey, bytes: &[u8]) -> String {
     let mut hash: u32 = 0x811c9dc5;
-    for byte in &program.bytes {
+    for byte in bytes {
         hash ^= *byte as u32;
         hash = hash.wrapping_mul(0x01000193);
     }
-    format!(
-        "{}|{}|{:x}",
-        program.key.as_str(),
-        program.bytes.len(),
-        hash
-    )
+    format!("{}|{}|{:x}", key.as_str(), bytes.len(), hash)
 }
 
 /* ------------------------------------------------------------------ */
@@ -88,33 +96,94 @@ fn as_name(obj: &PdfObject) -> String {
         .unwrap_or_default()
 }
 
-/// Every font program reachable from a page, keyed by the name MuPDF reports for
+/// Everything one font dictionary on a page says about its font.
+///
+/// Reading one is not free: the program is the largest thing a PDF embeds, and
+/// reading it means inflating it. A page's resources name the same dictionaries
+/// over and over - one font on a thousand pages - so the caller keeps these in a
+/// cache keyed by the dictionary's indirect object and a document inflates each
+/// program once.
+pub struct FontResource {
+    /// The dictionary's indirect object, which is what it is cached under.
+    /// `None` for a dictionary written inline in a `Resources` dict: two of
+    /// those are not the same font, and nothing about them says otherwise, so
+    /// they are read every time rather than cached under a colliding key.
+    pub key: Option<i32>,
+    /// The dictionary itself, for the `/ToUnicode`, `/Encoding` and
+    /// `/CIDToGIDMap` reads that want it.
+    pub object: PdfObject,
+    /// `/BaseFont`, subset prefix and all: the name the walk knows the font by.
+    pub base: String,
+    /// The embedded program, if the dictionary has one. Shared rather than
+    /// copied: the same bytes are the walk's key for the font, the outlines it
+    /// is built from, and the names a ligature is read out of.
+    pub program: Option<Rc<Program>>,
+}
+
+/// Every font dictionary a page can reach, and what each one says.
+///
+/// `cache` belongs to the caller and is keyed by the dictionary's indirect
+/// object, so a document that draws one font on a thousand pages reads its
+/// program once. A font with no program is still a resource: it has an encoding
+/// the walk may have to read, and it is drawn from a substituted face.
+pub fn page_fonts(
+    page: &PdfPage,
+    cache: &mut HashMap<i32, Rc<FontResource>>,
+) -> Vec<Rc<FontResource>> {
+    let mut out = Vec::new();
+    for font in font_objects(page) {
+        let Some(base) = get(&font, "BaseFont").map(|o| as_name(&o)) else {
+            continue;
+        };
+        let key = font
+            .is_indirect()
+            .unwrap_or(false)
+            .then(|| font.as_indirect().ok())
+            .flatten();
+        if let Some(hit) = key.and_then(|key| cache.get(&key)) {
+            out.push(Rc::clone(hit));
+            continue;
+        }
+        let program = Dictionary::of(&font)
+            .and_then(|dictionary| dictionary.program())
+            .map(Rc::new);
+        let resource = Rc::new(FontResource {
+            key,
+            object: font,
+            base,
+            program,
+        });
+        if let Some(key) = key {
+            cache.insert(key, Rc::clone(&resource));
+        }
+        out.push(resource);
+    }
+    out
+}
+
+/// Every font program a page's dictionaries carry, by the name MuPDF reports for
 /// the font.
 ///
 /// A font resource can be a Type 0 font whose descendant carries the descriptor,
 /// which is the usual shape for a CID font, so both are followed. The first
 /// program found under a name wins: that is the one FreeType would read.
-pub fn programs_on_page(page: &PdfPage) -> HashMap<String, Program> {
-    let mut out = HashMap::new();
-    for font in font_objects(page) {
-        let Some(base) = get(&font, "BaseFont").map(|o| as_name(&o)) else {
-            continue;
-        };
-        let Some(dictionary) = Dictionary::of(&font) else {
-            continue;
-        };
-        let Some(program) = dictionary.program() else {
+pub fn programs_of(fonts: &[Rc<FontResource>]) -> HashMap<String, Rc<Program>> {
+    let mut out: HashMap<String, Rc<Program>> = HashMap::new();
+    for resource in fonts {
+        let Some(program) = &resource.program else {
             continue;
         };
         if program.name.is_empty() {
             continue;
         }
-        out.entry(program.name.clone()).or_insert(program);
+        out.entry(program.name.clone())
+            .or_insert_with(|| Rc::clone(program));
         // A PDF that names `/FontName` differently from `/BaseFont` - which
         // happens with a subset - would otherwise have a font no page could be
         // paired with, so the base name is offered as well.
-        if !base.is_empty() && !out.contains_key(&base) {
-            out.insert(base, dictionary.program().expect("just read one"));
+        if !resource.base.is_empty() {
+            out.entry(resource.base.clone())
+                .or_insert_with(|| Rc::clone(program));
         }
     }
     out
@@ -507,12 +576,9 @@ impl Dictionary {
     /// The embedded program behind this font dictionary, if it has one.
     fn program(&self) -> Option<Program> {
         let descriptor = get(&self.descendant, "FontDescriptor")?;
-        let mut name = get(&descriptor, "FontName")
+        let name = get(&descriptor, "FontName")
             .map(|o| as_name(&o))
             .unwrap_or_default();
-        if name.is_empty() {
-            name = String::new();
-        }
         for key in [
             ProgramKey::FontFile,
             ProgramKey::FontFile2,
@@ -520,7 +586,8 @@ impl Dictionary {
         ] {
             if let Some(reference) = get(&descriptor, key.as_str()) {
                 if let Ok(bytes) = reference.read_stream() {
-                    return Some(Program { name, key, bytes });
+                    let id = program_id(key, &bytes);
+                    return Some(Program { name, key, bytes, id });
                 }
             }
         }
@@ -668,30 +735,26 @@ pub struct FontEncoding {
 ///
 /// `cache` belongs to the caller and is keyed by the font resource's indirect
 /// object, so a document that draws one font on a thousand pages parses it once.
+/// The encodings are handed back shared, because a page asks for the same one on
+/// every page it appears: a copy per page would copy a map per font per page.
 pub fn page_encodings(
-    page: &PdfPage,
-    programs: &HashMap<String, Program>,
-    cache: &mut HashMap<i32, FontEncoding>,
-) -> HashMap<String, FontEncoding> {
+    fonts: &[Rc<FontResource>],
+    programs: &HashMap<String, Rc<Program>>,
+    cache: &mut HashMap<i32, Rc<FontEncoding>>,
+) -> HashMap<String, Rc<FontEncoding>> {
     let mut out = HashMap::new();
-    for font in font_objects(page) {
-        let base = get(&font, "BaseFont")
-            .map(|o| as_name(&o))
-            .unwrap_or_default();
-        if base.is_empty() {
+    for resource in fonts {
+        if resource.base.is_empty() {
             continue;
         }
-        let key = if font.is_indirect().unwrap_or(false) {
-            font.as_indirect().unwrap_or(0)
-        } else {
-            -(out.len() as i32) - 1
-        };
-        let encoding = match cache.get(&key) {
-            Some(hit) => hit.clone(),
+        let encoding = match resource.key.and_then(|key| cache.get(&key)) {
+            Some(hit) => Rc::clone(hit),
             None => {
-                let known = programs.get(&base);
-                let read = read_font_encoding(&font, known);
-                cache.insert(key, read.clone());
+                let known = programs.get(&resource.base).map(|p| &**p);
+                let read = Rc::new(read_font_encoding(resource, known));
+                if let Some(key) = resource.key {
+                    cache.insert(key, Rc::clone(&read));
+                }
                 read
             }
         };
@@ -701,25 +764,17 @@ pub fn page_encodings(
 }
 
 /// One font dictionary, read for the letters it names.
-fn read_font_encoding(font: &PdfObject, known: Option<&Program>) -> FontEncoding {
-    let name = get(font, "BaseFont")
-        .map(|o| as_name(&o))
-        .unwrap_or_default();
+fn read_font_encoding(resource: &FontResource, known: Option<&Program>) -> FontEncoding {
+    let name = resource.base.clone();
     let mut letters: HashMap<u32, String> = HashMap::new();
-    let Some(dictionary) = Dictionary::of(font) else {
+    let Some(dictionary) = Dictionary::of(&resource.object) else {
         return FontEncoding { name, letters };
     };
     // The walk's own program is the authority on glyph ids; a program read out of
     // this dictionary is used when the walk has none, which is the case for a
     // font that lives in a Form XObject's resources and nowhere else.
-    let owned;
-    let program = match known {
-        Some(p) => Some(p),
-        None => {
-            owned = dictionary.program();
-            owned.as_ref()
-        }
-    };
+    let fallback = resource.program.clone();
+    let program = known.or(fallback.as_deref());
     let Some(glyphs) = dictionary.names(program) else {
         return FontEncoding { name, letters };
     };
@@ -736,7 +791,7 @@ fn read_font_encoding(font: &PdfObject, known: Option<&Program>) -> FontEncoding
     let encoding: Vec<(u32, String)> = if dictionary.is_type0 {
         Vec::new()
     } else {
-        differences_of(font).unwrap_or_else(|| glyphs.encoding.clone())
+        differences_of(&resource.object).unwrap_or_else(|| glyphs.encoding.clone())
     };
     for (_, glyph) in &encoding {
         if !ligature_name(glyph) {
@@ -750,7 +805,7 @@ fn read_font_encoding(font: &PdfObject, known: Option<&Program>) -> FontEncoding
     // A `/ToUnicode` entry longer than one character is the document saying what
     // it reads the code as, which is the letters of a ligature written the other
     // way round. It wins over a name where the two disagree.
-    if let Some(stream) = get(font, "ToUnicode") {
+    if let Some(stream) = get(&resource.object, "ToUnicode") {
         if let Some(to_unicode) = read_to_unicode(&stream) {
             let map = get(&dictionary.descendant, "CIDToGIDMap");
             let map_bytes = map

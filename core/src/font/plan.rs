@@ -36,7 +36,7 @@ use mupdf::{
 
 use super::build::{build_font, Cmd, Ligature, OutlineGlyph, PUA_BASE, PUA_LIMIT};
 use super::program::{
-    font_objects, page_encodings, program_id, programs_on_page, FontEncoding, Program,
+    font_objects, page_encodings, page_fonts, programs_of, FontEncoding, FontResource, Program,
 };
 use crate::util::{base64, char_count, Digest, OrderedMap};
 
@@ -103,28 +103,32 @@ pub struct CompiledFace {
     pub glyphs: Vec<(u32, Vec<u32>, Vec<Cmd>, Option<f32>)>,
 }
 
-/// One glyph the page drew: which font, which id, for which code.
-#[derive(Clone, Copy, Debug)]
-struct Draw {
-    font_id: usize,
-    gid: u32,
-    code: u32,
-}
-
 /// A font a page drew with, as the display list sees it.
 struct FontUse {
     name: String,
     /// The handle, for the fonts that have no program to draw from.
     font: Font,
+    /// Every gid the page drew from this font, once, in the order they were met.
+    /// A page draws the same letter thousands of times and the plan wants each
+    /// glyph once, so the membership is kept beside the list rather than
+    /// searched for in it.
     gids: Vec<u32>,
+    /// Membership for `gids`, which is what keeps the list to one entry a glyph.
+    present: HashSet<u32>,
+    /// gid -> the first code the page drew it for, as the per-page fonts had it.
     codes: OrderedMap<u32, u32>,
+    /// gid -> the letters, where the code the display list reported *is* a
+    /// ligature character. The document's own dictionaries are the other source,
+    /// and they are read after the page is interpreted, from the font's
+    /// resources rather than from here.
+    ligature: OrderedMap<u32, &'static str>,
 }
 
 /// One font of the document, and everything the plan knows about it.
 struct Entry {
     key: String,
     name: String,
-    program: Option<Program>,
+    program: Option<Rc<Program>>,
     /// gid -> the outline in em units, or `None` for a glyph that is blank.
     outlines: HashMap<u32, Option<Vec<Cmd>>>,
     /// Every gid the document drew from this font, codes or not.
@@ -162,8 +166,13 @@ pub struct FontPlanRef<'a> {
 pub struct Plan {
     entries: Vec<Entry>,
     by_key: HashMap<String, usize>,
-    /// Font dictionaries already read, by the resource's indirect object.
-    encodings: HashMap<i32, FontEncoding>,
+    /// Font dictionaries already read, by the resource's indirect object. A
+    /// program is the largest thing a PDF embeds and a page names the same one
+    /// over and over, so reading one is what the walk spends its time on when it
+    /// is not interpreting a page.
+    resources: HashMap<i32, Rc<FontResource>>,
+    /// Encodings already read, by the resource's indirect object.
+    encodings: HashMap<i32, Rc<FontEncoding>>,
     faces: Vec<Face>,
     complete: bool,
     warned: Vec<String>,
@@ -183,6 +192,7 @@ impl Plan {
         Self {
             entries: Vec::new(),
             by_key: HashMap::new(),
+            resources: HashMap::new(),
             encodings: HashMap::new(),
             faces: Vec::new(),
             complete: false,
@@ -331,7 +341,11 @@ impl Plan {
     /// substituted - a base-14 face, with no program at all - by its name and
     /// nothing else.
     pub fn page_entries(&self, page: &PdfPage) -> HashMap<String, usize> {
-        let programs = programs_on_page(page);
+        // A read rather than a walk: this page is being drawn, and the plan's
+        // own cache of programs belongs to the walk. What this needs is the
+        // identity of each program, which is a hash of its bytes.
+        let mut cache = HashMap::new();
+        let programs = programs_of(&page_fonts(page, &mut cache));
         let mut out = HashMap::new();
         for font in font_objects(page) {
             let base = font
@@ -347,7 +361,7 @@ impl Plan {
                 .and_then(|name| programs.get(name))
                 .or_else(|| programs.get(&base));
             let key = match program {
-                Some(program) => program_id(program),
+                Some(program) => program.id().to_string(),
                 None => {
                     let name = descriptor.clone().unwrap_or_else(|| base.clone());
                     format!("named\u{0}{name}")
@@ -424,7 +438,11 @@ impl Plan {
 
     fn walk_page(&mut self, doc: &Document, index: i32) -> Result<(), Error> {
         let page = PdfPage::try_from(doc.load_page(index)?)?;
-        let programs = programs_on_page(&page);
+        // What the page's dictionaries say, read once for the document: a page
+        // names the same fonts as the last one, and reading a font means
+        // inflating its program.
+        let fonts = page_fonts(&page, &mut self.resources);
+        let programs = programs_of(&fonts);
 
         let collector = Rc::new(RefCell::new(Collector::new()));
         {
@@ -436,35 +454,46 @@ impl Plan {
             Err(shared) => std::mem::take(&mut *shared.borrow_mut()),
         };
 
-        let encodings = page_encodings(&page, &programs, &mut self.encodings);
-        let letters = draw_letters(&collector.fonts, &collector.draws, &encodings);
+        let encodings = page_encodings(&fonts, &programs, &mut self.encodings);
 
-        for (font_id, font) in collector.fonts.iter().enumerate() {
+        for font in collector.fonts.iter() {
             let program = programs.get(&font.name).cloned();
             let key = match &program {
-                Some(program) => program_id(program),
+                Some(program) => program.id().to_string(),
                 None => format!("named\u{0}{}", font.name),
             };
             let entry = self.entry_index(key, &font.name, program.clone());
+            let slot = &mut self.entries[entry];
 
             for gid in &font.gids {
-                self.entries[entry].seen.insert(*gid);
+                slot.seen.insert(*gid);
             }
-            // `font.codes` is gid -> the code it was drawn for; the entry keeps
-            // both directions, because the cmap is built one way and the letters
-            // are looked up the other.
+            // `font.codes` is gid -> the code the page drew it for; the entry
+            // keeps both directions, because the cmap is built one way and the
+            // letters are looked up the other.
             for (gid, code) in font.codes.iter() {
-                self.entries[entry].by_code.set(*code, *gid);
-                let codes = self.entries[entry].codes_by_gid.entry_default(*gid);
+                slot.by_code.set(*code, *gid);
+                let codes = slot.codes_by_gid.entry_default(*gid);
                 if !codes.contains(code) {
                     codes.push(*code);
                 }
             }
-            if let Some(by_gid) = letters.get(&font_id) {
-                for (gid, text) in by_gid.iter() {
-                    if !self.entries[entry].letters.contains_key(gid) {
-                        self.entries[entry].letters.set(*gid, text.clone());
-                    }
+            // The letters of a ligature, from the code the display list reported
+            // and then from the document's own dictionaries, in the order the
+            // glyphs were drawn: the entry keeps the first page to name one, and
+            // the order it keeps them in is what the face is named from.
+            let encoding = encodings.get(&font.name);
+            for gid in &font.gids {
+                let from_code = font.ligature.get(gid);
+                let from_dictionary = encoding.and_then(|e| e.letters.get(gid));
+                let Some(text) = from_code
+                    .map(|text| *text)
+                    .or_else(|| from_dictionary.map(|text| text.as_str()))
+                else {
+                    continue;
+                };
+                if !slot.letters.contains_key(gid) {
+                    slot.letters.set(*gid, text.to_string());
                 }
             }
 
@@ -477,11 +506,10 @@ impl Plan {
                     .gids
                     .iter()
                     .copied()
-                    .filter(|gid| !self.entries[entry].outlines.contains_key(gid))
+                    .filter(|gid| !slot.outlines.contains_key(gid))
                     .collect();
                 if !fresh.is_empty() {
                     let drawn = draw_glyphs(&font.font, &fresh);
-                    let slot = &mut self.entries[entry];
                     for (gid, cmds) in drawn.outlines {
                         slot.outlines.insert(gid, cmds);
                     }
@@ -496,7 +524,7 @@ impl Plan {
 
     /// The index of the entry for a font, creating it the first time the font is
     /// met.
-    fn entry_index(&mut self, key: String, name: &str, program: Option<Program>) -> usize {
+    fn entry_index(&mut self, key: String, name: &str, program: Option<Rc<Program>>) -> usize {
         if let Some(index) = self.by_key.get(&key) {
             return *index;
         }
@@ -897,46 +925,16 @@ fn ligature_code(letters: &str) -> Option<u32> {
     })
 }
 
-/// The letters each glyph a page drew stands for, by font id -> glyph id.
-///
-/// Two sources, in order. The first is the code the display list reported: a
-/// document whose encoding is honest names a ligature with the ligature's own
-/// character, and Unicode gave that character its letters. It is the only source
-/// for a font with no program - a substituted face, which three of the corpus's
-/// four documents draw on nearly every page - because there are no glyph names to
-/// read.
-///
-/// The second is the dictionary, for the case a producer writes the ligature's
-/// *first* letter as the code (`f` for the `fi` glyph, which is what pdfTeX
-/// does), so the code says nothing and `/Differences` or `/ToUnicode` says
-/// everything.
-fn draw_letters(
-    fonts: &[FontUse],
-    draws: &[Draw],
-    encodings: &HashMap<String, FontEncoding>,
-) -> HashMap<usize, OrderedMap<u32, String>> {
-    let mut out: HashMap<usize, OrderedMap<u32, String>> = HashMap::new();
-    for draw in draws {
-        let from_code = ligature_letters(draw.code);
-        let from_dictionary = encodings
-            .get(&fonts[draw.font_id].name)
-            .and_then(|e| e.letters.get(&draw.gid))
-            .map(|s| s.as_str());
-        let Some(text) = from_code.or(from_dictionary) else {
-            continue;
-        };
-        if char_count(text) < 2 {
-            continue;
-        }
-        out.entry(draw.font_id)
-            .or_default()
-            .insert(draw.gid, text.to_string());
-    }
-    out
-}
-
 /// The letters a ligature *character* stands for, by code point, as the PDF's
 /// own encoding may have stated it.
+///
+/// It is the only source of a ligature's letters for a font with no program - a
+/// substituted face, which three of the corpus's four documents draw on nearly
+/// every page - because there are no glyph names to read. The document's own
+/// dictionaries are the other source, for the case a producer writes the
+/// ligature's *first* letter as the code (`f` for the `fi` glyph, which is what
+/// pdfTeX does), so the code says nothing and `/Differences` or `/ToUnicode`
+/// says everything.
 fn ligature_letters(code: u32) -> Option<&'static str> {
     super::program::ligature_letters(code)
 }
@@ -1020,7 +1018,6 @@ impl PathWalker for CmdCollector {
 struct Collector {
     fonts: Vec<FontUse>,
     by_name: HashMap<String, usize>,
-    draws: Vec<Draw>,
 }
 
 impl Collector {
@@ -1028,7 +1025,6 @@ impl Collector {
         Self {
             fonts: Vec::new(),
             by_name: HashMap::new(),
-            draws: Vec::new(),
         }
     }
 
@@ -1048,7 +1044,9 @@ impl Collector {
                         name,
                         font,
                         gids: Vec::new(),
+                        present: HashSet::new(),
                         codes: OrderedMap::new(),
+                        ligature: OrderedMap::new(),
                     });
                     id
                 }
@@ -1061,19 +1059,32 @@ impl Collector {
                 let gid = gid as u32;
                 let code = item.ucs();
                 let use_ = &mut self.fonts[font_id];
-                use_.gids.push(gid);
+                // A code that *is* a ligature character already says what the
+                // glyph is written as, and no dictionary has to be asked.
+                if (0xfb00..=0xfb06).contains(&code) {
+                    if let Some(text) = ligature_letters(code as u32) {
+                        use_.ligature.set(gid, text);
+                    }
+                }
                 // The first code wins for a gid, as the outline writer's own
                 // `data-text` did - and a glyph MuPDF could not name is left
                 // without one, so the plan and the per-page fonts agree on which
-                // glyphs have a character at all.
-                if usable_code(code) && !use_.codes.contains_key(&gid) {
-                    use_.codes.set(gid, code as u32);
+                // glyphs have a character at all. That same lookup is what says
+                // whether the gid has been seen: the same letter is drawn over
+                // and over, and a page of a specification draws millions.
+                let first = if usable_code(code) {
+                    if use_.codes.contains_key(&gid) {
+                        false
+                    } else {
+                        use_.codes.set(gid, code as u32);
+                        true
+                    }
+                } else {
+                    true
+                };
+                if first && use_.present.insert(gid) {
+                    use_.gids.push(gid);
                 }
-                self.draws.push(Draw {
-                    font_id,
-                    gid,
-                    code: code as u32,
-                });
             }
         }
     }
