@@ -205,7 +205,7 @@ export class PdfEngine implements PdfEngineLike {
   static async create(opts: EngineOptions = {}): Promise<PdfEngine> {
     const coreUrl = opts.coreUrl;
     if (!coreUrl) throw new Error('PdfEngine.create needs a coreUrl: where the core was built to');
-    const core = new Core(await loadCore(coreUrl));
+    const core = new Core(await loadCore(coreUrl, opts.wasmUrl));
     return new PdfEngine(core, opts);
   }
 

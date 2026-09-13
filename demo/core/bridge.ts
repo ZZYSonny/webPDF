@@ -107,14 +107,23 @@ const FLAG = {
  * wasm binary through `locateFile`, which is why the caller has to say where the
  * glue is - Emscripten names the binary after the *Rust binary* it linked, and
  * the build renames both files to something the demo can refer to.
+ *
+ * `wasm` is where that build put the binary, and it is passed in rather than
+ * derived from the glue's own name because only the build knows it: the release
+ * binary is named for the digest of its bytes, so that a copy a service worker
+ * kept for the build before this one is asked for by a name this build does not
+ * use. A caller that does not say - a host with its own copy of the core - gets
+ * Emscripten's name beside the glue, which is where its build put it.
  */
-export async function loadCore(glue: URL | string): Promise<CoreModule> {
+export async function loadCore(glue: URL | string, wasm?: URL | string): Promise<CoreModule> {
   const url = typeof glue === 'string' ? new URL(glue, globalThis.location?.href) : glue;
+  const binary = wasm === undefined ? null : new URL(String(wasm), globalThis.location?.href).href;
   const { default: factory } = (await import(/* @vite-ignore */ url.href)) as {
     default: (options: { locateFile: (name: string) => string }) => Promise<CoreModule>;
   };
   return factory({
-    locateFile: (name) => (name.endsWith('.wasm') ? new URL(name.replace(/^.*\.wasm$/, 'webpdf-core.wasm'), url).href : name),
+    locateFile: (name) =>
+      !name.endsWith('.wasm') ? name : (binary ?? new URL(name.replace(/^.*\.wasm$/, 'webpdf-core.wasm'), url).href),
   });
 }
 

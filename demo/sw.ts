@@ -19,7 +19,13 @@
  *     - downloading nine megabytes on install, for a reader who may never open a
  *     document, is not a promise a site should make. It is kept the first time it
  *     is actually fetched (`warm-engine`), together with the digest it was
- *     verified against, and served from there afterwards;
+ *     verified against, and served from there afterwards. Its name is the digest
+ *     of its bytes, so each build keeps its own and the one before it (see
+ *     `trimEngines`): a request for the new name cannot be answered with the old
+ *     file, which is what keeps a deploy from pairing one build's page with
+ *     another build's binary. Which of the kept copies are the two is decided by
+ *     when each was *first* kept, remembered by URL (`firstKept`), because a copy
+ *     that a late message asks for again is an old engine and not a new one;
  *   - *documents* are not this worker's decision at all. The page keeps the ones
  *     it decides are worth keeping in a cache of its own
  *     (`demo/offline.ts` - the name is spelled there too), and all this worker
@@ -89,6 +95,124 @@ const ORDER_KEY = new URL('./shells.json', scope.location.href).href;
 /** The engine's cache, and the page's document cache, which is not ours to trim. */
 const ENGINE = 'webpdf-engine';
 const DOCS = 'webpdf-docs';
+
+/** How many engines are worth keeping: this build's, and the one its shell answers for. */
+const ENGINES_KEPT = 2;
+
+/**
+ * When an engine was kept, as a header on the kept copy itself.
+ *
+ * The header is *the entry's own* record of its age, and that is deliberate: a
+ * page can ask for an engine at any time, including the build before this one
+ * asking a moment after this one has - the reader's tab is not the only tab, and
+ * a message that arrives late arrives from a build that is not the newest. A trim
+ * that asked "who asked last?" would answer with the older build and delete the
+ * newer engine; a trim that asks "which of these were kept most recently?" cannot
+ * - a message that arrives late does not re-keep anything, as long as the copy it
+ * asks about is still there. When it is not, the copy is written again, and then
+ * the moment it is stamped with is the one `firstKept` remembers below.
+ */
+const KEPT_AT = 'x-webpdf-kept';
+
+/**
+ * When an engine was kept *the first time*, remembered by URL.
+ *
+ * The header above is not enough on its own, because a kept copy can be dropped
+ * and then asked for again. A page of a build that is no longer kept can still be
+ * open in a tab of its own, and when it asks its worker for the engine it was
+ * made of, the file the server has is gone - but the browser's own HTTP cache is
+ * not, and it answers for as long as the deploy's `max-age` says. So the request
+ * succeeds minutes after the build it belongs to did, the copy is written again,
+ * and if *that* moment were its age it would be the newest engine in the cache -
+ * pushing out the engine of the build on screen, which is the one thing this trim
+ * exists to protect, and leaving a reader offline with no engine at all.
+ *
+ * An engine that comes back is not a new engine. Its age is therefore remembered
+ * rather than taken: the first time this URL was kept, written beside the shell
+ * order so it outlives the copy it describes. A page that re-keeps an old engine
+ * gets the old age back, the trim drops it again on the spot, and the order the
+ * ages imply never depends on which tab's message arrived when.
+ */
+const AGES = new URL('./engine-ages/', scope.location.href).href;
+
+/** How many of those ages are worth keeping: more than can matter, and still tiny. */
+const AGES_KEPT = 16;
+
+/** Where one engine's age lives: its own entry, so one write cannot lose another. */
+const ageKey = (url: string): string => `${AGES}${encodeURIComponent(url)}.json`;
+
+/** Every remembered engine age, newest first. */
+async function ages(store: Cache): Promise<Array<{ key: Request; at: number }>> {
+  const found = await Promise.all(
+    (await store.keys())
+      .filter((key) => key.url.startsWith(AGES))
+      .map(async (key) => {
+        const record = await store.match(key);
+        // The age is the whole of the record: the URL it belongs to is in the
+        // entry's own key, so there is nothing else to write down.
+        const at = Number(record ? await record.text() : 0);
+        return { key, at: Number.isFinite(at) ? at : 0 };
+      }),
+  );
+  return found.sort((a, b) => b.at - a.at);
+}
+
+/**
+ * When this engine was kept the first time: what was remembered, or now.
+ *
+ * The moment is made unique as well as new - later than every age remembered, so
+ * that two engines kept in the same millisecond still have an order - because the
+ * trim compares ages and a tie would leave it to the cache's own key order.
+ *
+ * A bookkeeping store that cannot be written is not a reason to refuse the
+ * engine: the fallback is the moment itself, which is what this did before there
+ * was a store, and the copy carries its age either way.
+ */
+async function firstKept(url: string): Promise<number> {
+  try {
+    const store = await caches.open(ORDER);
+    const key = new Request(ageKey(url));
+    const remembered = await store.match(key);
+    if (remembered) {
+      const at = Number(await remembered.text());
+      if (at > 0) return at;
+    }
+    const known = await ages(store);
+    const at = Math.max(Date.now(), (known[0]?.at ?? 0) + 1);
+    await store.put(key, new Response(String(at)));
+    for (const stale of known.slice(AGES_KEPT)) await store.delete(stale.key);
+    return at;
+  } catch {
+    return Date.now();
+  }
+}
+
+/**
+ * Keep the newest two engines, and drop the rest.
+ *
+ * Two is the same arithmetic the shells get: the shell before this one may still
+ * have to answer for itself, and two builds back has nobody to answer for at all.
+ * A build's binary is named for the digest of its bytes, so what is dropped here
+ * is never a file some kept page is going to name.
+ *
+ * The engine that was *just* asked for is not exempt. It is the newest thing in
+ * the cache whenever it is the engine of a build still being served, and when it
+ * is not - an old build's page asking for the copy it lost - it is exactly the
+ * one the trim should drop, and the age remembered for it is what says so.
+ */
+async function trimEngines(cache: Cache): Promise<void> {
+  const kept = await Promise.all(
+    (await cache.keys()).map(async (key) => {
+      const response = await cache.match(key, { ignoreVary: true });
+      const at = Number(response?.headers.get(KEPT_AT) ?? 0);
+      return { key, at: Number.isFinite(at) ? at : 0 };
+    }),
+  );
+  // Newest first, and an entry that never said when it was kept is the oldest
+  // there is - which is what a copy from a build before this one is.
+  kept.sort((a, b) => b.at - a.at);
+  for (const { key } of kept.slice(ENGINES_KEPT)) await cache.delete(key);
+}
 
 /** The page, for a navigation that is not about a particular file. */
 const INDEX = new URL('./index.html', scope.location.href).href;
@@ -228,6 +352,11 @@ async function shelled(request: Request): Promise<Response | null> {
  * in it is bytes the page verified. A response that is merely *served* is not
  * necessarily the engine, and this is one cache that must not fill up with things
  * that are not.
+ *
+ * A request can only ever match the binary its own build named, because that name
+ * is the digest of the bytes behind it: a page of the build before this one asks
+ * for the file it was made with and is answered with it, and a page of this build
+ * asks for a name the older copy does not have.
  */
 async function engine(request: Request): Promise<Response> {
   const cache = await caches.open(ENGINE);
@@ -274,29 +403,43 @@ async function digestOf(bytes: ArrayBuffer): Promise<string | null> {
  * allowed to answer for it later. Nothing is kept at all until the reader has
  * opened a document, which is the moment the engine is worth nine megabytes.
  *
- * The binary's name does not change when it is rebuilt, which is exactly why the
- * digest is here: the build id covers the page's own files, and this one is
- * fetched rather than bundled, so the two have to be tied together some other
- * way.
+ * The name and the digest are two halves of one fact. The name is what the build
+ * put in the page - `webpdf-core.<digest>.wasm` - so it is what makes the kept
+ * copy *this* build's rather than the one before it, and it is why a page is
+ * never handed an engine another build left behind: a request for the new name
+ * cannot be answered by the old file. The digest is the check that the bytes
+ * under that name are the ones it promises, which is what the page's `integrity`
+ * means.
+ *
+ * What the copy is stamped with is the moment this URL was *first* kept, not the
+ * moment it was fetched (see `firstKept`): a copy that came back after being
+ * dropped is the same engine, and has to sort as the old one it is.
  */
 async function warmEngine(source: { url?: string; integrity?: string } | undefined): Promise<void> {
   if (!source?.url || !source.integrity) return;
   try {
     const cache = await caches.open(ENGINE);
     const url = new URL(source.url, scope.location.href).href;
-    if (await cache.match(url, { ignoreVary: true })) return;
-    const response = await fetch(url);
-    if (!response.ok) return;
-    const bytes = await response.arrayBuffer();
-    // No `crypto.subtle` (a page that is not on a secure origin) means no way to
-    // check, and an unchecked binary is worse than a network fetch.
-    if ((await digestOf(bytes)) !== source.integrity) return;
-    await cache.put(
-      url,
-      new Response(bytes, {
-        headers: { 'content-type': 'application/wasm', 'content-length': String(bytes.byteLength) },
-      }),
-    );
+    if (!(await cache.match(url, { ignoreVary: true }))) {
+      const response = await fetch(url);
+      if (!response.ok) return;
+      const bytes = await response.arrayBuffer();
+      // No `crypto.subtle` (a page that is not on a secure origin) means no way
+      // to check, and an unchecked binary is worse than a network fetch.
+      if ((await digestOf(bytes)) !== source.integrity) return;
+      const at = await firstKept(url);
+      await cache.put(
+        url,
+        new Response(bytes, {
+          headers: {
+            'content-type': 'application/wasm',
+            'content-length': String(bytes.byteLength),
+            [KEPT_AT]: String(at),
+          },
+        }),
+      );
+    }
+    await trimEngines(cache);
   } catch {
     // A worker that cannot keep the engine is not a failure: the page fetches it
     // for itself either way.

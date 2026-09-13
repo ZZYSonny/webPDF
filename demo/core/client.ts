@@ -66,6 +66,10 @@ export class WorkerEngine implements PdfEngineLike {
     this.worker.postMessage({
       wpdf: 'engine',
       coreUrl,
+      // The binary's own address travels with the glue's: the build named it for
+      // what is in it, and neither this thread nor the worker can work that name
+      // out from the glue.
+      wasmUrl: options?.wasmUrl ? String(options.wasmUrl) : undefined,
       options: options ? { planFonts: options.planFonts } : undefined,
     });
     this.worker.addEventListener('message', (event: MessageEvent) => {

@@ -192,34 +192,48 @@ const CORE_DIR = 'demo/engine';
 const CORE_FILES = ['webpdf-core.js', 'webpdf-core.wasm'];
 
 /**
- * The Rust core, as this build knows it: the two files Emscripten wrote, and the
- * digest of the binary.
+ * The Rust core, as this build knows it: the two files Emscripten wrote, where
+ * the page is told to find each of them, and the digest of the binary.
  *
  * There is one source and it is this site's own. The engine this replaces was
  * ten megabytes of somebody else's npm package, fetched from a CDN first because
  * a versioned URL could be cached forever; the core is built from this
  * repository by `scripts/build-core-wasm.ts`, so it is emitted here, next to the
- * page, and updated exactly when the page is. What survives from that design is
- * the digest: the service worker only keeps bytes whose hash the page was built
- * expecting, so a cache can never hand back a stale binary under a name that did
- * not change with it.
+ * page, and updated exactly when the page is.
+ *
+ * The binary's *name* carries its digest, and that is the whole of how a deploy
+ * reaches a reader who has been here before. The glue and the binary are one
+ * program split in two - release builds minify the wasm's export names, so the
+ * glue is the only thing that knows which letter is `wpdf_open` - and a reader's
+ * service worker keeps the engine for as long as it likes. Under a fixed name
+ * that kept copy is what a later build is handed, and the pair that comes out of
+ * it is two builds old. Under a name that changes with the bytes, every cache in
+ * the chain - the worker's, the HTTP one - is asking about a file it either has
+ * or does not, and there is no way to be handed the wrong engine under a name
+ * that belongs to this one. `integrity` still says which bytes those are; the
+ * service worker checks it before it keeps anything at all.
+ *
+ * The name is added in a build and not in development, because the dev server
+ * serves `demo/engine/` as the static directory it is: there the file on disk is
+ * the one the page names, and no cache of it outlives a reload.
  *
  * Neither file is in the repository - both are produced from `core/` - so both
  * are read here rather than imported, and a build without them says so in one
  * sentence instead of failing at `fs.readFileSync`.
  */
-function coreFacts() {
+function coreFacts(contentAddressed: boolean) {
   for (const name of CORE_FILES) {
     if (!fs.existsSync(path.resolve(import.meta.dirname, CORE_DIR, name))) {
       throw new Error(`${CORE_DIR}/${name} is missing: run \`npm run build:wasm\` first`);
     }
   }
   const wasm = fs.readFileSync(path.resolve(import.meta.dirname, CORE_DIR, 'webpdf-core.wasm'));
+  const digest = crypto.createHash('sha256').update(wasm).digest('hex').slice(0, 12);
   return {
     /** Where the page loads the glue from - relative to the page, like every asset. */
     url: 'engine/webpdf-core.js',
-    /** And the binary the glue fetches. */
-    wasm: 'engine/webpdf-core.wasm',
+    /** And the binary the glue fetches, named for what is in it. */
+    wasm: contentAddressed ? `engine/webpdf-core.${digest}.wasm` : 'engine/webpdf-core.wasm',
     /** `sha384-<base64>`, spelled the way an `integrity` attribute is. */
     integrity: `sha384-${crypto.createHash('sha384').update(wasm).digest('base64')}`,
   };
@@ -239,8 +253,14 @@ function core(): Plugin {
   let facts: ReturnType<typeof coreFacts> | null = null;
   let serving = false;
 
-  /** Read the core once, on the first thing that actually needs it. */
-  const known = () => (facts ??= coreFacts());
+  /**
+   * Read the core once, on the first thing that actually needs it.
+   *
+   * Whether the binary is named for its content is the *mode's* answer and not
+   * the caller's: a build emits the file under the name the page was told, and
+   * the two must not be able to disagree.
+   */
+  const known = () => (facts ??= coreFacts(!serving));
 
   return {
     name: 'webpdf:core',
@@ -249,14 +269,19 @@ function core(): Plugin {
     },
     buildStart() {
       if (serving) return;
-      known();
-      for (const name of CORE_FILES) {
-        this.emitFile({
-          type: 'asset',
-          fileName: `engine/${name}`,
-          source: fs.readFileSync(path.resolve(import.meta.dirname, CORE_DIR, name)),
-        });
-      }
+      const { url, wasm } = known();
+      // The glue keeps its own name: it is one of the files the shell is made of,
+      // so the build id already changes when it does.
+      this.emitFile({
+        type: 'asset',
+        fileName: url,
+        source: fs.readFileSync(path.resolve(import.meta.dirname, CORE_DIR, 'webpdf-core.js')),
+      });
+      this.emitFile({
+        type: 'asset',
+        fileName: wasm,
+        source: fs.readFileSync(path.resolve(import.meta.dirname, CORE_DIR, 'webpdf-core.wasm')),
+      });
     },
     resolveId: (id) => (id === CORE_MODULE ? `\0${CORE_MODULE}` : undefined),
     load: (id) => (id === `\0${CORE_MODULE}` ? `export const core = ${JSON.stringify(known())};\n` : undefined),

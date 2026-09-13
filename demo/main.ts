@@ -170,6 +170,17 @@ const resolve = (url: string): string => new URL(url, BASE).href;
 const coreUrl = new URL(core.url, BASE).href;
 
 /**
+ * Where the core's binary is, which is not the glue's name with a different
+ * extension: the build names the release binary for the digest of its bytes, so
+ * that the copy a service worker kept for the build before this one is never
+ * asked for under this one's name. Only the build knows that name, so it is
+ * resolved here - against the page, like the glue - and handed to the engine as
+ * a fact rather than worked out again by whoever needs it.
+ */
+const wasmUrl = new URL(core.wasm, BASE).href;
+const wasm = { url: wasmUrl, integrity: core.integrity };
+
+/**
  * The engine: a worker that owns the core, or - where there is no worker to be
  * had - the core on this thread.
  *
@@ -181,7 +192,7 @@ const coreUrl = new URL(core.url, BASE).href;
  * does not care which thread has the document, so nothing here mentions it.
  */
 async function createEngine(planFonts: boolean): Promise<PdfEngineLike> {
-  const options = { coreUrl, planFonts, onWarn: warn };
+  const options = { coreUrl, wasmUrl, planFonts, onWarn: warn };
   const worker = await createWorkerEngine(options);
   if (worker) return worker;
   // The wasm is fetched and instantiated here and now, on this thread.
@@ -194,7 +205,7 @@ async function createEngine(planFonts: boolean): Promise<PdfEngineLike> {
  * see `demo/offline.ts`.
  */
 const offline = createOffline({
-  engine: { url: new URL(core.wasm, BASE).href, integrity: core.integrity },
+  engine: wasm,
   hosted: isHosted() && window.parent !== window,
   onWarn: warn,
   // A newer build of the viewer, waiting for a page willing to reload into it.

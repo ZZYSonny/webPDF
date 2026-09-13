@@ -22,6 +22,7 @@ import { PdfEngine } from './core/engine.ts';
 import type { EngineOptions } from './core/types.ts';
 
 let coreUrl: string | null = null;
+let wasmUrl: string | null = null;
 let planFonts: boolean | undefined;
 let engine: Promise<PdfEngine> | null = null;
 
@@ -30,6 +31,7 @@ function engineOf(): Promise<PdfEngine> {
     if (!coreUrl) return Promise.reject(new Error('the rendering worker was not told where the core is'));
     engine = PdfEngine.create({
       coreUrl,
+      wasmUrl: wasmUrl ?? undefined,
       planFonts,
       // The plan arrives on its own rather than as the answer to anything: a
       // viewer watches for it while it is doing something else. Every slice is
@@ -62,6 +64,7 @@ self.addEventListener('message', (event: MessageEvent) => {
   const data = event.data as {
     wpdf?: string;
     coreUrl?: string;
+    wasmUrl?: string;
     options?: { planFonts?: boolean };
     id?: number;
     method?: string;
@@ -70,6 +73,7 @@ self.addEventListener('message', (event: MessageEvent) => {
 
   if (data?.wpdf === 'engine') {
     coreUrl = data.coreUrl ?? null;
+    wasmUrl = data.wasmUrl ?? null;
     planFonts = data.options?.planFonts;
     return;
   }

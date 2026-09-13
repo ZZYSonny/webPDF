@@ -153,6 +153,16 @@ export interface EngineOptions {
    * build is the only thing that knows where it put the file.
    */
   coreUrl?: URL | string;
+  /**
+   * Where the core's binary is, as an absolute URL, when that is not simply the
+   * glue's own name beside the glue.
+   *
+   * A build names the release binary for the digest of its bytes - so that the
+   * copy a service worker kept for the build before this one is never asked for
+   * under this one's name - and only the build knows that name. A host that
+   * serves its own copy of the core can leave this out.
+   */
+  wasmUrl?: URL | string;
   /** Forwarded from a host that wants the plan before the first page. */
   planFonts?: boolean;
   /**

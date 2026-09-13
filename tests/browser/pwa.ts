@@ -56,6 +56,9 @@ const root = path.join(here, '..', '..');
 const dist = path.join(root, 'dist', 'demo');
 const url = process.argv[2] ?? 'http://127.0.0.1:5178/';
 
+/** How many engines the worker keeps: this build's, and the one its shell answers for. */
+const ENGINES_KEPT = 2;
+
 /** The paper the offline half is written against, from the suite's cache. */
 const paper = PAPERS[0];
 const file = cachedFile(paper.url);
@@ -72,17 +75,27 @@ const pdf = `/pdf/${path.basename(file)}`;
 const corpus = path.dirname(file);
 
 /**
- * The core's binary as *this* build knows it: the address the page resolves,
- * and the digest it was built against.
+ * The core's binary as *this* build serves it: the file the build emitted, the
+ * digest it was built against, and the hash in the name.
  *
- * Both are read the way `coreFacts()` in `vite.demo.config.ts` writes them -
+ * The name is read off the disk rather than written down here, because the name
+ * is the thing under test: a build that addressed its engine by content and one
+ * that did not are told apart by what is in `dist/demo/engine`, and a test that
+ * spelled the name itself could not tell them apart at all.
+ *
+ * The digest is read the way `coreFacts()` in `vite.demo.config.ts` computes it -
  * the built file and its SHA-384 - because that is what the page checks a kept
  * copy against, and a test that computed its own answer could not tell a build
  * that wrote the wrong digest from one that wrote the right one.
  */
-const coreWasm = fs.readFileSync(path.join(dist, 'engine', 'webpdf-core.wasm'));
+const coreName = fs.readdirSync(path.join(dist, 'engine')).find((name) => /^webpdf-core\.[0-9a-f]+\.wasm$/.test(name));
+if (!coreName) {
+  console.error('FAIL: dist/demo/engine has no content-addressed engine: every build would ask for the same name');
+  process.exit(1);
+}
+const coreWasm = fs.readFileSync(path.join(dist, 'engine', coreName));
 const coreDigest = `sha384-${createHash('sha384').update(coreWasm).digest('base64')}`;
-const coreName = 'webpdf-core.wasm';
+const coreHash = createHash('sha256').update(coreWasm).digest('hex').slice(0, 12);
 
 let failures = 0;
 const started = Date.now();
@@ -197,10 +210,31 @@ function serve(root: string): http.Server {
  * name, the shell lists it instead of the old one, and the worker's build digest
  * changes so a browser sees a worker it does not have.
  *
+ * The *engine* is rebuilt too - the same bytes under the name the new build's
+ * digest would give them, and the page repointed at that name. That is the
+ * difference between this and the deploy before it, and it is the one that used
+ * to go wrong: a core rebuilt for a new deploy is a different file to a browser,
+ * and under a name that did not change with it the page was handed the engine
+ * the reader already had, which is a pair of builds that were never meant to
+ * run together. The bytes are the same here - recompiling a Rust core per test
+ * would test the compiler - but the bytes are not what the caches are keyed on.
+ *
+ * The name it replaces is left on the server rather than renamed away. A real
+ * deploy has nothing at the old URL, but the reader's own HTTP cache does: the
+ * server it came from said `max-age=600` (see `serve`), and that is what answers
+ * a page of the build before this one when it asks its worker for the engine it
+ * was made of, minutes after the deploy. Keeping the file is how that request is
+ * made to succeed here every time instead of whenever a cache happens to hold a
+ * copy - which is what the last check of this section is about.
+ *
  * The *page* is marked as well, because that is the question the rest of this
  * checks ask: which build is the reader looking at.
  */
-function redeploy(dir: string, marker: string): { was: string; now: string } {
+function redeploy(
+  dir: string,
+  marker: string,
+  engineWas: string,
+): { was: string; now: string; engine: { was: string; now: string } } {
   const index = path.join(dir, 'index.html');
   let html = fs.readFileSync(index, 'utf8');
   const entry = /src="\.\/(assets\/[^"]+\.js)"/.exec(html);
@@ -215,6 +249,16 @@ function redeploy(dir: string, marker: string): { was: string; now: string } {
     .replace('<head>', `<head>\n    <meta name="build" content="${marker}" />`);
   fs.writeFileSync(index, html);
 
+  const engines = path.join(dir, 'engine');
+  const engineNow = `webpdf-core.${createHash('sha256').update(`${marker}-engine`).digest('hex').slice(0, 12)}.wasm`;
+  fs.copyFileSync(path.join(engines, engineWas), path.join(engines, engineNow));
+  // The name is a literal in the entry module - it is a fact about the build, and
+  // the only file that says it - so the new build's page is what repoints it.
+  fs.writeFileSync(
+    path.join(dir, now),
+    fs.readFileSync(path.join(dir, now), 'utf8').split(engineWas).join(engineNow),
+  );
+
   const worker = path.join(dir, 'sw.js');
   fs.writeFileSync(
     worker,
@@ -223,7 +267,7 @@ function redeploy(dir: string, marker: string): { was: string; now: string } {
       .replace(was, now)
       .replace(/const BUILD = "[0-9a-f]+"/, `const BUILD = "${createHash('sha256').update(html).digest('hex').slice(0, 16)}"`),
   );
-  return { was, now };
+  return { was, now, engine: { was: engineWas, now: engineNow } };
 }
 
 /** Which build the page on screen is, or null for the one that was there first. */
@@ -258,6 +302,10 @@ async function boot(page: Page, at: string): Promise<void> {
 
 /** Open a document through the page's own path, and wait for it to be drawn. */
 async function open(page: Page, document_: string): Promise<void> {
+  // A reload that lands on a new build has the new build's marker in its HTML
+  // before the demo's own modules have run, and this is called right after one:
+  // wait for the handle rather than race it.
+  await page.waitFor(() => !!window.webpdf?.open, { label: 'the demo to open a document' });
   await page.evaluate(`window.webpdf.open(${JSON.stringify(document_)})`);
   await page.waitFor(() => window.__svgs().length > 0, { label: 'the first page to be drawn' });
 }
@@ -340,6 +388,17 @@ console.log('› the engine, and where the page was told to find it');
   // was built against.
   const local = new URL(`/engine/${coreName}`, url).href;
   check('the engine came from this site', engine === local, `${engine || 'nothing kept'}`);
+
+  // The name is the digest of the bytes, and that is the whole of how a deploy
+  // reaches a reader who has been here before: a new engine is a new URL, so a
+  // copy kept for the build before this one cannot answer for it. A name that
+  // did not carry the content would make the kept copy the one that answers,
+  // whatever the page was built against.
+  check(
+    'the engine is named for the digest of its bytes',
+    coreName === `webpdf-core.${coreHash}.wasm`,
+    `${coreName} is sha256:${coreHash.slice(0, 12)} of ${Math.round(coreWasm.length / 1e6)} MB`,
+  );
 
   // The binary is the published one, byte for byte: the page digests what it is
   // handed and will not keep what it did not expect (see `warmEngine`), so a
@@ -434,7 +493,19 @@ console.log('\n› a redeploy, and what the page does about it');
   // a different set of files at the same URLs, as far as a browser can tell.
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'webpdf-redeploy-'));
   fs.cpSync(dist, dir, { recursive: true });
-  const server = await listening(serve(dir));
+  const site = serve(dir);
+  /**
+   * Every path the site has been asked for, in order.
+   *
+   * A request the worker makes for itself is not in the page's own resource
+   * timing, so the only place the last check of this section can see the engine
+   * it deliberately asks for again is here, at the server.
+   */
+  const asked: string[] = [];
+  site.on('request', (request) => asked.push(new URL(request.url ?? '/', 'http://x').pathname));
+  const server = await listening(site);
+  /** How many times the site has been asked for a file, by its name. */
+  const askedFor = (name: string): number => asked.filter((path) => path.endsWith(name)).length;
 
   /**
    * Reload onto the build that is being served, and wait to be told a new one is
@@ -496,6 +567,65 @@ console.log('\n› a redeploy, and what the page does about it');
   const stillServed = (file: string): Promise<boolean> =>
     page.evaluate<boolean>(`fetch(${JSON.stringify('./' + file)}).then((response) => response.ok).catch(() => false)`);
 
+  /**
+   * The engines the worker is keeping, as file names.
+   *
+   * Read from here rather than from a predicate in the page, because a predicate
+   * is sent to the page as its own source: a name closed over in this file would
+   * arrive as whatever the page happens to have under that name - a `name` there
+   * is `window.name`, the empty string, and every URL ends with that - and every
+   * read of the cache here is about a file name.
+   */
+  const enginesOf = async (): Promise<string[]> =>
+    (await page.evaluate<Kept>(`window.__kept()`)).engine.map((url) => url.split('/').pop() ?? url);
+
+  /**
+   * What the worker is keeping, once it has stopped changing it.
+   *
+   * Storing an engine and trimming the engines are two steps, and a read can land
+   * between them: the worker has this build's engine before it has decided what
+   * that does to the ones it already had. Two reads the same, a moment apart, is
+   * what "the worker is done" looks like from outside.
+   */
+  const settledEngines = async (): Promise<string[]> => {
+    const deadline = Date.now() + 30000;
+    let previous: string[] = [];
+    while (Date.now() < deadline) {
+      const kept = [...(await enginesOf())].sort();
+      if (kept.join('\n') === previous.join('\n')) return kept;
+      previous = kept;
+      await new Promise((r) => setTimeout(r, 250));
+    }
+    return previous;
+  };
+
+  /**
+   * Whether the engine this build names is the one the page fetched and kept.
+   *
+   * A document has to be opened for either to happen - the engine is fetched when
+   * it is first needed rather than when the page boots - and the fact that this
+   * build's name is in the cache is the fact that it was fetched: a name that is
+   * new to this build cannot be answered by anything the worker already had, so
+   * the bytes behind it came over the network, and the worker only keeps what it
+   * was asked for after the page had used it. What is waited for is the *settled*
+   * cache, because the store is followed by a trim that an eager read would catch
+   * halfway through.
+   */
+  const engineInUse = async (name: string): Promise<boolean> => {
+    await open(page, pdf);
+    const deadline = Date.now() + 90000;
+    let previous: string[] = [];
+    while (Date.now() < deadline) {
+      const kept = [...(await enginesOf())].sort();
+      if (kept.includes(name) && kept.length <= ENGINES_KEPT && kept.join('\n') === previous.join('\n')) {
+        return true;
+      }
+      previous = kept;
+      await new Promise((r) => setTimeout(r, 250));
+    }
+    return false;
+  };
+
   try {
     await boot(page, server.origin);
     await page.waitFor(() => navigator.serviceWorker.controller !== null, { label: 'the first worker to take the site over' });
@@ -508,9 +638,15 @@ console.log('\n› a redeploy, and what the page does about it');
       `${first[0] ?? 'no shell'} is the only one, and nothing was offered`,
     );
 
+    // A document on the build the reader is on, so that the engine this build
+    // named is the one their worker is holding when the deploy lands. That is the
+    // state the whole of the engine's half of a deploy is about: a reader who has
+    // used the build before this one.
+    check('the build the reader is on keeps its own engine', await engineInUse(coreName), `${coreName} fetched and kept`);
+
     // The deploy. From here the server is a different build and the browser is
     // still running the one before it.
-    const second = redeploy(dir, 'second');
+    const second = redeploy(dir, 'second', coreName);
     const gone = await fetch(`${server.origin}/${second.was}`);
     check(
       'the deploy replaces the entry module the old shell was made of',
@@ -540,15 +676,32 @@ console.log('\n› a redeploy, and what the page does about it');
 
     check('taking it lands on the new build', (await takeTheOffer('second')) === 'second', 'the page is second');
 
+    // What the deploy rebuilt: the core is compiled from `core/`, and a build
+    // that recompiles it addresses a *different* file, so the page cannot be
+    // handed the one the reader already had. Under one fixed name it was - and
+    // the pair that came out of it was one build's page and another build's
+    // engine, which draws a document with no faces at all.
+    check(
+      'the new build draws with the engine it was built against, not the one already kept',
+      await engineInUse(second.engine.now),
+      `asked for and kept ${second.engine.now}; the build before it used ${second.engine.was}`,
+    );
+
     const after = await shellsOf(page);
     check(
       'the build before it is kept, so the files it was made of still answer',
       after.length === 2 && after.includes(first[0]) && (await stillServed(second.was)),
       `${after.length} shells kept, and ${second.was} - which the server no longer has - is still served`,
     );
+    const keptEngines = await settledEngines();
+    check(
+      'and so is the engine it was made of, for as long as that shell is',
+      keptEngines.includes(second.engine.was),
+      `${keptEngines.join(', ') || 'no engines kept'}`,
+    );
 
     // The one after that: the same again, and the shell before last dropped.
-    redeploy(dir, 'third');
+    const third = redeploy(dir, 'third', second.engine.now);
     const offeredAgain = await toldAbout();
     check(
       'a second deploy is offered the same way, to the reader who took the first',
@@ -561,6 +714,59 @@ console.log('\n› a redeploy, and what the page does about it');
       'the shell before last is dropped: two builds back is nobody to answer for',
       now.length === 2 && !now.includes(first[0]) && (await stillServed(second.now)),
       `${now.length} shells, the first build ${now.includes(first[0]) ? 'still kept' : 'gone'}, ${second.now} still served`,
+    );
+
+    // The engine follows its shell: the page on the third build has to be drawn
+    // with the third build's core, and the one two builds back has nobody left to
+    // serve - which is also what keeps a reader's storage from growing by a copy
+    // of the core at every deploy.
+    const thirdDrawn = await engineInUse(third.engine.now);
+    check('the third build draws with its own engine', thirdDrawn, `${third.engine.now} fetched and kept`);
+    const engines = await settledEngines();
+    check(
+      'the engine before last is dropped with its shell',
+      engines.includes(third.engine.now) && engines.includes(second.engine.now) && !engines.includes(coreName),
+      `${engines.length} engines kept (${engines.join(', ')}), ${coreName} is gone`,
+    );
+
+    // And then a page of the build that was just dropped asks for its engine
+    // again. This is not a hypothetical: the reader's tab is not the only tab, a
+    // tab of the build two deploys back is still open, and the file its page
+    // names is still where the server put it - which is what the reader's own
+    // HTTP cache is for the deploy's ten minutes. The request succeeds, the
+    // worker is asked to keep an engine whose build nobody is serving, and the
+    // question is what that does to the engine the page on screen is running.
+    //
+    // It must not become the newest thing in the cache. An engine that comes
+    // back is not a new engine, so the moment it was *first* kept is what it
+    // sorts by (`firstKept`), and the trim drops it again on the spot. The two
+    // that are kept stay the two that are kept, which is the whole of what an
+    // offline reader needs when the network is gone for good.
+    const stale = new URL(`/engine/${coreName}`, server.origin).href;
+    const before = askedFor(coreName);
+    // The browser's own HTTP cache is usually what answers for that file, since
+    // the server said `max-age=600` when it served it - which is the point of
+    // leaving the name alive. It is emptied here so that the fetch is one this
+    // test can watch arrive; where the bytes come from changes nothing about what
+    // the worker does with them.
+    await page.send('Network.clearBrowserCache').catch(() => undefined);
+    await page.evaluate(
+      `navigator.serviceWorker.ready.then((registration) => registration.active.postMessage(${JSON.stringify({
+        wpdf: 'warm-engine',
+        engine: { url: stale, integrity: coreDigest },
+      })}))`,
+    );
+    const deadline = Date.now() + 30000;
+    while (askedFor(coreName) === before && Date.now() < deadline) await new Promise((r) => setTimeout(r, 100));
+    const asked = askedFor(coreName) > before;
+    const afterStale = await settledEngines();
+    check(
+      'an old build asking for its engine again does not push out the one on screen',
+      asked &&
+        afterStale.includes(third.engine.now) &&
+        afterStale.includes(second.engine.now) &&
+        !afterStale.includes(coreName),
+      `${asked ? 'the dropped build asked the server' : 'the server was never asked'} for ${coreName} again, and ${afterStale.length} engines are kept (${afterStale.join(', ')})`,
     );
 
     // And none of it costs the offline claim: the last build is a build like any

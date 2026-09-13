@@ -424,7 +424,11 @@ its manifest and icons, and the core's Emscripten glue — and nothing else. The
 6 MB binary and the documents are kept the first time they are actually used, and
 both are kept *by the page*: the engine's wasm only after the page has checked it
 against the digest the build was made with, and a document only when the reader
-opened it. The list of documents is capped at eight, and the cap is visible: it
+opened it. A build names that binary for the digest of its bytes
+(`webpdf-core.<hash>.wasm`), so a deploy addresses a file the copy a reader
+already has cannot answer for: the worker keeps this build's engine and the one
+before it, and a page is never drawn with another build's core. The list of
+documents is capped at eight, and the cap is visible: it
 is exactly "what has been read here". A newer build installs, waits, and asks —
 a page that is being read is never swapped out from under the reader.
 
