@@ -458,7 +458,7 @@ try {
       const viewer = window.webpdf.viewer();
       viewer.setZoom(1.5);
       viewer.setBionic(true, 0.4);
-      viewer.setCrop(['page-number'], 6);
+      viewer.setCrop(['^[0-9]+$'], 6);
       viewer.goToDestination(5, 200);
     })()`,
   );
@@ -473,7 +473,7 @@ try {
   );
   check(
     'the viewer writes the reader\'s place into its own memory',
-    remembered?.pos?.page === 5 && remembered.settings?.zoom?.level === 1.5 && remembered.settings?.bionic?.on === true && remembered.settings?.crop?.rules.join() === 'page-number',
+    remembered?.pos?.page === 5 && remembered.settings?.zoom?.level === 1.5 && remembered.settings?.bionic?.on === true && remembered.settings?.crop?.patterns.join() === '^[0-9]+$',
     JSON.stringify(remembered),
   );
 
@@ -490,7 +490,7 @@ try {
     return { page: viewer.place().page, y: viewer.place().y, zoom: viewer.zoom, bionic: viewer.bionic, dim: viewer.bionicDim, crop: [...viewer.crop], padding: viewer.cropPadding };
   });
   check('the position comes back', restored.page === 5 && Math.abs((restored.y ?? 0) - 200) < 6, JSON.stringify({ page: restored.page, y: restored.y }));
-  check('so do the settings', restored.zoom === 1.5 && restored.bionic === true && restored.dim === 0.4 && restored.crop.join() === 'page-number' && restored.padding === 6, JSON.stringify(restored));
+  check('so do the settings', restored.zoom === 1.5 && restored.bionic === true && restored.dim === 0.4 && restored.crop.join() === '^[0-9]+$' && restored.padding === 6, JSON.stringify(restored));
 
   /* ------------------------------------------------- the keys and the save */
 

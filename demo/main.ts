@@ -35,6 +35,7 @@ import { createOffline } from './offline.ts';
 import { get, inherited, keyOfFile, keyOfUrl, MEMORY_KEY, put, read, write, type Memory, type Place, type Settings } from './memory.ts';
 import { createSearch, type SearchController, type SearchState } from './search.ts';
 import { createCropMenu, type CropMenu } from './crop.ts';
+import { CUSTOM_RULES_KEY, readCustomRules, writeCustomRules, type CropRule } from './core/rules.ts';
 import { createMenu, type Menu } from './menu.ts';
 import { scrollIntoPanel } from './panels.ts';
 import { exampleDocuments, type Example } from './examples.ts';
@@ -83,6 +84,10 @@ const els = {
   cropAll: $<HTMLButtonElement>('crop-all'),
   cropNone: $<HTMLButtonElement>('crop-none'),
   cropPadding: $<HTMLInputElement>('crop-padding'),
+  cropAdd: $<HTMLFormElement>('crop-add'),
+  cropNewName: $<HTMLInputElement>('crop-new-name'),
+  cropNewPattern: $<HTMLInputElement>('crop-new-pattern'),
+  cropNewError: $('crop-new-error'),
   bionicGroup: $('bionic-group'),
   bionicBtn: $<HTMLButtonElement>('bionic-btn'),
   bionicMenu: $('bionic-menu'),
@@ -117,6 +122,12 @@ const REPORT_MS = 400;
  * where the reader was in it. Read once, at start-up, and written back whole.
  */
 let memory: Memory = read(localStorage.getItem(MEMORY_KEY));
+/**
+ * The crop rules the reader wrote, which belong to them and not to a document:
+ * read once, at start-up, and written back whole. They are the vocabulary of
+ * marks a reader has built up, so they follow them from one paper to the next.
+ */
+let customCropRules: CropRule[] = readCustomRules(localStorage.getItem(CUSTOM_RULES_KEY));
 /** What identifies the document on screen in that memory, if one is open. */
 let openKey: string | null = null;
 let rememberTimer = 0;
@@ -707,9 +718,14 @@ function applyZoomInput(): void {
 /* ------------------------------------------------------------------ crop */
 
 /**
- * The crop dropdown: rules in, a selection out. Applying it is one call - the
- * viewer measures the pages and re-lays them out as the boxes arrive - and the
- * progress it reports back is what the panel's status line shows.
+ * The crop dropdown: regular expressions in, a selection out. Applying it is
+ * one call - the viewer measures the pages and re-lays them out as the boxes
+ * arrive - and the progress it reports back is what the panel's status line
+ * shows.
+ *
+ * The reader's own rules are the page's to keep: the menu hands them back here
+ * whenever they change, and this is where they go into `localStorage` and come
+ * back from it.
  */
 function ensureCropMenu(v: PdfViewer): CropMenu {
   if (crop) return crop;
@@ -721,7 +737,23 @@ function ensureCropMenu(v: PdfViewer): CropMenu {
     allButton: els.cropAll,
     noneButton: els.cropNone,
     padding: els.cropPadding,
-    onChange: (rules, padding) => v.setCrop(rules, padding),
+    add: {
+      form: els.cropAdd,
+      name: els.cropNewName,
+      pattern: els.cropNewPattern,
+      error: els.cropNewError,
+    },
+    customRules: customCropRules,
+    onCustomRules: (rules) => {
+      customCropRules = [...rules];
+      try {
+        localStorage.setItem(CUSTOM_RULES_KEY, writeCustomRules(rules));
+      } catch {
+        /* storage full or blocked: the rule still applies for this sitting */
+      }
+    },
+    checkPattern: (pattern) => v.checkCropPattern(pattern),
+    onChange: (patterns, padding) => v.setCrop(patterns, padding),
   });
   return crop;
 }
@@ -1327,7 +1359,7 @@ function applySettings(settings: Settings | null): void {
     if (mode === 'custom') viewer.setZoom(level);
     else if (mode === 'fit-width' || mode === 'fit-page') viewer.setZoom(mode);
   }
-  if (settings.crop) ensureCropMenu(viewer).setRules(settings.crop.rules, settings.crop.padding);
+  if (settings.crop) ensureCropMenu(viewer).setPatterns(settings.crop.patterns, settings.crop.padding);
   if (settings.bionic) setBionic(settings.bionic.on, settings.bionic.dim);
   if (typeof settings.outline === 'boolean') setOutline(settings.outline);
   syncZoomBox();
@@ -1377,11 +1409,13 @@ function hostState(): { pos: Place | null; settings: Settings } {
     pos: viewer?.place() ?? null,
     settings: {
       zoom: viewer ? { level: viewer.zoom, mode: viewer.zoomMode } : null,
-      // With no rules there is no crop to remember - and the padding field is
-      // inert without them, so a "padding" of its own is not something the reader
-      // ever chose. (The viewer's own default padding is zero; the demo's is 6pt,
-      // and inheriting a zero would quietly replace it.)
-      crop: viewer && viewer.crop.length ? { rules: [...viewer.crop], padding: viewer.cropPadding } : null,
+      // With nothing checked there is no crop to remember - and the padding
+      // field is inert without it, so a "padding" of its own is not something
+      // the reader ever chose. (The viewer's own default padding is zero; the
+      // demo's is 6pt, and inheriting a zero would quietly replace it.) What is
+      // kept is the *expressions*, which is what the viewer is applying and
+      // what the menu can name again when the same document comes back.
+      crop: viewer && viewer.crop.length ? { patterns: [...viewer.crop], padding: viewer.cropPadding } : null,
       bionic: viewer ? { on: viewer.bionic, dim: viewer.bionicDim } : null,
       outline: !els.toc.hidden,
       // Not something the viewer is told; it is what the *next* visit builds the

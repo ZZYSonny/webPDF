@@ -55,10 +55,10 @@ export interface CoreModule {
     cropW: number,
     cropH: number,
   ) => number;
-  readonly _wpdf_measure_crop: (id: number, page: number, rules: number, rulesLen: number) => number;
+  readonly _wpdf_measure_crop: (id: number, page: number, patterns: number, patternsLen: number) => number;
   readonly _wpdf_links: (id: number, page: number) => number;
   readonly _wpdf_save: (id: number) => number;
-  readonly _wpdf_rules: () => number;
+  readonly _wpdf_crop_check: (pattern: number, patternLen: number) => number;
   readonly _wpdf_out_ptr: () => number;
 }
 
@@ -234,13 +234,30 @@ export class Core {
     };
   }
 
-  /** The box a page's content occupies under a rule set, or null for none. */
-  measureCrop(id: number, page: number, rules: readonly string[]): unknown {
-    const list = rules.join(',');
+  /** The box a page's content occupies under a set of patterns, or null. */
+  measureCrop(id: number, page: number, patterns: readonly string[]): unknown {
+    // A newline joins them because an expression can contain any other
+    // character; `crop::SEPARATOR` on the core side is the same one.
+    const list = patterns.join('\n');
     const { header } = this.withText(list, (ptr, len) =>
       this.frame(this.module._wpdf_measure_crop(id, page, ptr, len), 'measureCrop'),
     );
     return header.crop;
+  }
+
+  /**
+   * Whether one expression compiles, as an error message or null.
+   *
+   * The core answers this without a document, and answers it as an ordinary
+   * frame either way: a pattern that does not compile is a fact about the
+   * pattern, not a failed call - which is why the core puts its reason in
+   * `reason` and not in the `error` that means "this call failed".
+   */
+  checkCropPattern(pattern: string): string | null {
+    const { header } = this.withText(pattern, (ptr, len) =>
+      this.frame(this.module._wpdf_crop_check(ptr, len), 'checkCropPattern'),
+    );
+    return header.ok === true ? null : String(header.reason ?? 'this pattern will not compile');
   }
 
   /** Every link annotation on a page, for a host that wants the data. */
@@ -252,11 +269,5 @@ export class Core {
   /** Write the document out again, unencrypted. */
   save(id: number): Uint8Array {
     return this.frame(this.module._wpdf_save(id), 'save').payload;
-  }
-
-  /** The crop rules, so the menu is drawn from the core's own list. */
-  rules(): unknown[] {
-    const { header } = this.frame(this.module._wpdf_rules(), 'rules');
-    return (header.rules ?? []) as unknown[];
   }
 }

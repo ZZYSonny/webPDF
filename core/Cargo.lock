@@ -620,6 +620,7 @@ dependencies = [
  "miniz_oxide",
  "mupdf",
  "mupdf-sys",
+ "regex",
 ]
 
 [[package]]

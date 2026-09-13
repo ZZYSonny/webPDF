@@ -106,13 +106,23 @@ const css = new TextDecoder().decode(frame(m._wpdf_stylesheet(id), 'stylesheet')
 const faces = (css.match(/@font-face/g) ?? []).length;
 check('and produces one @font-face per font', faces > 0, `${Math.round(css.length / 1024)} kB, ${faces} faces`);
 
-const rules = frame(m._wpdf_rules(), 'rules').header.rules;
-check('the crop rules are the seven the panel draws', rules.length === 7, rules.map((r) => r.id).join(', '));
-
-const rulesText = put('arxiv,page-number');
-const crop = frame(m._wpdf_measure_crop(id, page, rulesText.ptr, rulesText.size), 'crop');
-m._free(rulesText.ptr);
+// The rules are the host's, and the core is handed the expressions themselves:
+// a newline joins them, because any other separator can be part of an
+// expression. "arXiv:" at the start and a run that is nothing but digits.
+const good = put('^arXiv:\n^\\s*[0-9]+\\s*$');
+const crop = frame(m._wpdf_measure_crop(id, page, good.ptr, good.size), 'crop');
+m._free(good.ptr);
 check('a crop box is measured without rendering the page', crop.header.crop === null || crop.header.crop.width > 0, JSON.stringify(crop.header.crop));
+
+const bad = put('^(');
+const refused = frame(m._wpdf_crop_check(bad.ptr, bad.size), 'crop_check').header;
+m._free(bad.ptr);
+check('and a pattern that is not one is refused with a reason', refused.ok === false && String(refused.reason).length > 0, JSON.stringify(refused));
+
+const fine = put('^arXiv:');
+const accepted = frame(m._wpdf_crop_check(fine.ptr, fine.size), 'crop_check').header;
+m._free(fine.ptr);
+check('while a pattern that is one is accepted', accepted.ok === true && accepted.reason === '', JSON.stringify(accepted));
 
 const prefix = put(`p${page}-`);
 const className = put('wpdf-page-svg');

@@ -1,22 +1,31 @@
-//! Cropping a page to its content, with the rules PaperCutter uses.
+//! Cropping a page to its content: a box from everything the page shows, minus
+//! the runs a list of regular expressions matches.
 //!
 //! The idea is the one a print shop means by "trim to the type": every page is
 //! reduced to the bounding box of what is actually on it, so a PDF whose pages
 //! carry two inches of blank margin can be read (or printed) without it. The
-//! rules exist because some marks on a page are not content - a publisher's
+//! patterns exist because some marks on a page are not content - a publisher's
 //! footer, an arXiv stamp in the margin, a bare page number - and a box built
 //! from *everything* would keep the margins that exist only to hold them.
 //!
 //! Ported from PaperCutter's `cutter.py`, which is the reference for both the
-//! boxes and the rules; each rule below says which line of it it came from. Two
-//! details of that script are deliberately kept because they are what it does,
-//! not because they are obviously right:
+//! boxes and the marks it removes. The script's predicates are lifted into
+//! regular expressions here, and its filter list becomes a *list of
+//! expressions*: the core has no opinion about what a rule is called or which
+//! ones a reader wants, only about whether a run matches. Two details of the
+//! script are deliberately kept because they are what it does, not because they
+//! are obviously right:
 //!
 //!  - a drawing counts only when it is *fully inside* the page box and more than
 //!    [`MIN_DRAWING_HEIGHT`] tall, so a rule or a figcaption frame is kept and a
 //!    hairline is not;
 //!  - the top of the box is clamped to the page (`box[1] = max(0, box[1])`),
 //!    which is what stops a mark in the trim area from pulling it upwards.
+//!
+//! A pattern is found anywhere in a run - Rust's `Regex::is_match` is Python's
+//! `re.search`, not `re.match` - so an expression that wants the start of a run
+//! says so with `^`. The host's built-in rules carry their own anchors, which is
+//! how the script's `startswith` and `re.match` calls are kept exact.
 //!
 //! This is the part of the TypeScript pipeline that asked MuPDF the most
 //! questions - every character's quad, and the bound of every fill, stroke, image
@@ -31,6 +40,7 @@ use mupdf::{
     ColorParams, Colorspace, Device, Error, Image, Matrix, NativeDevice, Page, Path, Rect, Shade,
     StrokeState, TextPageFlags,
 };
+use regex::Regex;
 
 /// Drawings taller than this are kept whatever they contain: a table rule, a
 /// figure, a shaded panel. `32` is PaperCutter's number, in page units.
@@ -142,199 +152,84 @@ pub struct Span {
     pub box_: Box2,
 }
 
-/// The marks a rule can remove, in PaperCutter's order.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Rule {
-    Arxiv,
-    ConferenceHeader,
-    PageNumber,
-    SectionNumber,
-    Chapter,
-    PrimeAi,
-    Title,
-}
+/// The separator between patterns on the wire.
+///
+/// A newline, because a regular expression for a line of text has no use for one
+/// and the alternative - a comma - is a character expressions do contain. The
+/// host joins with it and this side splits on it; a pattern that somehow carried
+/// a newline would arrive as two, which is the one thing the format asks of a
+/// caller.
+pub const SEPARATOR: &str = "\n";
 
-/// One rule as the host shows it: what it is called, what it removes, and the
-/// line of PaperCutter it came from.
-pub struct RuleInfo {
-    pub rule: Rule,
-    pub id: &'static str,
-    pub label: &'static str,
-    pub hint: &'static str,
-    pub source: &'static str,
-    /// True when the rule can only work with the document's own title.
-    pub needs_title: bool,
-}
-
-/// PaperCutter's filter list, in its order, plus the title filter it installs
-/// per document (`common_filter_function`). A span matching any enabled rule is
-/// left out of the content box.
-pub const RULES: [RuleInfo; 7] = [
-    RuleInfo {
-        rule: Rule::Arxiv,
-        id: "arxiv",
-        label: "arXiv stamp",
-        hint: "the identifier arXiv prints in the left margin",
-        source: "s.startswith(\"arXiv:\")",
-        needs_title: false,
-    },
-    RuleInfo {
-        rule: Rule::ConferenceHeader,
-        id: "conference-header",
-        label: "Conference header",
-        hint: "the publisher’s line across the top",
-        source: "s.startswith(\"Published as a conference paper at\")",
-        needs_title: false,
-    },
-    RuleInfo {
-        rule: Rule::PageNumber,
-        id: "page-number",
-        label: "Page number",
-        hint: "a span that is nothing but digits",
-        source: "s.lstrip().rstrip().isdigit()",
-        needs_title: false,
-    },
-    RuleInfo {
-        rule: Rule::SectionNumber,
-        id: "section-number",
-        label: "Section number",
-        hint: "a heading that opens with “3.1.”",
-        source: "re.match(\"[0-9]\\\\.[0-9]\\\\.\", s)",
-        needs_title: false,
-    },
-    RuleInfo {
-        rule: Rule::Chapter,
-        id: "chapter",
-        label: "Chapter heading",
-        hint: "a heading that opens with “CHAPTER 1.”",
-        source: "re.match(\"CHAPTER [0-9]\\\\.\", s)",
-        needs_title: false,
-    },
-    RuleInfo {
-        rule: Rule::PrimeAi,
-        id: "prime-ai",
-        label: "PRIME AI watermark",
-        hint: "the line “PRIME AI paper”",
-        source: "s == \"PRIME AI paper\"",
-        needs_title: false,
-    },
-    RuleInfo {
-        rule: Rule::Title,
-        id: "title",
-        label: "Running title",
-        hint: "the document’s own title, repeated as a header",
-        source: "s == title  (common_filter_function)",
-        needs_title: true,
-    },
-];
-
-impl Rule {
-    pub fn id(&self) -> &'static str {
-        RULES
-            .iter()
-            .find(|info| info.rule == *self)
-            .map(|info| info.id)
-            .unwrap_or("")
-    }
-
-    /// Does this span carry the mark the rule removes?
-    pub fn test(&self, text: &str, title: &str) -> bool {
-        match self {
-            Rule::Arxiv => text.starts_with("arXiv:"),
-            Rule::ConferenceHeader => text.starts_with("Published as a conference paper at"),
-            // Python's `isdigit()` also accepts non-ASCII digits; the port keeps
-            // to ASCII, which is what a numbered page is actually set in.
-            Rule::PageNumber => {
-                let trimmed = text.trim();
-                !trimmed.is_empty() && trimmed.bytes().all(|b| b.is_ascii_digit())
-            }
-            Rule::SectionNumber => starts_with_pattern(text, b"d.d."),
-            Rule::Chapter => starts_with_pattern(text, b"CHAPTER d."),
-            Rule::PrimeAi => text == "PRIME AI paper",
-            // No title, no match: PaperCutter only installs this filter when it
-            // has one.
-            Rule::Title => !title.is_empty() && text == title,
+/// A `list` of patterns, as the host sends one: trimmed, empties dropped,
+/// duplicates collapsed, order kept.
+///
+/// The order is the host's - it is the order of the menu - and it matters only
+/// for the cache key, since any match removes a run.
+pub fn parse_patterns(list: &str) -> Vec<String> {
+    let mut patterns: Vec<String> = Vec::new();
+    for pattern in list.split(SEPARATOR) {
+        let pattern = pattern.trim();
+        if pattern.is_empty() || patterns.iter().any(|each| each == pattern) {
+            continue;
         }
+        patterns.push(pattern.to_string());
     }
+    patterns
 }
 
-/// `^<pattern>$` where `d` stands for one ASCII digit and every other byte is
-/// itself - the two `re.match` rules, spelled out so the expression is not a
-/// dependency.
-fn starts_with_pattern(text: &str, pattern: &[u8]) -> bool {
-    let bytes = text.as_bytes();
-    bytes.len() >= pattern.len()
-        && pattern.iter().enumerate().all(|(i, want)| match want {
-            b'd' => bytes[i].is_ascii_digit(),
-            other => bytes[i] == *other,
-        })
-}
-
-/// The selection a caller asked for, in the order the rules are declared:
-/// unknown ids dropped, duplicates collapsed.
-pub fn normalise_rules(ids: &[String]) -> Vec<Rule> {
-    RULES
+/// Compile a list of patterns, or say which one is not one.
+///
+/// A reader can type any expression into the menu, so a bad one is an ordinary
+/// answer and not a panic: the message is what the menu shows beside the field,
+/// and the first pattern that fails is the one it names.
+pub fn compile(patterns: &[String]) -> Result<Vec<Regex>, String> {
+    patterns
         .iter()
-        .filter(|info| ids.iter().any(|id| id == info.id))
-        .map(|info| info.rule)
+        .map(|pattern| Regex::new(pattern).map_err(|error| describe(&error)))
         .collect()
 }
 
-/// Split a `a,b,c` list of rule ids, which is how the bridge passes a selection.
-pub fn parse_rules(list: &str) -> Vec<Rule> {
-    let ids: Vec<String> = list
-        .split(',')
-        .map(str::trim)
-        .filter(|id| !id.is_empty())
-        .map(str::to_string)
-        .collect();
-    normalise_rules(&ids)
-}
-
-/// Every rule, for a host that has to draw the menu it is choosing from.
-pub fn rules_json() -> String {
-    let mut out = String::from("[");
-    for (i, info) in RULES.iter().enumerate() {
-        if i > 0 {
-            out.push(',');
+/// A `regex` compile error as one line a reader can act on.
+///
+/// The crate's `Display` is a three-line rep: the offending pattern, a caret
+/// under the column, and then the reason. Only the reason is worth carrying
+/// across the boundary; anything unexpected is kept, collapsed, rather than
+/// thrown away.
+fn describe(error: &regex::Error) -> String {
+    let text = error.to_string();
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(reason) = line.strip_prefix("error:") {
+            return reason.trim().to_string();
         }
-        out.push_str(&format!(
-            "{{\"id\":\"{}\",\"label\":{},\"hint\":{},\"source\":{},\"needsTitle\":{}}}",
-            info.id,
-            crate::json::quote(info.label),
-            crate::json::quote(info.hint),
-            crate::json::quote(info.source),
-            info.needs_title
-        ));
     }
-    out.push(']');
-    out
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// True when this span carries one of the selected marks.
-fn filtered(text: &str, rules: &[Rule], title: &str) -> bool {
-    rules.iter().any(|rule| rule.test(text, title))
+/// True when this run carries one of the marks the patterns describe.
+pub fn filtered(text: &str, patterns: &[Regex]) -> bool {
+    patterns.iter().any(|pattern| pattern.is_match(text))
 }
 
 /// The content box of one page, or `None` when there is nothing to crop to.
 ///
 /// This is PaperCutter's `crop_page` up to the `set_cropbox` call: the union of
-/// the spans no rule removes and the drawings big enough to be content, with the
-/// top clamped to the page and the whole thing intersected with it.
+/// the spans no pattern matches and the drawings big enough to be content, with
+/// the top clamped to the page and the whole thing intersected with it.
 pub fn content_box(
     spans: &[Span],
     drawings: &[Box2],
     page: Box2,
-    title: &str,
-    rules: &[Rule],
+    patterns: &[Regex],
 ) -> Option<Box2> {
-    if rules.is_empty() {
+    if patterns.is_empty() {
         return None;
     }
 
     let mut box_ = Box2::new(f32::INFINITY, f32::INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY);
     for span in spans {
-        if span.text.is_empty() || filtered(&span.text, rules, title) {
+        if span.text.is_empty() || filtered(&span.text, patterns) {
             continue;
         }
         box_.union(&span.box_);
@@ -394,8 +289,8 @@ const TEXT_FLAGS: TextPageFlags =
 /// share a font, a size and a colour, which is how PyMuPDF groups them and
 /// therefore how PaperCutter's rules see the page. Grouping them the same way
 /// matters: "3.1." and the heading it introduces are one span when they are set
-/// in one style, and the rule for a section number then takes the whole heading
-/// out of the box - exactly as the reference script does.
+/// in one style, and the pattern for a section number then takes the whole
+/// heading out of the box - exactly as the reference script does.
 pub fn page_spans(page: &Page) -> Result<Vec<Span>, Error> {
     let text_page = page.to_text_page(TEXT_FLAGS)?;
     let mut spans: Vec<Span> = Vec::new();
@@ -538,55 +433,78 @@ mod test {
         Box2::new(0.0, 0.0, 612.0, 792.0)
     }
 
-    fn rules(ids: &[&str]) -> Vec<Rule> {
-        let list: Vec<String> = ids.iter().map(|id| id.to_string()).collect();
-        normalise_rules(&list)
+    /// The patterns the menu ships, as the host sends them, compiled.
+    fn patterns(list: &[&str]) -> Vec<Regex> {
+        let list: Vec<String> = list.iter().map(|each| each.to_string()).collect();
+        compile(&list).expect("the test's patterns compile")
     }
 
     #[test]
-    fn each_rule_recognises_its_own_mark_and_nothing_else() {
-        assert!(Rule::Arxiv.test("arXiv:1706.03762v7", ""));
-        assert!(Rule::ConferenceHeader.test("Published as a conference paper at ICLR", ""));
-        assert!(Rule::PageNumber.test("  42  ", ""), "a page number is trimmed first");
-        assert!(!Rule::PageNumber.test("42a", ""));
-        assert!(!Rule::PageNumber.test("", ""));
-        assert!(Rule::SectionNumber.test("3.1. The model", ""));
-        assert!(!Rule::SectionNumber.test("3. The model", ""));
-        assert!(Rule::Chapter.test("CHAPTER 1. Introduction", ""));
-        assert!(Rule::PrimeAi.test("PRIME AI paper", ""));
-        assert!(Rule::Title.test("Attention Is All You Need", "Attention Is All You Need"));
-        // No title, no match: the reference only installs the filter when it has
-        // one.
-        assert!(!Rule::Title.test("Attention Is All You Need", ""));
-        assert!(!Rule::Arxiv.test("See arXiv:1706.03762v7", ""));
+    fn a_pattern_is_found_anywhere_unless_it_says_otherwise() {
+        let anywhere = patterns(&["arXiv"]);
+        assert!(filtered("see arXiv:1706.03762v7", &anywhere));
+        let anchored = patterns(&["^arXiv:"]);
+        assert!(filtered("arXiv:1706.03762v7", &anchored));
+        assert!(!filtered("See arXiv:1706.03762v7", &anchored));
     }
 
     #[test]
-    fn a_selection_keeps_the_declared_order_and_drops_what_it_does_not_know() {
-        // Declared order, not the caller's; unknown ids and duplicates gone.
-        assert_eq!(
-            rules(&["title", "arxiv", "arxiv", "nonsense"]),
-            vec![Rule::Arxiv, Rule::Title]
+    fn the_reference_rules_as_the_host_spells_them() {
+        // Every predicate of `cutter.py`, as the menu's own expression.
+        let arxiv = patterns(&["^arXiv:"]);
+        assert!(filtered("arXiv:1706.03762v7", &arxiv));
+        let conference = patterns(&["^Published as a conference paper at"]);
+        assert!(filtered("Published as a conference paper at ICLR", &conference));
+        let number = patterns(&["^\\s*[0-9]+\\s*$"]);
+        assert!(filtered("  42  ", &number));
+        assert!(!filtered("42a", &number));
+        assert!(!filtered("", &number));
+        let section = patterns(&["^[0-9]\\.[0-9]\\."]);
+        assert!(filtered("3.1. The model", &section));
+        assert!(!filtered("3. The model", &section));
+        let chapter = patterns(&["^CHAPTER [0-9]\\."]);
+        assert!(filtered("CHAPTER 1. Introduction", &chapter));
+        // The title rule is a pattern too, escaped by whoever knows the title.
+        let title = patterns(&["^Attention Is All You Need$"]);
+        assert!(filtered("Attention Is All You Need", &title));
+        assert!(!filtered("Attention Is All You Need ", &title));
+    }
+
+    #[test]
+    fn a_bad_pattern_is_a_message_and_not_a_panic() {
+        let error = compile(&["^(".to_string()]).unwrap_err();
+        assert!(!error.is_empty(), "the message names the reason");
+        assert!(
+            !error.contains('\n'),
+            "the message is one line: {error:?}"
         );
-        assert_eq!(rules(&[]), Vec::new());
-        assert_eq!(parse_rules(" arxiv , page-number "), vec![Rule::Arxiv, Rule::PageNumber]);
-        assert_eq!(parse_rules(""), Vec::new());
+        assert!(compile(&["^.".to_string()]).is_ok());
     }
 
     #[test]
-    fn the_box_is_the_spans_no_rule_removed() {
+    fn the_wire_format_is_a_newline_list_deduplicated() {
+        assert_eq!(parse_patterns("^a\n^b"), vec!["^a".to_string(), "^b".to_string()]);
+        assert_eq!(parse_patterns(" ^a \n\n^a\n"), vec!["^a".to_string()]);
+        assert_eq!(parse_patterns(""), Vec::<String>::new());
+        // A comma is an ordinary character in an expression.
+        assert_eq!(parse_patterns("a{1,3}"), vec!["a{1,3}".to_string()]);
+    }
+
+    #[test]
+    fn the_box_is_the_spans_no_pattern_matched() {
         let spans = [
             span("arXiv:1706.03762v7", Box2::new(10.0, 10.0, 80.0, 10.0)),
             span("Attention Is All You Need", Box2::new(100.0, 200.0, 300.0, 20.0)),
             span("21", Box2::new(300.0, 760.0, 10.0, 10.0)),
         ];
-        // No rules: nothing to crop to at all.
-        assert_eq!(content_box(&spans, &[], page(), "", &[]), None);
+        // No patterns: nothing to crop to at all.
+        assert_eq!(content_box(&spans, &[], page(), &[]), None);
         // The arXiv stamp goes, the title and the page number stay.
-        let box_ = content_box(&spans, &[], page(), "", &rules(&["arxiv"])).unwrap();
+        let box_ = content_box(&spans, &[], page(), &patterns(&["^arXiv:"])).unwrap();
         assert_eq!(box_, Box2::new(100.0, 200.0, 300.0, 570.0));
         // The page number goes too: only the title is left.
-        let box_ = content_box(&spans, &[], page(), "", &rules(&["arxiv", "page-number"])).unwrap();
+        let box_ = content_box(&spans, &[], page(), &patterns(&["^arXiv:", "^\\s*[0-9]+\\s*$"]))
+            .unwrap();
         assert_eq!(box_, Box2::new(100.0, 200.0, 300.0, 20.0));
         // Every span removed: nothing to crop to.
         assert_eq!(
@@ -594,8 +512,7 @@ mod test {
                 &spans,
                 &[],
                 page(),
-                "Attention Is All You Need",
-                &rules(&["arxiv", "page-number", "title"]),
+                &patterns(&["^arXiv:", "^\\s*[0-9]+\\s*$", "^Attention Is All You Need$"]),
             ),
             None
         );
@@ -606,17 +523,17 @@ mod test {
         let spans = [span("text", Box2::new(100.0, 300.0, 50.0, 10.0))];
         let tall = Box2::new(50.0, 50.0, 400.0, 100.0);
         // Tall enough and inside: kept, and it is what makes the box taller.
-        let box_ = content_box(&spans, &[tall], page(), "", &rules(&["arxiv"])).unwrap();
+        let box_ = content_box(&spans, &[tall], page(), &patterns(&["^arXiv:"])).unwrap();
         assert_eq!(box_, Box2::new(50.0, 50.0, 400.0, 260.0));
 
         // A hairline is a rule, not content.
         let hairline = Box2::new(50.0, 40.0, 400.0, 1.0);
-        let box_ = content_box(&spans, &[hairline], page(), "", &rules(&["arxiv"])).unwrap();
+        let box_ = content_box(&spans, &[hairline], page(), &patterns(&["^arXiv:"])).unwrap();
         assert_eq!(box_, Box2::new(100.0, 300.0, 50.0, 10.0));
 
         // Half off the page is not content either - the publisher's bleed.
         let bleeding = Box2::new(-20.0, 50.0, 400.0, 100.0);
-        let box_ = content_box(&spans, &[bleeding], page(), "", &rules(&["arxiv"])).unwrap();
+        let box_ = content_box(&spans, &[bleeding], page(), &patterns(&["^arXiv:"])).unwrap();
         assert_eq!(box_, Box2::new(100.0, 300.0, 50.0, 10.0));
     }
 
@@ -625,7 +542,7 @@ mod test {
         // A mark above the page's top edge must not pull the box up: the
         // reference clamps the top and intersects the sides.
         let spans = [span("stamp", Box2::new(-30.0, -40.0, 700.0, 100.0))];
-        let box_ = content_box(&spans, &[], page(), "", &rules(&["arxiv"])).unwrap();
+        let box_ = content_box(&spans, &[], page(), &patterns(&["^arXiv:"])).unwrap();
         assert_eq!(box_, Box2::new(0.0, 0.0, 612.0, 60.0));
     }
 
@@ -645,16 +562,9 @@ mod test {
     fn a_box_with_no_area_is_no_crop() {
         // Zero-width spans: the union has no area, so there is nothing to show.
         let spans = [span("x", Box2::new(10.0, 10.0, 0.0, 0.0))];
-        assert_eq!(content_box(&spans, &[], page(), "", &rules(&["arxiv"])), None);
-    }
-
-    #[test]
-    fn the_menu_is_built_from_the_same_list_the_rules_are() {
-        let json = rules_json();
-        assert_eq!(json.matches("\"id\":").count(), RULES.len());
-        assert!(json.contains("\"label\":\"Page number\""));
-        assert!(json.contains("\"needsTitle\":true"));
-        // The two apostrophes in the copy are multi-byte, and JSON must not care.
-        assert!(json.contains("publisher’s line across the top"));
+        assert_eq!(
+            content_box(&spans, &[], page(), &patterns(&["^arXiv:"])),
+            None
+        );
     }
 }

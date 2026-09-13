@@ -9,9 +9,14 @@
 //!   WPDF_BIONIC=1            bionic reading
 //!   WPDF_BIONIC_DIM=0.35     how faint the rest of each word goes
 //!   WPDF_LINKS=1             append link hit areas
-//!   WPDF_CROP=arxiv,title    crop to the content minus these marks
+//!   WPDF_CROP='^arXiv:;^\s*[0-9]+\s*$'   crop to the content minus these marks
 //!   WPDF_CROP_PADDING=6      points of margin around the crop
 //!   WPDF_SAVE=out.pdf        write the document out again
+//!
+//! `WPDF_CROP` is a `;`-separated list of regular expressions, because a shell
+//! has no comfortable newline - which is what the wire uses. A reader's menu
+//! sends the same list, and a run is left out of the crop box when any
+//! expression in it matches anywhere in the run.
 
 use std::env;
 use std::fs;
@@ -37,7 +42,10 @@ fn main() {
         info.encrypted
     );
 
-    let rules = crop::parse_rules(&env::var("WPDF_CROP").unwrap_or_default());
+    let list = env::var("WPDF_CROP")
+        .unwrap_or_default()
+        .replace(';', crop::SEPARATOR);
+    let patterns = crop::compile(&crop::parse_patterns(&list)).expect("WPDF_CROP patterns compile");
     let padding: f32 = env::var("WPDF_CROP_PADDING")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -78,9 +86,9 @@ fn main() {
     };
     for p in pages {
         // The crop is measured first and applied as a `viewBox`, exactly as the
-        // host does it: the box the rules leave, grown by the padding, stopped by
-        // the page.
-        let view_box = match core.measure_crop(p, &rules) {
+        // host does it: the box the patterns leave, grown by the padding, stopped
+        // by the page.
+        let view_box = match core.measure_crop(p, &patterns) {
             Ok(Some(box_)) => {
                 let page = core
                     .document()

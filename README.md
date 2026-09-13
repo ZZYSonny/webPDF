@@ -184,7 +184,7 @@ URLs, `demo/papers.mjs`):
 The old pipeline's outline SVG for the same pages was 373 KB and 398 KB, so the
 text render is a little over a third of it, with the whole page selectable.
 
-* **The crop agrees with the JavaScript it replaced.** The same rule sets over
+* **The crop agrees with the JavaScript it replaced.** The same marks over
   the same pages were measured both ways: 664 boxes compared, 21 differed, and
   every one of the 21 is a page the two MuPDF versions read different text on
   (1.28.1 in the npm package, 1.27.2 in the Rust crate) — proved, per page, by
@@ -219,7 +219,8 @@ core.authenticate("hunter2")?;          // only when `info().encrypted`
 core.plan_fonts()?;                     // or plan_start/plan_step, a slice at a time
 let css = core.stylesheet();            // one @font-face per font, for the document
 let page = core.render_page(0, &options)?;   // svg, width, height, stats, links
-let box = core.measure_crop(0, &rules)?;     // the content box, before padding
+let patterns = crop::compile(&["^arXiv:".to_string()])?;  // the marks to leave out
+let box = core.measure_crop(0, &patterns)?;  // the content box, before padding
 let bytes = core.save()?;               // the document again, encryption off
 ```
 
@@ -241,13 +242,20 @@ with the answer read from a pointer the module owns (`wpdf_out_ptr`). Arguments
 are strings or bytes the caller allocates with `malloc`; an error is a header
 with `"error"` in it. The exports are `wpdf_open`, `wpdf_password`, `wpdf_close`,
 `wpdf_info`, `wpdf_plan`, `wpdf_stylesheet`, `wpdf_render`, `wpdf_measure_crop`,
-`wpdf_links`, `wpdf_save`, `wpdf_rules` and `wpdf_out_ptr`.
+`wpdf_crop_check`, `wpdf_links`, `wpdf_save` and `wpdf_out_ptr`.
 
 `wpdf_render` takes a flag word — responsive, embed the page's fonts, bionic,
 link hit areas, crop — and, when cropping, the `viewBox` to draw into. A crop is
 never a deletion: the page is written at page coordinates and the host shows a
 window onto it, so changing the padding around a crop is a re-render and not a
 re-measure.
+
+`wpdf_measure_crop` takes the marks to leave out as a **newline-joined list of
+regular expressions** — a newline, because any other separator can be part of an
+expression — and `wpdf_crop_check` answers whether one expression compiles
+without a document, which is what lets the menu refuse a pattern as the reader
+types it. The core has no opinion about what a rule is called; that is the
+host's (`demo/core/rules.ts`).
 
 `demo/core/bridge.ts` is the TypeScript for that protocol, `demo/core/engine.ts`
 is a `PdfEngine` over it (source reading, the sliced plan, the crop cache,
@@ -320,16 +328,22 @@ pages' zoom belongs to the viewer:
 * **The outline floats** over the pages rather than taking a column (a column
   would change the viewer's width every time it opened, and a fit-width layout
   would re-zoom the document as a side effect). It starts closed.
-* **The reader's place is theirs.** Where they were, the zoom, the crop rules,
-  the fade and the outline are remembered per document — the hundred most recent
-  — in the page's own storage, read once at start-up and written back whole.
+* **The reader's place is theirs.** Where they were, the zoom, the crop
+  expressions, the fade and the outline are remembered per document — the hundred
+  most recent — in the page's own storage, read once at start-up and written back
+  whole. The rules that produced those expressions are remembered separately, so
+  a rule a reader writes follows them from one paper to the next.
 * **Cropping is opt-in twice over.** It does nothing until a rule is checked, and
-  each rule can be switched on and off individually. The rules are PaperCutter's,
-  ported into the core (`core/src/crop.rs`); what they remove is the *marks* — a
-  publisher's footer, an arXiv stamp, a bare page number — so that the box built
-  from what remains is the content. The measurement is the core's, once per page
-  and rule set; the padding around it belongs to the page, because the crop is a
-  `viewBox` and changing the margin is a re-render rather than a re-measure.
+  each rule can be switched on and off individually. A rule is a name and a
+  **regular expression**, and the menu shows the expression under the name: what a
+  rule does is exactly what it says. The six that ship are PaperCutter's own
+  predicates, lifted into expressions that mean the same thing (`demo/core/rules.ts`);
+  a reader can add their own, which the core checks before the rule is kept, and
+  remove them again. What they leave out is the *marks* — a publisher's footer,
+  an arXiv stamp, a bare page number — so that the box built from what remains is
+  the content. The measurement is the core's, once per page and expression set;
+  the padding around it belongs to the page, because the crop is a `viewBox` and
+  changing the margin is a re-render rather than a re-measure.
 * **Bionic reading is one choice: off, or a fade at some strength.** The first
   letters of every word are held at full strength and the rest is faded with
   `fill-opacity` — the string, the character order and every position are
@@ -399,7 +413,7 @@ core/                       the engine: Rust, MuPDF, built to wasm
   src/font/plan.rs          one face per font, for the whole document
   src/font/build.rs         outlines + cmap + GSUB liga → an sfnt
   src/font/woff.rs          sfnt → WOFF
-  src/crop.rs               PaperCutter's rules, and the box they leave
+  src/crop.rs               the box a list of regular expressions leaves
   src/links.rs              link annotations → hit areas, and where they point
   src/bionic.rs             bioneer: the fixation points, as fill-opacity
   src/wasm.rs               the bridge: frames, exports, the document table
@@ -416,7 +430,9 @@ demo/                       the viewer (the Vite root, and the site)
   layout.ts                 page geometry and the visible-range maths
   memory.ts                 where the reader was: the hundred most recent documents
   search.ts                 find, and the highlights it paints
-  menu.ts crop.ts panels.ts the dropdowns, the crop rules, the outline panel
+  menu.ts crop.ts panels.ts the dropdowns, the crop menu, the outline panel
+  core/rules.ts             the crop rules: names, and the expressions they apply
+  core/crop.ts              the host's half of a crop: the box, and the padding
   offline.ts                the service worker, and the documents worth keeping
   sw.js                     the shell, the engine, and the documents
   worker.ts                 the core, on a thread of its own
@@ -447,8 +463,9 @@ npm run build:wasm     build the core for the browser (needs .emsdk/, and a
 npm run dev            the demo, with the core served from demo/engine/
 npm run build          the wasm, then the demo, into dist/demo
 npm run typecheck      tsc over demo/, ext/ and tests/
-npm test               the node tests: the memory, the zoom box, the crx
-npm run test:core      cargo test: 36 unit tests over crop, links, info, the
+npm test               the node tests: the memory, the zoom box, the crop
+                       rules, the crx
+npm run test:core      cargo test: 37 unit tests over crop, links, info, the
                        JSON writer and the bridge's framing
 npm run test:browser   every browser suite (see below)
 npm run verify         the three of them
@@ -458,7 +475,7 @@ The native core is the fastest way to look at anything:
 
 ```
 cargo run --release --manifest-path core/Cargo.toml -- paper.pdf .scratch/out 0
-WPDF_CROP=arxiv,page-number WPDF_LINKS=1 cargo run --release --manifest-path core/Cargo.toml -- paper.pdf .scratch/out 0
+WPDF_CROP='^arXiv:;^\s*[0-9]+\s*$' WPDF_LINKS=1 cargo run --release --manifest-path core/Cargo.toml -- paper.pdf .scratch/out 0
 ```
 
 The corpus is a list of public URLs (`demo/papers.mjs`), downloaded into
@@ -513,9 +530,10 @@ wants; the published site is `dist/demo`, and the extension points at it.
 * **The wasm binary is 9 MB.** It is compressed on the wire (~4.4 MB gzipped),
   fetched only when a document is actually opened, and kept for the next visit —
   but it is not precached on install, deliberately.
-* **The crop rules are heuristics.** Seven of them, ported from PaperCutter, and
-  each one is a test over the page's spans and drawings. They are wrong on some
-  documents; that is why none of them is on by default.
+* **The crop rules are heuristics.** Six of them, lifted from PaperCutter into
+  regular expressions, and each one is a pattern over the page's text runs. They
+  are wrong on some documents; that is why none of them is on by default, and why
+  a reader can write their own.
 * **No PDF is ever written by hand.** Saving and printing hand back MuPDF's own
   copy of the document, recompressed and with any encryption removed. Annotations
   and form fields are whoever wrote the PDF's business, not ours.

@@ -62,7 +62,7 @@ pub struct Core {
     doc: Document,
     plan: Rc<font::plan::Plan>,
     info: DocInfo,
-    /// Measured crop boxes, keyed by rule set and page. Small: four numbers each.
+    /// Measured crop boxes, keyed by pattern set and page. Small: four numbers each.
     boxes: RefCell<HashMap<String, Option<Box2>>>,
     /// A counter for the scratch file `save` writes through.
     scratch: RefCell<u32>,
@@ -191,24 +191,28 @@ impl Core {
         Ok(links::page_links(&self.doc, &page))
     }
 
-    /// The box this page's content occupies under `rules` - before any padding,
-    /// which is a host's setting and costs nothing to change.
+    /// The box this page's content occupies under `patterns` - before any
+    /// padding, which is a host's setting and costs nothing to change.
     ///
     /// Reading a page costs a few milliseconds and is asked for once per page per
-    /// rule set, so the answers are kept: toggling a rule off and on again is then
-    /// free rather than a second pass over the document. `None` means "nothing to
-    /// crop to" - an empty page, or no rules - and the page keeps its own size.
-    pub fn measure_crop(&self, page: i32, rules: &[crop::Rule]) -> Result<Option<Box2>, Error> {
-        if rules.is_empty() {
+    /// pattern set, so the answers are kept: toggling a rule off and on again is
+    /// then free rather than a second pass over the document. `None` means
+    /// "nothing to crop to" - an empty page, or no patterns - and the page keeps
+    /// its own size.
+    ///
+    /// The patterns are already compiled: a bad one is the host's to report, and
+    /// `crop::compile` is what says so.
+    pub fn measure_crop(&self, page: i32, patterns: &[regex::Regex]) -> Result<Option<Box2>, Error> {
+        if patterns.is_empty() {
             return Ok(None);
         }
         let key = format!(
             "{}|{page}",
-            rules
+            patterns
                 .iter()
-                .map(|rule| rule.id())
+                .map(regex::Regex::as_str)
                 .collect::<Vec<_>>()
-                .join(",")
+                .join(crop::SEPARATOR)
         );
         if let Some(cached) = self.boxes.borrow().get(&key) {
             return Ok(*cached);
@@ -220,8 +224,7 @@ impl Core {
             &crop::page_spans(&loaded)?,
             &crop::page_drawings(&loaded)?,
             bounds,
-            &self.info.title,
-            rules,
+            patterns,
         );
         self.boxes.borrow_mut().insert(key, box_);
         Ok(box_)

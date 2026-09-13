@@ -20,7 +20,6 @@
  * - a type-only import, which is gone by the time this runs.
  */
 
-import type { CropRuleId } from './core/types.ts';
 import type { RenderMode } from './viewer.ts';
 import type { ZoomMode } from './layout.ts';
 
@@ -38,7 +37,16 @@ export interface Place {
  */
 export interface Settings {
   zoom?: { level: number; mode: ZoomMode } | null;
-  crop?: { rules: CropRuleId[]; padding: number } | null;
+  /**
+   * The crop in force, as the expressions themselves.
+   *
+   * The expressions and not the rules that produced them: an expression is what
+   * a crop *is*, it is what the engine applies, and it is what a host that
+   * called `setCrop` directly has to be able to hand back. A reader's named
+   * rules live in their own store (`core/rules.ts`), so a rule renamed or
+   * rewritten is one store away from every document.
+   */
+  crop?: { patterns: string[]; padding: number } | null;
   bionic?: { on: boolean; dim: number } | null;
   outline?: boolean;
   /**

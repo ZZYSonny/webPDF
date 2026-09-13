@@ -105,7 +105,7 @@ test('a move keeps what the open said', () => {
 test('the settings a document was left with are the ones the next one starts with', () => {
   const settings: Settings = {
     zoom: { level: 1.5, mode: 'custom' },
-    crop: { rules: ['page-number'], padding: 6 },
+    crop: { patterns: ['^\\s*[0-9]+\\s*$'], padding: 6 },
     bionic: { on: true, dim: 0.4 },
     outline: false,
   };

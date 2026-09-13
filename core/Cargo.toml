@@ -30,6 +30,10 @@ miniz_oxide = "0.8"
 # Bionic reading: where a word's fixation points are, the way `text-vide` found
 # them for the TypeScript pipeline this replaces. See `src/bionic.rs`.
 bioneer = "0.1.1"
+# The crop rules are regular expressions: a reader's list of them is compiled and
+# matched against every text run on a page. Already in the tree through `bioneer`,
+# so naming it here costs no build time and no second copy of the engine.
+regex = "1"
 
 [profile.release]
 opt-level = 3

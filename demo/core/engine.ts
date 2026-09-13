@@ -26,8 +26,8 @@ import { cropBox, padBox } from './crop.ts';
 import {
   DocumentNotOpenError,
   PasswordRequiredError,
+  type CropPattern,
   type CropRect,
-  type CropRuleId,
   type DocumentInfo,
   type EngineOptions,
   type FontAsset,
@@ -291,23 +291,28 @@ export class PdfEngine implements PdfEngineLike {
   }
 
   /**
-   * The box this page's content occupies under `rules` - before any padding,
+   * The box this page's content occupies under `patterns` - before any padding,
    * which is a render-time matter and costs nothing to change.
    *
-   * The core keeps its own answer per page and rule set; this layer keeps the
+   * The core keeps its own answer per page and pattern set; this layer keeps the
    * promise in the cache so two callers in the same turn do not cross the
    * boundary twice.
    */
-  async measureCrop(index: number, rules: readonly CropRuleId[]): Promise<CropRect | null> {
+  async measureCrop(index: number, patterns: readonly CropPattern[]): Promise<CropRect | null> {
     if (this.id === null) throw new DocumentNotOpenError();
-    const wanted = [...rules].sort();
+    const wanted = [...patterns].sort();
     if (wanted.length === 0) return null;
-    const key = `${wanted.join(',')}|${index}`;
+    const key = `${wanted.join('\n')}|${index}`;
     const cached = this.boxCache.get(key);
     if (cached !== undefined) return cached;
     const box = cropBox(this.core.measureCrop(this.id, index, wanted));
     this.boxCache.set(key, box);
     return box;
+  }
+
+  /** Whether one expression compiles, as an error message or null. */
+  async checkCropPattern(pattern: string): Promise<string | null> {
+    return this.core.checkCropPattern(pattern);
   }
 
   /** The page's box, for a host that wants to crop it itself. */

@@ -42,8 +42,13 @@ export interface DocumentInfo {
   encrypted: boolean;
 }
 
-/** The id of a crop rule. A string, because ids arrive from a host or a URL. */
-export type CropRuleId = string;
+/**
+ * A crop rule as the viewer, the engine and the core see it: a regular
+ * expression, matched anywhere in a text run. The names, the descriptions and
+ * the reader's own rules are the host's (`demo/core/rules.ts`); what crosses the
+ * worker boundary is the expression alone.
+ */
+export type CropPattern = string;
 
 /** A rectangle in page units, with the page's own origin (points, y down). */
 export interface CropRect {
@@ -51,16 +56,6 @@ export interface CropRect {
   y: number;
   width: number;
   height: number;
-}
-
-/** One of the crop rules, as the core describes it. */
-export interface CropRule {
-  id: string;
-  label: string;
-  hint: string;
-  /** The test itself, as PaperCutter writes it, for the menu's second line. */
-  source: string;
-  needsTitle: boolean;
 }
 
 /** A rectangle in page coordinates: `[x0, y0, x1, y1]`. */
@@ -88,8 +83,8 @@ export interface RenderOptions {
   embedFonts?: boolean;
   /** Add a clickable hit area for every link annotation. */
   links?: boolean;
-  /** Crop the page to its content, minus these marks (see `crop.ts`). */
-  crop?: readonly CropRuleId[] | null;
+  /** Crop the page to its content, minus the runs these expressions match. */
+  crop?: readonly CropPattern[] | null;
   /** Page units to grow the crop by, on every side. */
   cropPadding?: number;
   /** Bionic reading: fade every word's tail back. */
@@ -187,11 +182,19 @@ export interface PdfEngineLike {
   open(source: PdfSource, password?: string): Promise<DocumentInfo>;
   renderPage(index: number, opts?: RenderOptions): Promise<RenderedPage>;
   /**
-   * The box a page would be cropped to under these rules, without rendering it.
-   * A viewer needs this ahead of the render, because the cropped size of every
-   * page is what its scroll layout is built from.
+   * The box a page would be cropped to under these patterns, without rendering
+   * it. A viewer needs this ahead of the render, because the cropped size of
+   * every page is what its scroll layout is built from.
    */
-  measureCrop?(index: number, rules: readonly CropRuleId[]): Promise<CropRect | null>;
+  measureCrop?(index: number, patterns: readonly CropPattern[]): Promise<CropRect | null>;
+  /**
+   * Whether one regular expression compiles, as an error message or null.
+   *
+   * The host asks before it lets a reader keep a rule they typed: the core's
+   * engine is the authority on what an expression means, so a pattern the core
+   * refuses is refused here too, with the core's own reason.
+   */
+  checkCropPattern?(pattern: string): Promise<string | null>;
   /** Write the open document out again, as a fresh PDF. */
   save?(): Promise<Uint8Array>;
   drainNewFonts(): FontAsset[];

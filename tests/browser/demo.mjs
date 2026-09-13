@@ -1097,8 +1097,14 @@ try {
         // Where the control lives: the instruction was "after the search".
         afterSearch: !!(search.compareDocumentPosition(button) & Node.DOCUMENT_POSITION_FOLLOWING),
         rows: items.map((el) => el.dataset.id),
-        // The star is a recommendation, not part of the rule's name.
+        // The star is a recommendation, not part of the rule's name, and the
+        // expression under the name is the whole of what a rule does.
         names: items.map((el) => (el.querySelector('.crop-name')?.textContent ?? '').replace('★', '')),
+        patterns: items.map((el) => el.querySelector('.crop-pattern')?.textContent ?? ''),
+        customRows: document.querySelectorAll('#crop-list .crop-remove').length,
+        addError: document.getElementById('crop-new-error').hidden
+          ? ''
+          : document.getElementById('crop-new-error').textContent,
         checked: items.filter((el) => el.getAttribute('aria-selected') === 'true').map((el) => el.dataset.id),
         disabledRows: items.filter((el) => el.getAttribute('aria-disabled') === 'true').map((el) => el.dataset.id),
         menuOpen: !document.getElementById('crop-menu').hidden,
@@ -1168,9 +1174,19 @@ try {
   console.log('before crop : ' + JSON.stringify({ page: start.page, viewBox: start.viewBox, box: [start.pageWidth, start.pageHeight], elements: start.elements }));
   if (!start.afterSearch) fail('the crop control should sit after the search box');
   if (start.rows.length < 6) fail(`the crop menu should list the rules, got ${JSON.stringify(start.rows)}`);
-  for (const name of ['arXiv stamp', 'Conference header', 'Page number', 'Section number', 'Chapter heading', 'PRIME AI watermark', 'Running title']) {
+  for (const name of ['arXiv stamp', 'Conference header', 'Page number', 'Section number', 'Chapter heading', 'Running title']) {
     if (!start.names.includes(name)) fail(`the crop menu is missing the rule named ${JSON.stringify(name)}`);
   }
+  // Every rule says what it does: the expression, and nothing about it. The
+  // watermark rule the reference script carried is deliberately not one of them.
+  if (start.names.includes('PRIME AI watermark')) fail('the crop menu still lists the PRIME AI rule');
+  for (const pattern of ['^arXiv:', '^Published as a conference paper at', '^\\s*[0-9]+\\s*$', '^[0-9]\\.[0-9]\\.', '^CHAPTER [0-9]\\.']) {
+    if (!start.patterns.includes(pattern)) {
+      fail(`no rule shows the expression ${JSON.stringify(pattern)}, got ${JSON.stringify(start.patterns)}`);
+    }
+  }
+  if (start.customRows) fail('the reader should have no custom rules to start with');
+  if (start.addError) fail(`the add form should show no error to start with, got ${JSON.stringify(start.addError)}`);
   // Nothing is selected, and nothing has happened to the document.
   if (start.checked.length) fail(`cropping should start with nothing selected, got ${JSON.stringify(start.checked)}`);
   if (!/shown whole/.test(start.status)) fail(`the menu should say the pages are untouched, got ${JSON.stringify(start.status)}`);
@@ -1409,6 +1425,66 @@ try {
     'the page to come back',
     60000,
   );
+
+  // A rule the reader types: the core checks the expression before it is kept,
+  // the rule crops like a built-in one, and the × on its row takes it away.
+  // Nothing is checked at this point, so the page is the whole page again.
+  console.log('— a rule the reader typed —');
+  /** Fill the add form and submit it, the way the reader's Enter key would. */
+  const submitRule = (name, pattern) =>
+    page.evaluate(`(() => {
+      document.getElementById('crop-new-name').value = ${JSON.stringify(name)};
+      document.getElementById('crop-new-pattern').value = ${JSON.stringify(pattern)};
+      document.getElementById('crop-add').requestSubmit();
+    })()`);
+
+  const beforeBad = await cropState();
+  await submitRule('Not a rule', '^(');
+  const refused = await waitUntil(
+    `(() => document.getElementById('crop-new-error').textContent || false)()`,
+    'the core to refuse the expression',
+    60000,
+  );
+  const afterBad = await cropState();
+  console.log('refused expression: ' + JSON.stringify(refused));
+  if (!/regular expression/i.test(refused)) fail(`a bad expression should be refused, got ${JSON.stringify(refused)}`);
+  if (afterBad.customRows !== beforeBad.customRows) fail('a refused expression should not become a rule');
+
+  await submitRule('My page number', '^\\s*[0-9]{1,3}\\s*$');
+  // The form is answered asynchronously - the core is asked whether the
+  // expression compiles - so the row is what says the rule was taken, and the
+  // status is what says the crop it started has settled.
+  await waitUntil(
+    `(() => {
+      const status = document.getElementById('crop-status').textContent;
+      const added = document.querySelectorAll('#crop-list .crop-remove').length;
+      return added > 0 && !status.startsWith('Cropping') ? true : false;
+    })()`,
+    'the reader’s rule to be added and applied',
+    60000,
+  );
+  const custom = await cropState();
+  console.log('custom rule : ' + JSON.stringify({ patterns: custom.patterns, customRows: custom.customRows, status: custom.status }));
+  if (!custom.names.includes('My page number')) fail('the rule the reader named should be in the list');
+  if (!custom.patterns.includes('^\\s*[0-9]{1,3}\\s*$')) fail('the rule should show the expression that was typed');
+  if (custom.customRows !== 1) fail(`the row should carry a remove mark, got ${custom.customRows}`);
+  if (custom.checked.join() !== 'custom-1') fail(`the new rule should be the checked one, got ${JSON.stringify(custom.checked)}`);
+
+  await page.evaluate(() => document.querySelector('#crop-list .crop-remove').click());
+  const backFromRule = await waitUntil(
+    `(() => {
+      const shown = document.getElementById('pageno').value;
+      const svg = window.__svgOfPage(shown);
+      return !!svg && (svg.getAttribute('viewBox') ?? '').startsWith('0 0 ');
+    })()`,
+    'the page to come back after the rule is removed',
+    60000,
+  );
+  const without = await cropState();
+  console.log('rule removed: ' + JSON.stringify({ names: without.names, customRows: without.customRows, viewBox: backFromRule }));
+  if (without.customRows) fail('the removed rule should be gone from the list');
+  if (without.checked.length) fail('removing the only checked rule should leave nothing checked');
+
   // Leave the dropdown as it was found, whatever left it open in between (a
   // click on a page closes it, and the toggle would then open it again).
   await page.evaluate(`(() => {

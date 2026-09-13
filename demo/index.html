@@ -155,6 +155,39 @@
                 <span class="crop-pad-hint">kept around the content</span>
               </div>
               <div id="crop-list" class="crop-list" role="listbox" aria-multiselectable="true" aria-label="Crop rules"></div>
+              <!--
+                A reader's own rules: a name, a regular expression, and the core's
+                verdict on it before anything is added (see demo/crop.ts). The
+                expression is what a rule *is*, so this is the whole of it.
+              -->
+              <form id="crop-add" class="crop-add" autocomplete="off">
+                <input
+                  id="crop-new-name"
+                  class="crop-new-name"
+                  type="text"
+                  placeholder="Name"
+                  aria-label="Name for a new rule"
+                  maxlength="48"
+                />
+                <input
+                  id="crop-new-pattern"
+                  class="crop-new-pattern mono"
+                  type="text"
+                  placeholder="^regular expression$"
+                  aria-label="Regular expression for a new rule"
+                  spellcheck="false"
+                  maxlength="200"
+                />
+                <button
+                  id="crop-add-btn"
+                  class="btn tiny"
+                  type="submit"
+                  title="Add this expression as a rule you can check"
+                >
+                  Add
+                </button>
+                <p id="crop-new-error" class="crop-new-error" role="alert" hidden></p>
+              </form>
             </div>
           </div>
         </div>

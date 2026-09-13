@@ -54,8 +54,8 @@
  */
 
 import type {
+  CropPattern,
   CropRect,
-  CropRuleId,
   DocumentInfo,
   FontAsset,
   FontPlanProgress,
@@ -66,7 +66,7 @@ import type {
 } from './core/types.ts';
 import { linkTargetOf, type LinkTarget } from './core/links.ts';
 import { debug as DEBUG } from './core/debug.ts';
-import { normaliseRules, padBox } from './core/crop.ts';
+import { normalisePatterns, padBox } from './core/crop.ts';
 import { BIONIC_DIM, bionicDim } from './core/bionic.ts';
 import {
   computeFitScale,
@@ -114,7 +114,7 @@ export type ViewerEvent =
    * whole document first - the boxes arrive a page at a time and the layout
    * follows them, which is what `running` reports the end of.
    */
-  | { type: 'crop-change'; rules: readonly CropRuleId[]; measured: number; total: number; running: boolean }
+  | { type: 'crop-change'; patterns: readonly CropPattern[]; measured: number; total: number; running: boolean }
   | { type: 'error'; error: unknown; page?: number }
   | { type: 'drop-accepted'; name: string }
   /**
@@ -351,8 +351,8 @@ export class PdfViewer {
    * have not changed yet.
    */
   private cropPlace: Place | null = null;
-  /** The rules in force, empty for no crop at all. */
-  private cropRules: CropRuleId[] = [];
+  /** The patterns in force, empty for no crop at all. */
+  private cropPatterns: CropPattern[] = [];
   /** Page units kept around the content box, on every side. */
   private padding = 0;
   /** Bionic reading: every word's first letters at full strength, the rest faded. */
@@ -515,7 +515,7 @@ export class PdfViewer {
     this.info = info;
     this.docSeq++;
     this.baseGeometry = info.pages.map((p) => ({ width: p.width, height: p.height }));
-    // A crop belongs to the document it was measured on; the rules are the
+    // A crop belongs to the document it was measured on; the patterns are the
     // reader's and stay, so a selection made on one paper applies to the next.
     this.cropEpoch++;
     this.cropBoxes = [];
@@ -547,7 +547,7 @@ export class PdfViewer {
     this.emitPlan();
     this.emitZoom();
     this.update();
-    if (this.cropRules.length > 0) this.measureCrop();
+    if (this.cropPatterns.length > 0) this.measureCrop();
   }
 
   /* --------------------------------------------------------- render mode */
@@ -815,9 +815,10 @@ export class PdfViewer {
   /* --------------------------------------------------------------- crop */
 
   /**
-   * Show every page cropped to its content, with the marks `rules` name left
-   * out of the box (see `core/crop.ts` - the rules are PaperCutter's). `null`
-   * or an empty list turns cropping off again, which is where a viewer starts.
+   * Show every page cropped to its content, with the runs the regular
+   * expressions `patterns` match left out of the box (see `core/crop.ts`).
+   * `null` or an empty list turns cropping off again, which is where a viewer
+   * starts.
    *
    * A crop changes the *size* of every page, so the scroll layout cannot be
    * built until the boxes are known - and knowing them means reading every page
@@ -827,10 +828,11 @@ export class PdfViewer {
    * progress; a second visit to the same selection is instant, because an
    * engine keeps what it measured.
    */
-  setCrop(rules: readonly CropRuleId[] | null, padding = 0): void {
-    const next = normaliseRules(rules);
+  setCrop(patterns: readonly CropPattern[] | null, padding = 0): void {
+    const next = normalisePatterns(patterns);
     const pad = Number.isFinite(padding) && padding > 0 ? padding : 0;
-    const sameRules = next.join(',') === this.cropRules.join(',');
+    // A newline joins them: any other separator could be part of an expression.
+    const sameRules = next.join('\n') === this.cropPatterns.join('\n');
     if (sameRules && Math.abs(pad - this.padding) < 1e-3) return;
     if (sameRules) {
       // Only the margin moved. Nothing has to be measured again - every page
@@ -845,7 +847,7 @@ export class PdfViewer {
       return;
     }
     this.padding = pad;
-    this.cropRules = next;
+    this.cropPatterns = next;
     // Whatever pass was running is now measuring for the wrong selection.
     this.cropEpoch++;
     this.cropRunning = false;
@@ -865,9 +867,21 @@ export class PdfViewer {
     this.measureCrop();
   }
 
-  /** The rules in force. Empty means the pages are shown whole. */
-  get crop(): readonly CropRuleId[] {
-    return this.cropRules;
+  /** The patterns in force. Empty means the pages are shown whole. */
+  get crop(): readonly CropPattern[] {
+    return this.cropPatterns;
+  }
+
+  /**
+   * Whether one regular expression compiles, as an error message or null.
+   *
+   * Passed straight through to the engine, which is where the core's own
+   * answer lives; the viewer is only the thing a host already has a handle on.
+   */
+  async checkCropPattern(pattern: string): Promise<string | null> {
+    const check = this.engine.checkCropPattern?.bind(this.engine);
+    if (!check) return null;
+    return check(pattern);
   }
 
   /** How far the measuring pass has got, for a host that shows progress. */
@@ -936,7 +950,7 @@ export class PdfViewer {
 
   private measureCrop(): void {
     const measure = this.engine.measureCrop?.bind(this.engine);
-    const rules = this.cropRules;
+    const patterns = this.cropPatterns;
     const epoch = ++this.cropEpoch;
     const count = this.baseGeometry.length;
     this.cropMeasured = 0;
@@ -956,7 +970,7 @@ export class PdfViewer {
         if (this.destroyed || epoch !== this.cropEpoch) return;
         let box: CropRect | null = null;
         try {
-          box = await measure(index, rules);
+          box = await measure(index, patterns);
         } catch (error) {
           // A page that cannot be read stays whole; the rest of the pass runs.
           DEBUG('measureCrop failed', index, String(error));
@@ -1088,7 +1102,7 @@ export class PdfViewer {
   private emitCrop(done: boolean): void {
     this.emit({
       type: 'crop-change',
-      rules: this.cropRules,
+      patterns: this.cropPatterns,
       measured: done ? this.geometry.length : this.cropMeasured,
       total: this.geometry.length,
       running: !done,
@@ -1232,7 +1246,7 @@ export class PdfViewer {
       responsive: false,
       idPrefix: `p${page - 1}-`,
       className: 'wpdf-page-svg',
-      crop: this.cropRules,
+      crop: this.cropPatterns,
       cropPadding: this.padding,
       bionic: this.bionicOn,
       bionicDim: this.bionicDimValue,
@@ -1759,7 +1773,7 @@ export class PdfViewer {
       idPrefix: `p${index}-`,
       responsive: true,
       className: 'wpdf-page-svg',
-      crop: this.cropRules,
+      crop: this.cropPatterns,
       cropPadding: this.padding,
       bionic: this.bionicOn,
       bionicDim: this.bionicDimValue,

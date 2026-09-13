@@ -49,13 +49,13 @@ const METHODS = [
   'open',
   'renderPage',
   'measureCrop',
+  'checkCropPattern',
   'save',
   'drainNewFonts',
   'planProgress',
   'plannedFonts',
   'planDone',
   'trimCaches',
-  'rules',
 ] as const;
 
 self.addEventListener('message', (event: MessageEvent) => {

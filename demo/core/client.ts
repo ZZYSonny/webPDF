@@ -11,8 +11,8 @@
  */
 
 import type {
+  CropPattern,
   CropRect,
-  CropRuleId,
   DocumentInfo,
   EngineOptions,
   FontAsset,
@@ -121,8 +121,8 @@ export class WorkerEngine implements PdfEngineLike {
     return this.call<RenderedPage>('renderPage', [index, opts]);
   }
 
-  async measureCrop(index: number, rules: readonly CropRuleId[]): Promise<CropRect | null> {
-    return this.call<CropRect | null>('measureCrop', [index, rules]);
+  async measureCrop(index: number, patterns: readonly CropPattern[]): Promise<CropRect | null> {
+    return this.call<CropRect | null>('measureCrop', [index, patterns]);
   }
 
   /** The open document, written out again by the engine that is holding it. */
@@ -130,9 +130,9 @@ export class WorkerEngine implements PdfEngineLike {
     return this.call<Uint8Array>('save', []);
   }
 
-  /** The crop rules the core knows, so a host can draw the menu from them. */
-  async rules(): Promise<unknown[]> {
-    return this.call<unknown[]>('rules', []);
+  /** Whether one expression compiles, as an error message or null. */
+  async checkCropPattern(pattern: string): Promise<string | null> {
+    return this.call<string | null>('checkCropPattern', [pattern]);
   }
 
   /** Nothing per-page: every page uses the document's plan. */

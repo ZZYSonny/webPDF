@@ -54,7 +54,7 @@ const EXPORTS = [
   '_wpdf_measure_crop',
   '_wpdf_links',
   '_wpdf_save',
-  '_wpdf_rules',
+  '_wpdf_crop_check',
   '_wpdf_out_ptr',
 ];
 

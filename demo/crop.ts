@@ -3,23 +3,29 @@
  *
  * Cropping a page to its content is the one thing in this reader that changes
  * what a document looks like, so it is opt-in twice over: it does nothing at
- * all until a rule is checked, and every rule can be switched on and off
- * individually. The rules are PaperCutter's (`core/src/crop.rs` names each one
- * after the line it came from, and `./core/rules.ts` here is the same list for
- * the panel to draw); what they remove is the *marks* - a publisher's
- * footer, an arXiv stamp, a bare page number - so that a box built from what
- * remains is the content and not the margins those marks needed.
+ * all until a pattern is checked, and every pattern can be switched on and off
+ * individually. A rule is a name and a regular expression (`core/rules.ts`),
+ * and the row says both: what a rule does is exactly the expression under it.
  *
  * The panel is a listbox of toggles rather than a set of checkboxes because it
  * lives in the same bar as the zoom menu and behaves like it: one dropdown open
  * at a time, arrow keys to move, Escape to leave. "Enable all" is the reference
  * script's own behaviour; "Disable all" is how a reader gets their page back.
+ * The reader's own expressions are added at the foot of the list and removed
+ * from the row itself, and they are kept for every document rather than this one
+ * - a rule a reader writes is a rule.
  */
 
-// The list the panel draws is the page's copy of the core's own: the ids and the
-// wording travel together, and the core answers for what each one measures.
-import { CROP_RULES } from './core/rules.ts';
-import type { CropRule, CropRuleId } from './core/types.ts';
+import {
+  CROP_RULES,
+  RECOMMENDED_RULE_ID,
+  expandPattern,
+  nextCustomId,
+  ruleUsable,
+  type CropRule,
+  type CropRuleId,
+} from './core/rules.ts';
+import { normalisePatterns } from './core/crop.ts';
 import { scrollIntoPanel } from './panels.ts';
 
 export interface CropMenuOptions {
@@ -35,8 +41,21 @@ export interface CropMenuOptions {
   noneButton: HTMLButtonElement;
   /** The padding field, in page units. */
   padding: HTMLInputElement;
-  /** The rules, or the padding, changed: apply both. */
-  onChange: (rules: CropRuleId[], padding: number) => void;
+  /** The form a reader adds their own rule through. */
+  add: {
+    form: HTMLFormElement;
+    name: HTMLInputElement;
+    pattern: HTMLInputElement;
+    error: HTMLElement;
+  };
+  /** The reader's own rules, as storage had them. */
+  customRules?: readonly CropRule[];
+  /** The reader's own rules changed: keep them. */
+  onCustomRules?: (rules: readonly CropRule[]) => void;
+  /** Ask the core whether a pattern compiles: an error message, or null. */
+  checkPattern: (pattern: string) => Promise<string | null>;
+  /** The selection, or the padding, changed: apply both. */
+  onChange: (patterns: string[], padding: number) => void;
 }
 
 /** The most padding the field will take: two inches is already all margin. */
@@ -49,14 +68,6 @@ const MAX_PADDING = 144;
  * trimmed page from looking cut off, and it is the value the panel starts on.
  */
 const DEFAULT_PADDING = 6;
-
-/**
- * The rule the panel stars: the one nearly every paper needs, and the one
- * PaperCutter's own defaults are about. The star is a recommendation, not a
- * state - the row starts unchecked like every other, because cropping is
- * opt-in (see the file header).
- */
-const RECOMMENDED: CropRuleId = 'page-number';
 
 export interface CropProgress {
   measured: number;
@@ -73,25 +84,38 @@ export interface CropMenu {
   setDocument(title: string): void;
   /** Measuring progress changed. */
   setProgress(state: CropProgress): void;
-  /** The selection, in rule order. */
-  rules(): CropRuleId[];
+  /** The checked expressions, in list order - what the engine applies. */
+  patterns(): string[];
   /** Check every rule, or none of them. */
   setAll(on: boolean): void;
   /**
-   * Put the panel back where a reader left it: exactly these rules, at this
-   * padding. A host restoring a document that was read before says what was in
-   * force rather than clicking rows, and the pages are re-cropped the same way
-   * checking them by hand would.
+   * Put the panel back where a reader left it: exactly these expressions, at
+   * this padding.
+   *
+   * A host restoring a document that was read before says what was in force
+   * rather than clicking rows, and the pages are re-cropped the same way
+   * checking them by hand would. An expression the menu has no named rule for -
+   * one a host set directly, or another document's title - is given a row of
+   * its own rather than dropped: it is what the pages are being cut to, and a
+   * reader is entitled to see it and remove it.
    */
-  setRules(rules: readonly CropRuleId[], padding: number): void;
+  setPatterns(patterns: readonly string[], padding: number): void;
   /** Page units kept around the content, as the field has it. */
   readonly padding: number;
   destroy(): void;
 }
 
 export function createCropMenu(opts: CropMenuOptions): CropMenu {
-  const { button, menu, list, status, allButton, noneButton, padding: padInput } = opts;
+  const { button, menu, list, status, allButton, noneButton, padding: padInput, add } = opts;
   const selected = new Set<CropRuleId>();
+  /** The reader's own rules, in the order they were added. */
+  const custom: CropRule[] = [...(opts.customRules ?? [])];
+  /**
+   * Rows for expressions that were restored and that no named rule explains:
+   * a pattern a host set directly, or another document's title. They last for
+   * this document's sitting and are not among the reader's own rules.
+   */
+  let adopted: CropRule[] = [];
   const rows = new Map<CropRuleId, HTMLButtonElement>();
   let cursor = 0;
   let padding = DEFAULT_PADDING;
@@ -99,21 +123,44 @@ export function createCropMenu(opts: CropMenuOptions): CropMenu {
   let progress: CropProgress = { measured: 0, total: 0, running: false };
   let destroyed = false;
 
-  /** The rows, in the order the rules are declared. */
-  const elements = (): HTMLButtonElement[] => CROP_RULES.map((rule) => rows.get(rule.id)).filter((el): el is HTMLButtonElement => !!el);
-
-  function usable(rule: CropRule): boolean {
-    return !rule.needsTitle || title !== '';
+  /** Every rule the menu draws: the built-in ones, the reader's, and any adopted. */
+  function allRules(): CropRule[] {
+    return [...CROP_RULES, ...custom, ...adopted];
   }
 
-  function buildRow(rule: CropRule): HTMLButtonElement {
+  /** The option buttons, in the order the rules are listed. */
+  const elements = (): HTMLButtonElement[] =>
+    allRules()
+      .map((rule) => rows.get(rule.id))
+      .filter((el): el is HTMLButtonElement => !!el);
+
+  function usable(rule: CropRule): boolean {
+    return ruleUsable(rule, title);
+  }
+
+  /** What the row prints under its name: the expression, with the title in it. */
+  function patternOf(rule: CropRule): string {
+    return expandPattern(rule, title);
+  }
+
+  /** What hovering a row says: the expression, and why it may be inert here. */
+  function tipFor(rule: CropRule): string {
+    let tip = patternOf(rule);
+    if (rule.id === RECOMMENDED_RULE_ID) tip += '\nThe rule most documents want';
+    if (!usable(rule)) tip += '\nthis document declares no title';
+    return tip;
+  }
+
+  function buildRow(rule: CropRule): HTMLElement {
+    const row = document.createElement('div');
+    row.className = 'crop-row';
+
     const el = document.createElement('button');
     el.type = 'button';
     el.className = 'crop-option';
     el.setAttribute('role', 'option');
     el.dataset.id = rule.id;
-    // The literal test, so what a rule does is never a guess.
-    el.title = `${rule.hint}\n${rule.source}`;
+    el.title = tipFor(rule);
 
     const check = document.createElement('span');
     check.className = 'crop-check';
@@ -124,18 +171,19 @@ export function createCropMenu(opts: CropMenuOptions): CropMenu {
     const name = document.createElement('span');
     name.className = 'crop-name';
     name.textContent = rule.label;
-    if (rule.id === RECOMMENDED) {
+    if (rule.id === RECOMMENDED_RULE_ID) {
       const star = document.createElement('span');
       star.className = 'star';
       star.setAttribute('aria-hidden', 'true');
       star.textContent = '★';
       name.appendChild(star);
-      el.title += '\nThe rule most documents want';
     }
-    const hint = document.createElement('span');
-    hint.className = 'crop-hint';
-    hint.textContent = rule.hint;
-    text.append(name, hint);
+    // The expression itself, and nothing about it: what a rule does is what it
+    // says, and the reader can read it off the row.
+    const pattern = document.createElement('span');
+    pattern.className = 'crop-pattern mono';
+    pattern.textContent = patternOf(rule);
+    text.append(name, pattern);
 
     el.append(check, text);
     el.addEventListener('click', () => {
@@ -144,14 +192,45 @@ export function createCropMenu(opts: CropMenuOptions): CropMenu {
     });
     el.addEventListener('keydown', onListKeyDown);
     rows.set(rule.id, el);
-    return el;
+    row.append(el);
+
+    if (rule.custom) {
+      const remove = document.createElement('button');
+      remove.type = 'button';
+      remove.className = 'crop-remove';
+      remove.textContent = '×';
+      remove.title = `Remove “${rule.label}”`;
+      remove.setAttribute('aria-label', `Remove the rule ${rule.label}`);
+      remove.addEventListener('click', (event) => {
+        event.stopPropagation();
+        removeRule(rule.id);
+      });
+      row.append(remove);
+    }
+    return row;
   }
 
-  list.replaceChildren(...CROP_RULES.map(buildRow));
+  /**
+   * Draw the list again from the rules there are now.
+   *
+   * A reader can add and remove rules while the panel is open, and a row carries
+   * its rule's name and expression in its own markup - so the list is rebuilt
+   * rather than patched. The selection is by id and survives it.
+   */
+  function rebuild(): void {
+    rows.clear();
+    list.replaceChildren(...allRules().map(buildRow));
+  }
+
+  rebuild();
 
   /* --------------------------------------------------------------- state */
 
   function toggleRule(id: CropRuleId): void {
+    const rule = allRules().find((each) => each.id === id);
+    // A rule that cannot apply is not a rule this document can check: toggling
+    // it would report a mark left out that was never going to be there.
+    if (!rule || !usable(rule)) return;
     if (selected.has(id)) selected.delete(id);
     else selected.add(id);
     render();
@@ -159,7 +238,7 @@ export function createCropMenu(opts: CropMenuOptions): CropMenu {
   }
 
   function emit(): void {
-    opts.onChange(selection(), padding);
+    opts.onChange(patterns(), padding);
   }
 
   /** What the field says, as a number: clamped, and never a NaN. */
@@ -179,20 +258,23 @@ export function createCropMenu(opts: CropMenuOptions): CropMenu {
     emit();
   }
 
-  function selection(): CropRuleId[] {
-    return CROP_RULES.filter((rule) => selected.has(rule.id)).map((rule) => rule.id);
+  /** The checked expressions, in list order, exactly as the core will read them. */
+  function patterns(): string[] {
+    return allRules()
+      .filter((rule) => usable(rule) && selected.has(rule.id))
+      .map((rule) => patternOf(rule));
   }
 
   /** Every rule that applies to this document is already checked. */
   function allSelected(): boolean {
-    return CROP_RULES.every((rule) => !usable(rule) || selected.has(rule.id));
+    return allRules().every((rule) => !usable(rule) || selected.has(rule.id));
   }
 
   function setAll(on: boolean): void {
     selected.clear();
     // Only rules that can apply: checking one that this document cannot use
     // would report a mark as left out that was never going to be there.
-    if (on) for (const rule of CROP_RULES) if (usable(rule)) selected.add(rule.id);
+    if (on) for (const rule of allRules()) if (usable(rule)) selected.add(rule.id);
     render();
     emit();
     // The panel stays open: the point of the button is to see the list change.
@@ -200,21 +282,123 @@ export function createCropMenu(opts: CropMenuOptions): CropMenu {
     if (first) scrollIntoPanel(first, list);
   }
 
+  function showError(message: string | null): void {
+    add.error.textContent = message ?? '';
+    add.error.hidden = !message;
+  }
+
+  /**
+   * Add a rule the reader typed, if the core will have it.
+   *
+   * The check is the core's and not this page's: the engine that applies a
+   * pattern is the only one that can say what a pattern is, and a JavaScript
+   * `RegExp` would answer about a different language. A refusal is shown beside
+   * the fields and nothing is added.
+   */
+  async function addRule(label: string, pattern: string): Promise<void> {
+    const expression = pattern.trim();
+    if (expression === '') {
+      showError('Type an expression first.');
+      add.pattern.focus();
+      return;
+    }
+    if (allRules().some((rule) => rule.pattern === expression)) {
+      showError('That expression is already a rule.');
+      return;
+    }
+    let refused: string | null = null;
+    try {
+      refused = await opts.checkPattern(expression);
+    } catch (error) {
+      refused = `the core could not check it: ${String(error)}`;
+    }
+    if (destroyed) return;
+    if (refused) {
+      showError(`Not a regular expression: ${refused}`);
+      add.pattern.focus();
+      return;
+    }
+    const name = label.trim() || expression;
+    const rule: CropRule = {
+      id: nextCustomId(allRules().map((each) => each.id)),
+      label: name,
+      pattern: expression,
+      custom: true,
+    };
+    custom.push(rule);
+    opts.onCustomRules?.(custom);
+    rebuild();
+    selected.add(rule.id);
+    add.name.value = '';
+    add.pattern.value = '';
+    showError(null);
+    render();
+    emit();
+    const el = rows.get(rule.id);
+    if (el) scrollIntoPanel(el, list);
+  }
+
+  function removeRule(id: CropRuleId): void {
+    const own = custom.findIndex((rule) => rule.id === id);
+    if (own >= 0) {
+      custom.splice(own, 1);
+      opts.onCustomRules?.(custom);
+    } else {
+      // An adopted expression is not one of the reader's own rules: it is this
+      // document's crop, and removing the row is how it is unchecked.
+      const at = adopted.findIndex((rule) => rule.id === id);
+      if (at < 0) return;
+      adopted.splice(at, 1);
+    }
+    selected.delete(id);
+    cursor = Math.min(cursor, Math.max(0, allRules().length - 1));
+    rebuild();
+    render();
+    emit();
+  }
+
   /* --------------------------------------------------------------- render */
 
-  function setRules(rules: readonly CropRuleId[], next: number): void {
+  /**
+   * Select the rules that produce these expressions, and give a row to the ones
+   * no rule explains.
+   *
+   * The expressions are what a crop *is*, so they are the currency of the memory
+   * as well as of the engine: an expression the menu can name is checked, and
+   * one it cannot is adopted.
+   */
+  function setPatterns(list: readonly string[], next: number): void {
+    const stored = normalisePatterns(list);
+    adopted = [];
     selected.clear();
-    for (const rule of CROP_RULES) if (rules.includes(rule.id)) selected.add(rule.id);
+    const named = new Set<string>();
+    for (const rule of [...CROP_RULES, ...custom]) {
+      const pattern = patternOf(rule);
+      if (stored.includes(pattern)) {
+        selected.add(rule.id);
+        named.add(pattern);
+      }
+    }
+    for (const pattern of stored) {
+      if (named.has(pattern)) continue;
+      adopted.push({
+        id: nextCustomId(allRules().map((rule) => rule.id)),
+        label: pattern,
+        pattern,
+        custom: true,
+      });
+    }
+    for (const rule of adopted) selected.add(rule.id);
     if (Number.isFinite(next)) padding = Math.min(MAX_PADDING, Math.max(0, next));
     padInput.value = String(padding);
+    rebuild();
     render();
     emit();
   }
 
   function render(): void {
-    const list_ = elements();
-    cursor = Math.min(cursor, Math.max(0, list_.length - 1));
-    for (const rule of CROP_RULES) {
+    cursor = Math.min(cursor, Math.max(0, elements().length - 1));
+    for (const rule of allRules()) {
       const el = rows.get(rule.id);
       if (!el) continue;
       const on = selected.has(rule.id);
@@ -223,10 +407,11 @@ export function createCropMenu(opts: CropMenuOptions): CropMenu {
       el.setAttribute('aria-disabled', String(!ok));
       el.classList.toggle('disabled', !ok);
       el.classList.toggle('active', elements()[cursor] === el);
-      const hint = el.querySelector('.crop-hint');
-      if (hint && rule.needsTitle) hint.textContent = ok ? rule.hint : 'this document declares no title';
+      const pattern = el.querySelector('.crop-pattern');
+      if (pattern) pattern.textContent = patternOf(rule);
+      el.title = tipFor(rule);
     }
-    const chosen = selection();
+    const chosen = patterns();
     // One bulk button at a time, and it always says what is left to do rather
     // than what was just done: "Enable all" is PaperCutter's own behaviour and
     // is offered until every rule that applies to this document is checked,
@@ -241,17 +426,17 @@ export function createCropMenu(opts: CropMenuOptions): CropMenu {
     button.setAttribute(
       'title',
       chosen.length
-        ? `Cropping pages to their content, leaving out ${chosen.length} kind${chosen.length === 1 ? '' : 's'} of mark`
-        : 'Trim each page to its content, leaving out the marks you check',
+        ? `Cropping pages to their content, leaving out what ${chosen.length} expression${chosen.length === 1 ? '' : 's'} match`
+        : 'Trim each page to its content, leaving out the runs your expressions match',
     );
-    status.textContent = describe();
+    status.textContent = describe(chosen.length);
   }
 
-  function describe(): string {
-    if (selected.size === 0) return 'Nothing checked — pages are shown whole.';
+  function describe(count: number): string {
+    if (count === 0) return 'Nothing checked — pages are shown whole.';
     const plus = padding > 0 ? `, +${padding} pt` : '';
     if (progress.running) return `Cropping… ${progress.measured}/${progress.total} pages`;
-    return `Cropped to content${plus}, minus ${selected.size} kind${selected.size === 1 ? '' : 's'} of mark.`;
+    return `Cropped to content${plus}, minus ${count} expression${count === 1 ? '' : 's'}.`;
   }
 
   function move(delta: number): void {
@@ -277,7 +462,7 @@ export function createCropMenu(opts: CropMenuOptions): CropMenu {
 
   function onListKeyDown(event: KeyboardEvent): void {
     const el = event.currentTarget as HTMLButtonElement;
-    const rule = CROP_RULES.find((r) => r.id === el.dataset.id);
+    const id = el.dataset.id;
     if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
       event.preventDefault();
       move(event.key === 'ArrowDown' ? 1 : -1);
@@ -285,9 +470,10 @@ export function createCropMenu(opts: CropMenuOptions): CropMenu {
       event.preventDefault();
       close();
       button.focus();
-    } else if ((event.key === ' ' || event.key === 'Enter') && rule) {
+    } else if (event.key === ' ' || event.key === 'Enter') {
+      if (!id) return;
       event.preventDefault();
-      toggleRule(rule.id);
+      toggleRule(id);
     } else if (event.key === 'a' && (event.ctrlKey || event.metaKey)) {
       event.preventDefault();
       setAll(true);
@@ -328,13 +514,20 @@ export function createCropMenu(opts: CropMenuOptions): CropMenu {
     }
   });
 
+  const onAddSubmit = (event: SubmitEvent): void => {
+    event.preventDefault();
+    void addRule(add.name.value, add.pattern.value);
+  };
+  add.form.addEventListener('submit', onAddSubmit);
+  add.pattern.addEventListener('input', () => showError(null));
+
   /* ----------------------------------------------------------------- open */
 
   function open(): void {
     if (destroyed) return;
     menu.hidden = false;
     button.setAttribute('aria-expanded', 'true');
-    cursor = Math.max(0, CROP_RULES.findIndex((rule) => selected.has(rule.id)));
+    cursor = Math.max(0, allRules().findIndex((rule) => selected.has(rule.id)));
     render();
     const first = elements()[cursor];
     if (first) scrollIntoPanel(first, list);
@@ -364,14 +557,15 @@ export function createCropMenu(opts: CropMenuOptions): CropMenu {
     },
     setProgress(state: CropProgress): void {
       progress = state;
-      status.textContent = describe();
+      status.textContent = describe(patterns().length);
     },
-    rules: selection,
+    patterns,
     setAll,
-    setRules,
+    setPatterns,
     destroy(): void {
       destroyed = true;
       button.removeEventListener('keydown', onButtonKeyDown);
+      add.form.removeEventListener('submit', onAddSubmit);
     },
   };
 }

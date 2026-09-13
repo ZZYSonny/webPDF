@@ -336,27 +336,35 @@ pub unsafe extern "C" fn wpdf_render(
     })
 }
 
-/// The box a page's content occupies under a rule set, or null for none.
+/// The box a page's content occupies under a list of patterns, or null for none.
+///
+/// The patterns arrive as the host joined them - see [`crop::SEPARATOR`] - and
+/// are compiled here: an expression that is not one is an ordinary failure, with
+/// the reason in the frame, and it is the host that decides what to say about it.
 ///
 /// # Safety
 ///
-/// `rules` must point at `rules_len` readable bytes for the length of the call.
+/// `patterns` must point at `patterns_len` readable bytes for the length of the
+/// call.
 #[no_mangle]
 pub unsafe extern "C" fn wpdf_measure_crop(
     id: u32,
     page: i32,
-    rules: *const u8,
-    rules_len: usize,
+    patterns: *const u8,
+    patterns_len: usize,
 ) -> i32 {
-    let list = match unsafe { text(rules, rules_len) } {
+    let list = match unsafe { text(patterns, patterns_len) } {
         Ok(list) => list,
+        Err(error) => return fail(error),
+    };
+    let compiled = match crop::compile(&crop::parse_patterns(&list)) {
+        Ok(compiled) => compiled,
         Err(error) => return fail(error),
     };
     call(|state| {
         let core = state.docs.get(&id).ok_or("no such document")?;
-        let rules = crop::parse_rules(&list);
         let box_ = core
-            .measure_crop(page, &rules)
+            .measure_crop(page, &compiled)
             .map_err(|error| error.to_string())?;
         let crop = match box_ {
             Some(box_) => box_.json(),
@@ -364,6 +372,34 @@ pub unsafe extern "C" fn wpdf_measure_crop(
         };
         Ok((format!("{{\"crop\":{crop}}}"), Vec::new()))
     })
+}
+
+/// Whether one regular expression compiles, as the menu's answer to a reader.
+///
+/// This is an ordinary frame either way - a pattern that does not compile is not
+/// a failed call - so that the host reads `ok` and `error` instead of catching
+/// something. It exists because a reader types an expression and should be told
+/// about a stray bracket before anything is measured, not after.
+///
+/// # Safety
+///
+/// `pattern` must point at `pattern_len` readable bytes for the length of the
+/// call.
+#[no_mangle]
+pub unsafe extern "C" fn wpdf_crop_check(pattern: *const u8, pattern_len: usize) -> i32 {
+    let pattern = match unsafe { text(pattern, pattern_len) } {
+        Ok(pattern) => pattern,
+        Err(error) => return fail(error),
+    };
+    match crop::compile(std::slice::from_ref(&pattern)) {
+        // `reason` and not `error`: a frame with an `error` in it is a *failed
+        // call* to the host, and a pattern that is not one is an ordinary answer.
+        Ok(_) => reply("{\"ok\":true,\"reason\":\"\"}", &[]),
+        Err(error) => reply(
+            &format!("{{\"ok\":false,\"reason\":{}}}", crate::json::quote(&error)),
+            &[],
+        ),
+    }
 }
 
 /// Every link annotation on a page, for a host that wants the data.
@@ -384,12 +420,6 @@ pub extern "C" fn wpdf_save(id: u32) -> i32 {
         let bytes = core.save().map_err(|error| error.to_string())?;
         Ok(("{}".to_string(), bytes))
     })
-}
-
-/// The crop rules, so a host can draw the menu without a second copy of them.
-#[no_mangle]
-pub extern "C" fn wpdf_rules() -> i32 {
-    call(|_| Ok((format!("{{\"rules\":{}}}", crop::rules_json()), Vec::new())))
 }
 
 /// Where the last answer's bytes are.
@@ -417,7 +447,7 @@ pub fn keep_exports() {
         wpdf_measure_crop as *const (),
         wpdf_links as *const (),
         wpdf_save as *const (),
-        wpdf_rules as *const (),
+        wpdf_crop_check as *const (),
         wpdf_out_ptr as *const (),
     ];
     std::hint::black_box(exports);
@@ -470,11 +500,21 @@ mod test {
     }
 
     #[test]
-    fn the_rules_are_the_ones_the_menu_offers() {
-        wpdf_rules();
+    fn a_pattern_is_checked_without_a_document() {
+        let good = b"^arXiv:";
+        // SAFETY: the slice is alive for the call.
+        unsafe { wpdf_crop_check(good.as_ptr(), good.len()) };
+        let (header, payload) = last();
+        assert_eq!(header, "{\"ok\":true,\"reason\":\"\"}");
+        assert!(payload.is_empty());
+
+        let bad = b"^(";
+        // SAFETY: as above.
+        unsafe { wpdf_crop_check(bad.as_ptr(), bad.len()) };
         let (header, _) = last();
-        assert!(header.contains("\"id\":\"arxiv\""));
-        assert!(header.contains("\"id\":\"title\""));
-        assert!(header.contains("\"needsTitle\":true"));
+        assert!(header.starts_with("{\"ok\":false"), "{header}");
+        // `reason`, not `error`: the host reads an `error` field as a failed call.
+        assert!(header.contains("\"reason\":\""), "{header}");
+        assert!(!header.contains("\"error\""), "{header}");
     }
 }

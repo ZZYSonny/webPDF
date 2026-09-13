@@ -486,10 +486,11 @@ body {
 
 /**
  * A dropdown like the zoom menu, but its rows are toggles rather than a choice,
- * so each one carries a check box and a line saying what it removes. Its face is
- * the crop mark, since the bar has no room to spell the word out and the mark is
- * what the thing is - and it lights up the way bionic reading's does, because
- * both of them are modes that change how a page is drawn.
+ * so each one carries a check box, the rule's name, and the expression it
+ * applies. Its face is the crop mark, since the bar has no room to spell the
+ * word out and the mark is what the thing is - and it lights up the way bionic
+ * reading's does, because both of them are modes that change how a page is
+ * drawn.
  */
 .crop-field {
   display: flex;
@@ -595,11 +596,22 @@ body {
   color: var(--text-muted);
 }
 
+/**
+ * One row of the list: the toggle, and - for a rule the reader wrote - the mark
+ * that takes it away again. The two are separate controls rather than one
+ * nested in the other, because a button inside a button is not a thing.
+ */
+.crop-row {
+  display: flex;
+  align-items: stretch;
+}
+
 .crop-option {
   display: flex;
   align-items: flex-start;
   gap: 8px;
-  width: 100%;
+  flex: 1;
+  min-width: 0;
   text-align: left;
   border: 0;
   background: none;
@@ -616,6 +628,25 @@ body {
 
 .crop-option.disabled {
   opacity: 0.5;
+}
+
+.crop-remove {
+  flex: none;
+  width: 22px;
+  margin: 4px 0;
+  border: 0;
+  background: none;
+  color: var(--text-muted);
+  font: inherit;
+  font-size: 14px;
+  line-height: 1;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.crop-remove:hover {
+  color: var(--text);
+  background: #262b36;
 }
 
 .crop-check {
@@ -656,10 +687,58 @@ body {
   font-weight: 600;
 }
 
-.crop-hint {
+/**
+ * The expression, and the whole of what a rule is: it wraps rather than
+ * truncating, because an expression cut off is an expression a reader cannot
+ * read back.
+ */
+.crop-pattern {
   font-size: 11px;
   color: var(--text-muted);
   white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+/* A reader's own rules: a name, an expression, and the core's verdict on it. */
+.crop-add {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 8px 8px 4px;
+  border-top: 1px solid var(--border);
+}
+
+.crop-new-name,
+.crop-new-pattern {
+  min-width: 0;
+  background: var(--bg-sunken);
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: var(--radius);
+  padding: 3px 6px;
+  font: inherit;
+  font-size: 12px;
+}
+
+.crop-new-name {
+  flex: 1 1 88px;
+}
+
+.crop-new-pattern {
+  flex: 1 1 130px;
+}
+
+.crop-new-name:focus,
+.crop-new-pattern:focus {
+  outline: 2px solid var(--accent);
+  outline-offset: -1px;
+}
+
+.crop-new-error {
+  flex: 1 0 100%;
+  margin: 0;
+  font-size: 11px;
+  color: #ffb4b4;
 }
 
 /* -------------------------------------------------------- bionic reading */

@@ -1,7 +1,7 @@
 /**
  * The host's half of cropping.
  *
- * The rules and the box they leave are the core's (`core/src/crop.rs`), and a
+ * The patterns and the box they leave are the core's (`core/src/crop.rs`), and a
  * crop reaches the page as a `viewBox` the core writes. What is left here is the
  * two things a *viewer* needs and the core has no opinion about:
  *
@@ -11,7 +11,7 @@
  *    therefore has to be changeable without measuring anything again.
  */
 
-import type { CropRect, CropRuleId } from './types.ts';
+import type { CropPattern, CropRect } from './types.ts';
 
 /** The core's crop answer, as JSON: `{x,y,width,height}` or null. */
 export function cropBox(raw: unknown): CropRect | null {
@@ -39,13 +39,19 @@ export function padBox(box: CropRect, padding: number, page?: CropRect): CropRec
 }
 
 /**
- * The selection a caller asked for: duplicates collapsed, order kept.
+ * The selection a caller asked for: blanks dropped, duplicates collapsed, order
+ * kept.
  *
  * `null` and `[]` both mean "crop nothing", which is the state a page opens in.
- * An id the core does not have is dropped there, and dropping it here as well
- * keeps one selection's cache key the same however it was spelled.
+ * A pattern the core cannot compile is the core's to refuse; this only keeps one
+ * selection's cache key the same however it was spelled.
  */
-export function normaliseRules(rules: readonly CropRuleId[] | null | undefined): CropRuleId[] {
-  if (!rules || rules.length === 0) return [];
-  return [...new Set(rules)];
+export function normalisePatterns(patterns: readonly CropPattern[] | null | undefined): CropPattern[] {
+  if (!patterns || patterns.length === 0) return [];
+  const kept: CropPattern[] = [];
+  for (const pattern of patterns) {
+    const trimmed = pattern.trim();
+    if (trimmed !== '' && !kept.includes(trimmed)) kept.push(trimmed);
+  }
+  return kept;
 }
