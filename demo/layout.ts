@@ -43,6 +43,7 @@ export class PageLayout {
   readonly height: number;
   readonly scale: number;
   private readonly opt: Required<LayoutOptions>;
+  private readonly rowStarts: number[] = [];
   private readonly rowTops: number[] = [];
   private readonly rowBottoms: number[] = [];
 
@@ -86,8 +87,9 @@ export class PageLayout {
         x += w + gap;
         i++;
       }
-      this.rowTops[rowStart] = y;
-      this.rowBottoms[rowStart] = y + rowHeight;
+      this.rowStarts.push(rowStart);
+      this.rowTops.push(y);
+      this.rowBottoms.push(y + rowHeight);
       y += rowHeight + gap;
     }
     this.height = Math.max(y - gap + padding, padding * 2);
@@ -96,21 +98,22 @@ export class PageLayout {
   /**
    * Pages intersecting the viewport, widened by `overscan` pixels.
    *
-   * Purely a scan over the precomputed boxes, so it stays cheap for very large
-   * documents.
+   * Locate the first intersecting row in logarithmic time, then inspect only
+   * rows in view. Row bounds also handle unequal page heights in facing mode.
    */
   visibleRange(scrollTop: number, viewportHeight: number, overscan = 0): Viewport {
     const top = scrollTop - overscan;
     const bottom = scrollTop + viewportHeight + overscan;
     let start = -1;
     let end = -1;
-    for (let i = 0; i < this.boxes.length; i++) {
-      const b = this.boxes[i];
-      if (b.top + b.height >= top && b.top <= bottom) {
-        if (start < 0) start = i;
-        end = i;
-      } else if (start >= 0 && b.top > bottom) {
-        break;
+    for (let row = this.rowAt(top); row < this.rowStarts.length && this.rowTops[row] <= bottom; row++) {
+      const limit = this.rowStarts[row + 1] ?? this.boxes.length;
+      for (let i = this.rowStarts[row]; i < limit; i++) {
+        const b = this.boxes[i];
+        if (b.top + b.height >= top && b.top <= bottom) {
+          if (start < 0) start = i;
+          end = i;
+        }
       }
     }
     if (start < 0) {
@@ -126,16 +129,32 @@ export class PageLayout {
     if (this.boxes.length === 0) return 0;
     let best = 0;
     let bestDistance = Infinity;
-    for (let i = 0; i < this.boxes.length; i++) {
+    const row = this.rowAt(y);
+    // In a gap, either adjacent row may be closer. In a spread, compare both
+    // pages because their vertical bounds may differ.
+    const first = this.rowStarts[Math.max(0, row - 1)];
+    const limit = this.rowStarts[row + 1] ?? this.boxes.length;
+    for (let i = first; i < limit; i++) {
       const b = this.boxes[i];
-      const d = y < b.top ? b.top - y : y > b.top + b.height ? y - (b.top + b.height) : 0;
+      const d = Math.max(b.top - y, y - b.top - b.height, 0);
       if (d < bestDistance) {
         bestDistance = d;
         best = i;
       }
-      if (b.top > y && bestDistance > 0) break;
     }
     return best;
+  }
+
+  /** First row ending at or below y; row count if y is past the document. */
+  private rowAt(y: number): number {
+    let lo = 0;
+    let hi = this.rowBottoms.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >>> 1;
+      if (this.rowBottoms[mid] < y) lo = mid + 1;
+      else hi = mid;
+    }
+    return lo;
   }
 
   /** The page that should be considered "current" for a given scroll offset. */

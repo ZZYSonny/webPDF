@@ -73,6 +73,7 @@ import {
   PageLayout,
   type LayoutOptions,
   type PageGeometry,
+  type PageBox,
   type Viewport,
   type ZoomMode,
 } from './layout.ts';
@@ -210,6 +211,8 @@ interface PageSlot {
    * goes in under it rather than over it (`swapInDocument`).
    */
   stale: boolean;
+  /** Box identity changes when layout is rebuilt; scrolling needs no style writes. */
+  positionedBox?: PageBox;
 }
 
 interface QueueEntry {
@@ -333,6 +336,7 @@ export class PdfViewer {
   /** When the view last moved: what tells a scroll in flight from a pause. */
   private lastMoveAt = 0;
   private lastOffset = -1;
+  private scrollDirection = 1;
   private settleTimer = 0;
   private flushFrame = 0;
   /** The window the engine was last told to keep; it is only told when it moves. */
@@ -534,6 +538,7 @@ export class PdfViewer {
     this.watchPlan();
     this.window = new Map();
     this.lastOffset = -1;
+    this.scrollDirection = 1;
     this.trimKey = '';
     // A newly opened document starts at the level the `zoom` option asks for,
     // whatever the previous document was left at - and the mode has to say so, or
@@ -1324,7 +1329,8 @@ export class PdfViewer {
 
   private positionSlot(slot: PageSlot): void {
     const box = this.layout.boxes[slot.index];
-    if (!box) return;
+    if (!box || slot.positionedBox === box) return;
+    slot.positionedBox = box;
     const s = slot.el.style;
     s.left = `${box.left}px`;
     s.top = `${box.top}px`;
@@ -1393,6 +1399,14 @@ export class PdfViewer {
   private tick(): void {
     if (this.destroyed || !this.info) return;
     const offset = this.scrollOffset();
+    // Mark movement before deciding which DOM work is safe this frame.
+    if (offset !== this.lastOffset) {
+      if (this.lastOffset !== -1) this.scrollDirection = offset > this.lastOffset ? 1 : -1;
+      this.lastOffset = offset;
+      this.lastMoveAt = performance.now();
+      clearTimeout(this.settleTimer);
+      this.settleTimer = 0;
+    }
     const viewportHeight = window.innerHeight || 1;
     const visible = this.layout.visibleRange(offset, viewportHeight, 0);
     // The window reaches a whole viewport past the viewport unless the host says
@@ -1412,15 +1426,20 @@ export class PdfViewer {
       // On screen goes first; otherwise the page that will be reached soonest
       // is the one worth having ready.
       const distance = i < visible.start ? visible.start - i : i > visible.end ? i - visible.end : 0;
-      wanted.set(i, distance);
+      const ahead = this.scrollDirection > 0 ? i > visible.end : i < visible.start;
+      wanted.set(i, distance === 0 ? 0 : distance * 2 + (ahead ? 0 : 1));
     }
     this.window = wanted;
+    // A jump or reversal invalidates queued work, but an active render may finish.
+    const prepared = new Set(this.aheadIndices());
+    this.queue.splice(0, this.queue.length, ...this.queue.filter((entry) => wanted.has(entry.index) || prepared.has(entry.index)));
+    for (const entry of this.queue) entry.priority = wanted.get(entry.index) ?? WARM_PRIORITY;
 
     // A page prepared past the window stays in the document once it is there:
     // installing it is what `installAhead` does at rest, and removing it on the
     // next tick would throw that work away.
     const held = new Set<number>();
-    for (let i = last + 1; i <= last + this.opt.prepareAhead && i < this.geometry.length; i++) {
+    for (const i of prepared) {
       if (this.slots.has(i)) held.add(i);
     }
     for (const index of [...this.slots.keys()]) {
@@ -1429,7 +1448,6 @@ export class PdfViewer {
 
     for (const [index, priority] of wanted) {
       const slot = this.ensureSlot(index);
-      this.positionSlot(slot);
       // Nothing is drawn while the pages are waiting for the plan, but the page
       // boxes are laid out and scrolling already works: what arrives when the
       // plan is ready is the drawing, not the document. A page whose picture is
@@ -1457,15 +1475,6 @@ export class PdfViewer {
       this.currentPage = page;
       this.emit({ type: 'page-change', page, pageCount: this.geometry.length });
     }
-    // A tick that finds the view somewhere new is the reader moving. This is
-    // what "scrolling" means below: not a `scroll` event, but the view having
-    // actually moved within the last `SETTLE_MS`.
-    if (offset !== this.lastOffset) {
-      this.lastOffset = offset;
-      this.lastMoveAt = performance.now();
-      clearTimeout(this.settleTimer);
-      this.settleTimer = 0;
-    }
     this.pump();
     this.scheduleFlush();
   }
@@ -1479,16 +1488,17 @@ export class PdfViewer {
 
   /**
    * Whether a page has to be on screen whatever else is going on: it is in the
-   * viewport, or next to it. A page this close is looked at within a flick, so
-   * it goes in the moment it is ready - a frame's work is better than a blank
-   * page - while everything further out waits for the scroll to stop.
+   * viewport, or next in the scroll direction. These pages get the next
+   * available insertion frame; everything further out waits for scrolling to
+   * stop.
    */
   private aboutToBeSeen(index: number): boolean {
-    return index >= this.visible.start - 1 && index <= this.visible.end + 1;
+    return index >= this.visible.start - (this.scrollDirection < 0 ? 1 : 0)
+      && index <= this.visible.end + (this.scrollDirection > 0 ? 1 : 0);
   }
 
   /**
-   * Put a rendered page on screen, now if the moment is right and later if not.
+   * Schedule a rendered page for insertion in an animation frame.
    * A page outside the window keeps its faces staged, which the next quiet
    * moment registers: that is what makes the page free when it is reached.
    */
@@ -1499,11 +1509,8 @@ export class PdfViewer {
       return;
     }
     if (slot.state === 'done' && !slot.stale) return;
-    if (!this.scrolling() || this.aboutToBeSeen(index)) this.insert(slot, index);
-    else {
-      slot.state = 'pending';
-      this.scheduleFlush();
-    }
+    slot.state = 'pending';
+    this.scheduleFlush();
   }
 
   /**
@@ -1601,37 +1608,32 @@ export class PdfViewer {
   }
 
   /**
-   * The quiet moment: put in whatever the reader has stopped in front of, and
-   * prepare what is coming. One page per frame, because each one is a parse and
-   * a paint of a whole page - being idle is not a reason to drop frames.
+   * Insert at most one page per animation frame, prioritising visible pages.
+   * During scrolling only nearby pages go in; at rest prepare the wider window
+   * and what comes next. A single SVG parse is indivisible and can still be slow.
    */
   private flush(): void {
     if (this.destroyed || this.waiting) return;
-    if (this.scrolling()) {
-      this.scheduleFlush();
-      return;
-    }
+    const moving = this.scrolling();
     // Any face built since the last write goes in now, all of them at once:
     // registering a face costs a layout of every text run in the document
     // however many rules arrive together, so they may as well arrive together.
-    this.releaseFonts();
+    if (!moving) this.releaseFonts();
 
-    const waiting = this.waitingPages();
+    const waiting = this.waitingPages().filter((index) => !moving || this.aboutToBeSeen(index));
     if (waiting.length > 0) {
       const index = waiting[0];
       const slot = this.slots.get(index);
       if (slot) this.insert(slot, index);
-      this.flushFrame = requestAnimationFrame(() => {
-        this.flushFrame = 0;
-        this.flush();
-      });
+      this.scheduleFlush();
+      return;
+    }
+    if (moving) {
+      this.scheduleFlush();
       return;
     }
     if (this.installAhead()) {
-      this.flushFrame = requestAnimationFrame(() => {
-        this.flushFrame = 0;
-        this.flush();
-      });
+      this.scheduleFlush();
       return;
     }
     this.warmAhead();
@@ -1652,18 +1654,42 @@ export class PdfViewer {
   }
 
   private scheduleFlush(): void {
-    if (this.settleTimer || this.destroyed) return;
-    this.settleTimer = window.setTimeout(() => {
+    if (this.destroyed || this.flushFrame || this.waiting) return;
+    const urgent = this.waitingPages().some((index) => this.aboutToBeSeen(index));
+    if (!this.scrolling() || urgent) {
+      clearTimeout(this.settleTimer);
       this.settleTimer = 0;
-      this.flush();
-    }, SETTLE_MS);
+      this.flushFrame = requestAnimationFrame(() => {
+        // Consume a pending scroll read before inserting SVG. Doing this in the
+        // opposite order forces layout and can insert a page we just left.
+        if (this.frameRequest) {
+          cancelAnimationFrame(this.frameRequest);
+          this.frameRequest = 0;
+          this.tick();
+        }
+        this.flushFrame = 0;
+        this.flush();
+      });
+    } else if (!this.settleTimer) {
+      this.settleTimer = window.setTimeout(() => {
+        this.settleTimer = 0;
+        this.scheduleFlush();
+      }, Math.max(1, SETTLE_MS - (performance.now() - this.lastMoveAt)));
+    }
   }
 
-  /** The last page index the window reaches, or -1 before a document is open. */
-  private lastWindowIndex(): number {
-    let last = -1;
-    for (const index of this.window.keys()) last = Math.max(last, index);
-    return last;
+  /** Bounded preparation beyond the window, in the reader's current direction. */
+  private aheadIndices(): number[] {
+    if (!this.window.size) return [];
+    const indices = [...this.window.keys()];
+    const edge = this.scrollDirection > 0 ? Math.max(...indices) : Math.min(...indices);
+    const out: number[] = [];
+    for (let n = 1; n <= this.opt.prepareAhead; n++) {
+      const index = edge + n * this.scrollDirection;
+      if (index < 0 || index >= this.geometry.length) break;
+      out.push(index);
+    }
+    return out;
   }
 
   /**
@@ -1680,8 +1706,7 @@ export class PdfViewer {
    */
   private installAhead(): boolean {
     if (this.opt.prepareAhead <= 0) return false;
-    const last = this.lastWindowIndex();
-    for (let i = last + 1; i <= last + this.opt.prepareAhead && i < this.geometry.length; i++) {
+    for (const i of this.aheadIndices()) {
       const slot = this.slots.get(i);
       if (slot?.state === 'done' && !slot?.stale) continue;
       const page = this.results.get(i);
@@ -1704,9 +1729,7 @@ export class PdfViewer {
    */
   private warmAhead(): void {
     if (this.queue.length > 0 || this.inFlight.size > 0) return;
-    const last = this.lastWindowIndex();
-    if (last < 0) return;
-    for (let i = last + 1; i <= last + this.opt.prepareAhead && i < this.geometry.length; i++) {
+    for (const i of this.aheadIndices()) {
       if (this.results.has(i)) continue;
       this.enqueue(i, WARM_PRIORITY);
     }
@@ -1727,12 +1750,12 @@ export class PdfViewer {
   private enqueue(index: number, priority: number): void {
     const slot = this.slots.get(index);
     if (slot && slot.state === 'done' && !slot.stale) return;
-    // An index is asked for once: a second ask raises its priority and moves it
+    // An index is asked for once: a second ask refreshes its priority and moves it
     // to the current generation, which is what makes re-asking after an
     // invalidation work rather than being swallowed by the stale entry.
     const existing = this.queue.find((entry) => entry.index === index);
     if (existing) {
-      existing.priority = Math.min(existing.priority, priority);
+      existing.priority = priority;
       existing.generation = this.generationOf(index);
       return;
     }
