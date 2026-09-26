@@ -954,7 +954,7 @@ interface FontProbe {
    * putting one in the document costs a frame - and registering the fonts it
    * brings costs a layout of every page already rendered. So a page that is
    * ready but not being looked at waits for the scroll to stop; a page the
-   * reader is looking at (or one page away from it) goes in regardless, because
+   * reader is looking at goes in regardless, because
    * a blank page is worse than a dropped frame.
    */
   console.log('— a scroll defers what is not being looked at —');
@@ -985,9 +985,10 @@ interface FontProbe {
           if (window.__pageSvg(el)) continue;
           const page = Number(el.dataset.page);
           const r = el.getBoundingClientRect();
-          // Looking at it, or one page away from it, which is where the haste
-          // rule applies.
-          const looked = r.bottom >= -r.height && r.top <= innerHeight + r.height;
+          // The current scheduler prepares ahead in the scroll direction and
+          // may defer a page behind us. Only an actual viewport intersection
+          // means the reader is looking at a blank page.
+          const looked = r.bottom > 0 && r.top < innerHeight;
           if (prepared.has(page)) waiting.push({ page, looked });
         }
         return waiting;

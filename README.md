@@ -556,11 +556,28 @@ npm run build          the wasm, then the demo, into dist/demo
 npm run typecheck      tsc over demo/, ext/, scripts/ and tests/
 npm test               the node tests: the memory, the zoom box, the crop
                        rules, the crx
-npm run test:core      cargo test: 37 unit tests over crop, links, info, the
+npm run test:wasm      generated input, rendering and graphics-feature tests
+                       against built WASM; no PDF downloads needed
+npm run test:fast      typecheck + Node + WASM + short browser regressions
+                       (built WASM and Chromium required; no corpus downloads)
+npm run test:complete  typecheck + Node + Rust + fonts + complete corpus
+                       and browser checks; downloads missing corpus PDFs
+npm run test:corpus    sampled corpus checks; -- --complete checks every page
+npm run bench:core     warmed render medians/maxima over sampled corpus pages
+npm run test:fonts     build the native dump probe and compare font outlines
+npm run test:dev       short browser regressions against Vite dev
+npm run test:core      cargo test: 40 unit tests over crop, links, info, the
                        JSON writer and the bridge's framing
 npm run test:browser   every browser suite (see below)
 npm run verify         the three of them
 ```
+
+Use `test:fast` during development and `test:complete` for the wider regression
+pass. The complete pass includes both rendering modes, longer scroll/crop loops,
+font loading across the corpus, pixel checks, and the existing browser suites.
+Cold native builds can take minutes. Timing measurements are reported without
+fixed FPS gates. The [scratch review](tests/review/scratch.md) records every
+script's disposition and the limits of the new coverage.
 
 Everything here is TypeScript, including the scripts and the tests, and Node
 runs them by stripping the types rather than compiling them — which is what the
@@ -587,6 +604,11 @@ serves the demo, and drives all of it in Chromium over CDP:
 | suite | what it drives |
 | --- | --- |
 | `tests/core/wasm.ts` | the wasm bridge's exports, driven from Node in a second — open, plan, stylesheet, render, crop, links, save, close |
+| `tests/core/input.test.ts` | malformed input returns an error without trapping; existing documents survive and new documents still render, using generated PDF data |
+| `tests/core/render.test.ts`, `tests/core/features.test.ts` | bionic geometry, font payloads, save/reopen, concurrent planning, and sixteen generated graphics cases |
+| `tests/core/corpus.ts` | every corpus page: rendering invariants, font parsing, crop/links, save/reopen; optional warmed render timings |
+| `regressions.ts` | document switching, real font loading, restoration order, crop/revisit races and scrolling measurements |
+| `ink.ts` | bionic fading changes darkness while preserving the positions of painted marks |
 | `demo.ts` | the whole application: the card, the bar at every width, the outline, the search, crop, bionic, links, Ctrl+S, Ctrl+P — and the screenshot in this README |
 | `modes.ts` | the two render modes: what is drawn while the plan is walking, that no page frame is ever made, and that the handover is invisible |
 | `pinch.ts` | the zoom contract, and that the browser's own pinch does no layout work |

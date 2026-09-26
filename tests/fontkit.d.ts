@@ -4,7 +4,7 @@ declare module 'fontkit' {
     id: number;
     name: string;
     advanceWidth: number;
-    path: { commands: unknown[]; toSVG(): string };
+    path: { commands: Array<{ command: string; args: number[] }>; toSVG(): string };
   }
   export interface LayoutRun {
     glyphs: Glyph[];
@@ -17,6 +17,7 @@ declare module 'fontkit' {
     postscriptName: string;
     characterSet: number[];
     glyphForCodePoint(code: number): Glyph;
+    getGlyph(id: number): Glyph;
     /** Shape a string, applying the named OpenType features (or the defaults). */
     layout(text: string, features?: string[]): LayoutRun;
   }

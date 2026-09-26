@@ -17,9 +17,16 @@
     "typecheck": "tsc --noEmit",
     "pdfs": "node tests/pdf-cache.ts",
     "test": "node --test tests/*.test.ts",
+    "test:wasm": "node --test tests/core/*.test.ts",
     "test:core": "if [ -d .rustup ]; then export RUSTUP_HOME=\"$PWD/.rustup\"; fi; if [ -d .cargo ]; then export CARGO_HOME=\"$PWD/.cargo\"; fi; cargo test --manifest-path core/Cargo.toml",
     "test:browser": "node tests/browser/all.ts",
-    "verify": "npm run typecheck && npm test && npm run test:browser"
+    "verify": "npm run typecheck && npm test && npm run test:browser",
+    "test:fast": "npm run typecheck && npm test && node tests/browser/all.ts --essential",
+    "test:complete": "npm run typecheck && npm test && npm run test:core && node tests/core/fonts.ts --complete && npm run test:browser && npm run test:dev",
+    "test:corpus": "node tests/core/corpus.ts",
+    "bench:core": "node tests/core/corpus.ts --benchmark",
+    "test:fonts": "node tests/core/fonts.ts",
+    "test:dev": "node tests/browser/all.ts --dev"
   },
   "engines": {
     "node": ">=22.18"

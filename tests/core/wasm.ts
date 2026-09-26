@@ -126,7 +126,7 @@ const check = (label: string, ok: boolean, detail = '') => {
 };
 
 const bytes = new Uint8Array(await readFile(pdf));
-const { ptr, size } = put('application/pdf');
+const ptr = m._malloc(Math.max(bytes.length, 1));
 m.HEAPU8.set(bytes, ptr);
 const opened = frame(m._wpdf_open(ptr, bytes.length), 'open');
 m._free(ptr);

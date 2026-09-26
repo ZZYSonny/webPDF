@@ -300,17 +300,25 @@ async function connect(wsUrl: string, tab: Tab | null = null, { domains = true }
       return () => listeners.delete(listener);
     },
     async goto(url: string, { timeout = 60000 }: { timeout?: number } = {}) {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      let onLoad: ((msg: any) => void) | undefined;
       const done = new Promise<void>((resolve) => {
-        const l = (msg: any) => {
+        onLoad = (msg: any) => {
           if (msg.method === 'Page.loadEventFired') {
-            listeners.delete(l);
             resolve();
           }
         };
-        listeners.add(l);
+        listeners.add(onLoad);
       });
-      await send('Page.navigate', { url });
-      await Promise.race([done, sleep(timeout)]);
+      try {
+        await send('Page.navigate', { url });
+        await Promise.race([done, new Promise<void>((resolve) => { timer = setTimeout(resolve, timeout); })]);
+      } finally {
+        // A successful navigation must not keep a short test alive for the
+        // unused 60-second deadline, or leave a listener after a timeout.
+        clearTimeout(timer);
+        if (onLoad) listeners.delete(onLoad);
+      }
     },
     async waitFor<T>(
       predicate: () => T,

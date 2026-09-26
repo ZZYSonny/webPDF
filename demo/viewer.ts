@@ -378,6 +378,7 @@ export class PdfViewer {
   private readonly homeZoom: number | 'fit-width' | 'fit-page';
   private seq = 0;
   private frameRequest = 0;
+  private initialRenderPending = false;
   private zoomFrame = 0;
   private destroyed = false;
   private currentPage = 1;
@@ -516,6 +517,9 @@ export class PdfViewer {
   }
 
   setDocument(info: DocumentInfo): void {
+    // The host restores zoom and position after load resolves. Do not start
+    // rendering the temporary page-one window before that restoration runs.
+    this.initialRenderPending = true;
     this.info = info;
     this.docSeq++;
     this.baseGeometry = info.pages.map((p) => ({ width: p.width, height: p.height }));
@@ -553,6 +557,7 @@ export class PdfViewer {
     this.emitZoom();
     this.update();
     if (this.cropPatterns.length > 0) this.measureCrop();
+    this.onScroll();
   }
 
   /* --------------------------------------------------------- render mode */
@@ -1342,6 +1347,7 @@ export class PdfViewer {
     if (this.frameRequest) return;
     this.frameRequest = requestAnimationFrame(() => {
       this.frameRequest = 0;
+      this.initialRenderPending = false;
       this.tick();
     });
   };
@@ -1665,6 +1671,7 @@ export class PdfViewer {
         if (this.frameRequest) {
           cancelAnimationFrame(this.frameRequest);
           this.frameRequest = 0;
+          this.initialRenderPending = false;
           this.tick();
         }
         this.flushFrame = 0;
@@ -1767,7 +1774,7 @@ export class PdfViewer {
   }
 
   private pump(): void {
-    if (this.destroyed || this.waiting) return;
+    if (this.destroyed || this.waiting || this.initialRenderPending) return;
     while (this.inFlight.size < this.opt.concurrency && this.queue.length > 0) {
       this.queue.sort((a, b) => a.priority - b.priority || a.seq - b.seq);
       const entry = this.queue.shift();
