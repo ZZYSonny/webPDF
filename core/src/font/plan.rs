@@ -134,8 +134,13 @@ struct Entry {
     /// Every gid the document drew from this font, codes or not.
     seen: HashSet<u32>,
     advances: HashMap<u32, f32>,
-    /// code -> gid. The last writer wins, as the per-page pipeline had it.
-    by_code: OrderedMap<u32, u32>,
+    /// Every (code, gid) the pages drew, in the order they were met.
+    ///
+    /// A code is not a key to one glyph: a document can draw the `f` of a word
+    /// and its `fi` ligature with the same code (`f` is what pdfTeX writes for
+    /// the ligature), and a plain code -> gid map would keep only the last of
+    /// them and give the others a private-use code of their own.
+    by_code: OrderedMap<(u32, u32), ()>,
     /// gid -> every code it was drawn for, in the order they were met.
     codes_by_gid: OrderedMap<u32, Vec<u32>>,
     /// gid -> the letters a ligature glyph stands for.
@@ -293,8 +298,9 @@ impl Plan {
         out
     }
 
-    /// Every entry, as (name, drawn gids, outlines, coded glyphs, has a face).
-    /// For diagnosing what a document's fonts became.
+    /// Every entry, as (name, drawn gids, outlines, drawn code-glyph pairs, gids
+    /// with codes, ligature-named gids, coded gids). For diagnosing what a
+    /// document's fonts became.
     pub fn debug_entries(&self) -> Vec<(String, usize, usize, usize, usize, usize, usize)> {
         self.entries
             .iter()
@@ -472,7 +478,7 @@ impl Plan {
             // keeps both directions, because the cmap is built one way and the
             // letters are looked up the other.
             for (gid, code) in font.codes.iter() {
-                slot.by_code.set(*code, *gid);
+                slot.by_code.set((*code, *gid), ());
                 let codes = slot.codes_by_gid.entry_default(*gid);
                 if !codes.contains(code) {
                     codes.push(*code);
@@ -640,7 +646,7 @@ impl Plan {
         // list named it with: `fi` arrives as `f` from a document that names a
         // ligature after its first letter, and a font that took that `f` would
         // take it away from the real `f`.
-        let by_code: Vec<(u32, u32)> = entry.by_code.iter().map(|(c, g)| (*c, *g)).collect();
+        let by_code: Vec<(u32, u32)> = entry.by_code.iter().map(|(&(c, g), _)| (c, g)).collect();
         for (code, gid) in by_code {
             if !entry.outlines.contains_key(&gid)
                 || entry.letters.contains_key(&gid)
@@ -1156,4 +1162,64 @@ impl NativeDevice for Collector {
     ) {
     }
     fn end_mask(&mut self, _f: &Function) {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A code belongs to a glyph, not the other way round: two glyphs can be
+    /// drawn for one code - the `f` of a word and the `fi` ligature a document
+    /// writes as `f` - and each keeps a character a reader can type. The letter
+    /// keeps its letter; a private-use code here would put a character that is
+    /// not a letter into the page's text, and bionic reading counts a word's
+    /// letters.
+    #[test]
+    fn a_letter_and_a_ligature_drawn_for_one_code_keep_their_own() {
+        let f = b'f' as u32;
+        let ligature = 0xfb01;
+        let mut plan = Plan::new();
+        let mut by_code: OrderedMap<(u32, u32), ()> = OrderedMap::new();
+        by_code.set((f, 28), ());
+        by_code.set((f, 49), ());
+        let mut codes_by_gid = OrderedMap::new();
+        codes_by_gid.set(28, vec![f]);
+        codes_by_gid.set(49, vec![f]);
+        let mut letters = OrderedMap::new();
+        letters.set(49, "fi".to_string());
+        plan.entries.push(Entry {
+            key: "test".into(),
+            name: "test".into(),
+            program: None,
+            outlines: HashMap::from([
+                (28, Some(vec![Cmd::Move(0.0, 0.0), Cmd::Line(0.4, 0.7)])),
+                (49, Some(vec![Cmd::Move(0.0, 0.0), Cmd::Line(0.9, 0.7)])),
+            ]),
+            seen: HashSet::from([28, 49]),
+            advances: HashMap::from([(28, 0.3f32), (49, 0.6f32)]),
+            by_code,
+            codes_by_gid,
+            letters,
+            code_of: HashMap::new(),
+            blank: HashSet::new(),
+            letters_of: HashMap::new(),
+            face: None,
+            signature: String::new(),
+        });
+
+        plan.compile(0);
+
+        let entry = &plan.entries[0];
+        assert_eq!(entry.code_of.get(&28), Some(&f), "the letter keeps its letter");
+        assert_eq!(
+            entry.code_of.get(&49),
+            Some(&ligature),
+            "the ligature keeps Unicode's character for it"
+        );
+        assert!(
+            !entry.code_of.values().any(|code| (0xe000..=0xf8ff).contains(code)),
+            "no glyph should fall back to a private-use code: {:?}",
+            entry.code_of
+        );
+    }
 }
