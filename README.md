@@ -494,8 +494,16 @@ and a viewer that can no longer serve the extension says so instead of sitting o
 a tab that never draws. The extension stores no memory of the reader; where they
 were is the viewer's own storage.
 
-`npm run build:extension` builds it, `node scripts/build-extension.ts` stages
-`dist/ext/webpdf` and signs a `.crx`.
+`npm run build:extension` is the Chrome Web Store build: it stages
+`dist/ext/webpdf` and writes `dist/ext/webpdf-<version>.zip`, with no manifest
+`key` (the store rejects one and assigns the id itself), and checks the
+132-character `description` limit. Upload that zip.
+
+`npm run build:extension:crx` builds the self-hosted form instead, into
+`dist/ext-crx`: the manifest carries the public half of the signing key and the
+zip is signed into a `.crx`. Keep the private key (`ext/key.pem`, or
+`$WEBPDF_EXT_KEY` in the environment) out of the repository; the public key is
+not a secret. A crx is not accepted by the Chrome Web Store.
 
 ---
 
@@ -638,6 +646,7 @@ serves the demo, and drives all of it in Chromium over CDP:
 
 `npm run build:pages` builds the demo and drops the `.nojekyll` GitHub Pages
 wants; the published site is `dist/demo`, and the extension points at it.
+`npm run build:extension` writes the store zip CI uploads with it.
 
 ---
 

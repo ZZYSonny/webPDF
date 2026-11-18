@@ -8,9 +8,10 @@
  * at it with `--remote` instead of at github.io, so what runs here is the
  * published arrangement - a viewer fetched over the network, framed cross-origin
  * by an extension page - with nothing about the network in the way. `dir` is the
- * build output the extension was staged into (`dist/ext` by default):
- * `dir/webpdf` is the extension and `dir/webpdf-<version>.crx` the artifact CI
- * uploads.
+ * build output the extension was staged into (`dist/ext-crx` by default, the
+ * `--crx` build): `dir/webpdf` is the extension, `dir/webpdf-<version>.zip` the
+ * archive it was packed from, and `dir/webpdf-<version>.crx` the signed,
+ * self-hosted artifact.
  *
  * The frame is a different site from the extension page, so under site isolation
  * it is a target of its own: everything asked of the viewer goes over CDP rather
@@ -43,10 +44,10 @@
  *                  bridge is versioned: a viewer that still serves this
  *                  extension's revision draws the document, and one that does
  *                  not is reported to the reader rather than left blank
- *   the artifact   the crx CI uploads is signed the way Chrome signs one: this
- *                  file packs the same directory with Chromium's own
- *                  `--pack-extension` and checks that the reader here accepts it,
- *                  and that both name the same extension id
+ *   the artifact   the crx the `--crx` build writes is signed the way Chrome
+ *                  signs one: this file packs the same directory with Chromium's
+ *                  own `--pack-extension` and checks that the reader here accepts
+ *                  it, and that both name the same extension id
  */
 
 import { execFileSync } from 'node:child_process';
@@ -64,7 +65,7 @@ import type { PdfViewer } from '../../demo/viewer.ts';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const url = process.argv[2] ?? 'http://127.0.0.1:5178/';
-const dir = path.resolve(process.argv[3] ?? path.join(here, '..', '..', 'dist/ext'));
+const dir = path.resolve(process.argv[3] ?? path.join(here, '..', '..', 'dist/ext-crx'));
 const extensionDir = path.join(dir, 'webpdf');
 
 /** The paper every part of this file is written against, from the cache. */
@@ -157,7 +158,7 @@ async function withExtension(
   { where = extensionDir, expectApp = url }: { where?: string; expectApp?: string | null } = {},
 ): Promise<{ browser: Browser; id: string; workerId: string; viewer: string }> {
   if (!fs.existsSync(path.join(where, 'manifest.json'))) {
-    throw new Error(`${where} is not built — run \`npm run build:extension\` first`);
+    throw new Error(`${where} is not built — run \`npm run build:extension:crx\` first`);
   }
   // Which viewer this build frames is a build-time answer, and the only one the
   // test cannot choose for itself: the rest of the flow is the same either way.
@@ -789,13 +790,13 @@ try {
 
   /* ------------------------------------------------------- the artifact */
 
-  // What CI uploads: the crx has to be signed the way Chrome signs one. The
-  // strongest check available is Chromium's own packer - if the reader here
+  // The signed, self-hosted artifact has to be signed the way Chrome signs one.
+  // The strongest check available is Chromium's own packer - if the reader here
   // accepts the file Chrome wrote, then the file this repository writes is in
   // Chrome's format and not merely in its own.
   const crxFile = path.join(dir, `webpdf-${version}.crx`);
   if (!fs.existsSync(crxFile)) {
-    check('the crx CI uploads exists', false, crxFile);
+    check('the crx build\'s artifact exists', false, crxFile);
   } else {
     const ours = verifyCrx(fs.readFileSync(crxFile));
     check('the crx is signed over its own contents', ours.ok === true, crxFile);

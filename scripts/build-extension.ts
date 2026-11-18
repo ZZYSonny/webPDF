@@ -10,20 +10,34 @@
  * one file saying which viewer this build points at.
  *
  *   node scripts/build-extension.ts [--out DIR] [--remote URL] [--key FILE]
- *                                    [--no-zip] [--no-crx]
+ *                                    [--no-zip] [--crx]
  *
  * What it writes, in `--out` (default `dist/ext`):
  *
  *   webpdf/                 the extension itself, as `Load unpacked` wants it
- *   webpdf-<version>.zip    that directory, zipped
- *   webpdf-<version>.crx    the same zip behind a signed CRX3 header - what an
- *                           installer wants, and what CI uploads
+ *   webpdf-<version>.zip    that directory, zipped - the Chrome Web Store
+ *                           package, with no `key` in its manifest
+ *
+ * With `--crx` it also writes:
+ *
+ *   webpdf-<version>.crx    the same zip behind a signed CRX3 header, for
+ *                           self-hosting; the manifest then carries the public
+ *                           key, so the staged directory and the crx are the
+ *                           same extension to the browser
  *
  * The key is read from `--key`, from `$WEBPDF_EXT_KEY` (a path or the PEM itself),
- * or from `ext/key.pem`, which is gitignored and made on the first build; with
- * none of those, a key is made for this build alone and the extension id changes
- * with it - see `scripts/crx.ts`. The id is the reader's addresses: the browser
- * files remembered positions under it, so keep the key if they are to survive.
+ * or from `ext/key.pem`, which is gitignored and made on the first crx build;
+ * with none of those, a key is made for this build alone and the extension id
+ * changes with it - see `scripts/crx.ts`. The id is the reader's addresses: the
+ * browser files remembered positions under it, so keep the key if they are to
+ * survive.
+ *
+ * The default is the store build. Chrome's uploader rejects both a manifest
+ * `key` and a `.crx`, and assigns the extension id itself, so the default reads
+ * no key and signs nothing. The `description` limit (132 characters) is checked
+ * on every build, because a store rejection is the only place it would surface.
+ * `npm run build:extension` is that build; `npm run build:extension:crx` is the
+ * signed one, into `dist/ext-crx`, for a self-hosted install.
  *
  * `--remote` is what makes the build testable: point it at a local server and the
  * assembled extension is the same one, framed by the same page, with nothing
@@ -71,7 +85,10 @@ const into = path.join(outDir, 'webpdf');
 /** The viewer this build frames: the published site, or whatever `--remote` says. */
 const app = new URL(String(option('remote', PUBLISHED))).href;
 const zipping = !flag('no-zip');
-const packing = !flag('no-crx');
+// The store is the default: no manifest key and no crx. `--crx` opts into the
+// signed, self-hosted form, whose manifest carries the public key.
+const packing = flag('crx') && !flag('no-crx');
+const store = !packing;
 
 /* ----------------------------------------------------------------- helpers */
 
@@ -212,8 +229,9 @@ if (!fs.existsSync(path.join(build, 'background.js')) || !fs.existsSync(path.joi
 /* ----------------------------------------------------------------- staging */
 
 const keyFile = path.join(root, 'ext/key.pem');
-// `--key` first, then the environment, then the gitignored file the first build
-// left behind; `signingKey` makes one for this build alone when all are absent.
+// `--key` first, then the environment, then the gitignored file the first crx
+// build left behind; `signingKey` makes one for this build alone when all are
+// absent. The store build reads none of them: it has nothing to sign.
 const namedKey = option('key');
 const key = packing
   ? signingKey(
@@ -236,36 +254,56 @@ fs.mkdirSync(path.join(into, 'icons'), { recursive: true });
 copy(path.join(root, 'demo/icon.png'), path.join(into, 'icons/icon.png'));
 
 // The manifest: the repository's own, with the version from the package, so
-// there is one place to change it, and the public half of the signing key, so
-// that the unpacked directory and the crx packed from it are the *same
-// extension* to the browser - the same id, and therefore the same memory.
+// there is one place to change it. A `--crx` build also carries the public half
+// of the signing key, so the unpacked directory and the crx packed from it are
+// the *same extension* to the browser - the same id, and therefore the same
+// memory. The store build leaves the key out: the Chrome Web Store rejects it
+// and assigns the id itself.
 const manifest = {
   ...JSON.parse(fs.readFileSync(path.join(root, 'ext/manifest.json'), 'utf8')),
   version: pkg.version,
 };
 if (key) manifest.key = createPublicKey(key.privateKey).export({ type: 'spki', format: 'der' }).toString('base64');
+
+// The store's own limits, checked here rather than at the end of an upload: a
+// description one character over is a rejected package, not a warning.
+const description = String(manifest.description ?? '');
+if (description.length > 132) {
+  console.error(`build-extension: manifest description is ${description.length} characters — the Chrome Web Store allows 132`);
+  process.exit(2);
+}
+if (store && 'key' in manifest) {
+  console.error('build-extension: a store build must not carry a manifest key');
+  process.exit(2);
+}
 fs.writeFileSync(path.join(into, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`);
 
 // Which viewer to frame. Read by the extension page at start-up; `--remote`
 // changes nothing else about the build.
 fs.writeFileSync(path.join(into, 'viewer.json'), `${JSON.stringify({ app, version: pkg.version }, null, 2)}\n`);
 
-/* ---------------------------------------------------------------- the crx */
+/* -------------------------------------------------------------- the archive */
 
 const staged = filesIn(into);
 const bytes = staged.reduce((total, file) => total + fs.statSync(file.full).size, 0);
 const archive = path.join(outDir, `webpdf-${pkg.version}.zip`);
+const crxFile = path.join(outDir, `webpdf-${pkg.version}.crx`);
 let zipped = 0;
 if (zipping || packing) {
   fs.rmSync(archive, { force: true });
   zipped = zipDirectory(into, archive);
 }
+// A store build signs nothing, so a crx left by an earlier `--crx` build in the
+// same directory would be a different extension with the same version: remove it
+// rather than leave it beside the zip as if it belonged to it.
+if (!packing) fs.rmSync(crxFile, { force: true });
+
 // A crx is that same zip with a signed header in front of it, so the archive is
 // written either way and removed again when nobody asked to keep it.
 let crx: { file: string; id: string } | null = null;
 if (packing && key) {
   const packed = packCrx(fs.readFileSync(archive), key.privateKey);
-  crx = { file: path.join(outDir, `webpdf-${pkg.version}.crx`), id: packed.extensionId };
+  crx = { file: crxFile, id: packed.extensionId };
   fs.writeFileSync(crx.file, packed.crx);
   if (!zipping) fs.rmSync(archive, { force: true });
 }
@@ -278,6 +316,7 @@ log(`viewer   ${app}`);
 log(`contents ${staged.length} files, ${(bytes / 1024).toFixed(1)} KB`);
 if (zipping) log(`archive  ${path.relative(root, archive)} (${zipped} entries)`);
 if (crx) log(`crx      ${path.relative(root, crx.file)} — extension id ${crx.id}`);
+if (store) log('store    no manifest key and no crx — upload the zip, not a crx');
 log(`load     chrome://extensions → Developer mode → Load unpacked → ${path.relative(root, into)}`);
 if (key?.source === 'made for this build') {
   log('this id is this build’s alone — keep the next build the same extension with $WEBPDF_EXT_KEY or ext/key.pem');

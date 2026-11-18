@@ -30,18 +30,15 @@
 # build to ship, and the PDF cache the tests use is not consulted here at all.
 #
 # The extension is built here too, and it is a *build*: the job produces the
-# signed `.crx` and uploads it as an artifact. Nothing is released and nothing is
-# published to the Chrome Web Store - the artifact is the deliverable, and anyone
-# who wants the extension takes it from the run.
+# Chrome Web Store zip and uploads it as an artifact. Nothing is released and
+# nothing is published to the Chrome Web Store - the zip is the deliverable, and
+# the store takes it from the run. No signing key is involved: the store rejects
+# a manifest `key` and a `.crx`, and signs the upload itself.
 #
 # One job for both, because they are two halves of the same thing: the extension
 # frames the site this job publishes, so a run that ships a viewer and an
 # extension that cannot draw with it is worse than a run that ships neither, and
 # a failure in either build stops the deploy rather than publishing half of it.
-# Set the `WEBPDF_EXT_KEY` secret to a PEM private key to keep the extension id
-# stable from one run to the next (and therefore the reader's remembered
-# positions with it); without it each run generates a key, prints the id it
-# produced, and produces an extension the browser sees as a new one.
 
 name: Build
 
@@ -104,20 +101,15 @@ jobs:
       # there, rather than publishing a viewer with no core behind it.
       - run: npm run build:pages
       # The extension, from the same commit as the site it frames: compile the
-      # worker and the viewer page, then stage and sign the package - a staged
-      # dist/ext/webpdf, a .zip beside it, and the .crx that is uploaded.
+      # worker and the viewer page, then stage the store package - a staged
+      # dist/ext/webpdf and the .zip beside it, with no manifest key and no crx.
       - run: npm run build:extension
-        env:
-          # Empty when the secret is not set, which the build reads as "make one
-          # for this run" - the id it produced is printed in the log either way.
-          WEBPDF_EXT_KEY: ${{ secrets.WEBPDF_EXT_KEY }}
       - uses: actions/upload-artifact@v5
         with:
           name: webpdf-extension
-          # The crx is the artifact: it is the signed, installable extension. The
-          # staged directory and the zip stay on the runner (a zip of a crx is not
-          # what a browser installs).
-          path: dist/ext/*.crx
+          # The zip is the artifact: it is what the Chrome Web Store accepts.
+          # The staged directory stays on the runner.
+          path: dist/ext/*.zip
           if-no-files-found: error
           retention-days: 14
       - uses: actions/upload-pages-artifact@v5

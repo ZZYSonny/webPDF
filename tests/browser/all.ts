@@ -76,11 +76,12 @@ if (!dev) {
 
 // The extension too: it is pointed at this server rather than at github.io, so
 // that what is tested is the same extension with the same handover, the same
-// cross-origin frame and no network in the way.
+// cross-origin frame and no network in the way. The `--crx` build is the one
+// used because the suite also checks the signed artifact.
 if (!essential) {
   console.log('› building the extension');
   await run([vite, 'build', '--config', 'vite.ext.config.ts']);
-  await run([path.join(root, 'scripts/build-extension.ts'), '--out', 'dist/ext', '--remote', url]);
+  await run([path.join(root, 'scripts/build-extension.ts'), '--crx', '--out', 'dist/ext-crx', '--remote', url]);
 }
 
 console.log(`› serving on ${url}`);
@@ -127,7 +128,7 @@ try {
     await run([path.join(here, 'pwa.ts'), url], { stdio: 'inherit' });
 
     console.log('\n› the extension, loaded in a browser');
-    await run([path.join(here, 'extension.ts'), url], { stdio: 'inherit' });
+    await run([path.join(here, 'extension.ts'), url, path.join(root, 'dist/ext-crx')], { stdio: 'inherit' });
   }
 } catch (err) {
   failed = true;

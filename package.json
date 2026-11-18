@@ -13,6 +13,8 @@
     "build:demo": "vite build --config vite.demo.config.ts",
     "build:pages": "npm run build && node scripts/no-jekyll.ts dist/demo",
     "build:extension": "vite build --config vite.ext.config.ts && node scripts/build-extension.ts",
+    "build:extension:store": "npm run build:extension",
+    "build:extension:crx": "vite build --config vite.ext.config.ts && node scripts/build-extension.ts --crx --out dist/ext-crx",
     "preview": "vite preview --config vite.demo.config.ts",
     "typecheck": "tsc --noEmit",
     "pdfs": "node tests/pdf-cache.ts",
