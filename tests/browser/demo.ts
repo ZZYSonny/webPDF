@@ -1831,6 +1831,7 @@ interface FontProbe {
   /** What the bionic menu offers, which row is chosen, and which is starred. */
   interface BionicMenu {
     rows: string[];
+    headings: string[];
     star: string;
     chosen: string[];
   }
@@ -1843,6 +1844,7 @@ interface FontProbe {
       const name = (el) => el.querySelector('.menu-name').textContent.replace('★', '').trim();
       return {
         rows: rows.map(name),
+        headings: [...document.querySelectorAll('#bionic-menu .menu-heading')].map((el) => el.textContent.trim()),
         star: name(rows.find((el) => el.querySelector('.star')) ?? rows[0]),
         chosen: rows.filter((el) => el.getAttribute('aria-selected') === 'true').map(name),
       };
@@ -1860,6 +1862,7 @@ interface FontProbe {
     face: string;
     on: boolean;
     dim: number;
+    scope: string;
     viewBox: string | null;
     texts: number;
     chars: number;
@@ -1910,6 +1913,7 @@ interface FontProbe {
         face: button.textContent.trim(),
         on: window.webpdf.viewer().bionic,
         dim: window.webpdf.viewer().bionicDim,
+        scope: window.webpdf.viewer().bionicScope,
         viewBox: svg ? svg.getAttribute('viewBox') : null,
         texts: texts.length,
         chars: all.length,
@@ -1946,13 +1950,22 @@ interface FontProbe {
   if (!/^B/.test(plainText.face)) fail(`the bionic control should be its own letter, got ${JSON.stringify(plainText.face)}`);
   if (plainText.on !== false || plainText.face !== 'B▾') fail(`bionic reading should start off, got ${JSON.stringify({ on: plainText.on, face: plainText.face })}`);
   // The menu of values, before anything is faded: off is what is in force, and
-  // the star is on the default fade.
+  // the star is on the default fade. The word scopes are a second group below
+  // the fades, and the dictionary is the one in force.
   const beforeMenu = await bionicMenu();
   console.log('bionic menu: ' + JSON.stringify(beforeMenu));
   if (beforeMenu.rows[0] !== 'Off' || !beforeMenu.rows.some((r) => /^Fade the rest to \d+%$/.test(r))) {
     fail(`the bionic menu should offer off and a set of fades, got ${JSON.stringify(beforeMenu.rows)}`);
   }
-  if (beforeMenu.chosen.join() !== 'Off') fail(`nothing is faded yet, so "Off" is the value in force, got ${JSON.stringify(beforeMenu.chosen)}`);
+  const wordScopes = ['Common words only', 'Skip short words', 'All words'];
+  if (!wordScopes.every((row) => beforeMenu.rows.includes(row))) {
+    fail(`the bionic menu should offer the three word scopes, got ${JSON.stringify(beforeMenu.rows)}`);
+  }
+  if (beforeMenu.rows.indexOf('Common words only') < beforeMenu.rows.indexOf('Fade the rest to 70%')) {
+    fail(`the word scopes should be a group of their own, after the fades, got ${JSON.stringify(beforeMenu.rows)}`);
+  }
+  if (beforeMenu.headings.join() !== 'Words to mark') fail(`the word scopes should have a heading of their own, got ${JSON.stringify(beforeMenu.headings)}`);
+  if (beforeMenu.chosen.join() !== 'Off,Common words only') fail(`nothing is faded yet, so "Off" is the mode in force and the dictionary is the scope, got ${JSON.stringify(beforeMenu.chosen)}`);
   if (beforeMenu.star !== 'Fade the rest to 50%') fail(`the default fade should be starred, got ${JSON.stringify(beforeMenu.star)}`);
   if (plainText.faded) fail(`nothing should be faded before it is asked for (${plainText.faded} runs)`);
   // The words, which is what bionic reading needs and what a reader copies.
@@ -1998,7 +2011,7 @@ interface FontProbe {
   if (Math.abs(fainter.dim - 0.3) > 1e-9) fail(`choosing 30% should set the fade to 0.3, got ${fainter.dim}`);
   if (Math.abs(Number(fainter.opacity) - 0.3) > 0.02) fail(`the faded text should be drawn at 0.3, got ${fainter.opacity}`);
   if (fainterMenu.star !== 'Fade the rest to 30%') fail(`the star should have moved to 30%, got ${JSON.stringify(fainterMenu.star)}`);
-  if (fainterMenu.chosen.join() !== 'Fade the rest to 30%') fail(`30% should be the value in force, got ${JSON.stringify(fainterMenu.chosen)}`);
+  if (fainterMenu.chosen.join() !== 'Fade the rest to 30%,Common words only') fail(`30% should be the fade in force, got ${JSON.stringify(fainterMenu.chosen)}`);
   if (fainter.chars !== marked.chars || JSON.stringify(fainter.starts) !== JSON.stringify(marked.starts)) {
     fail('changing the fade changed the text or moved a character');
   }
@@ -2023,6 +2036,82 @@ interface FontProbe {
   if (JSON.stringify(marked.starts) !== JSON.stringify(plainText.starts)) {
     fail('bionic reading moved a character');
   }
+
+  /**
+   * The word scopes are a second setting, not another strength: the same page,
+   * the same fade, and a different set of words marked. The dictionary is the
+   * default because a formula's identifiers and numbers are words to the
+   * segmenter and not to a reader; `All words` is what bionic reading did
+   * before there was a choice.
+   */
+  console.log('— the word scope is configurable —');
+
+  /** How many tspans of the page in front of the reader are faded. */
+  const fadedOnScreen = (): Promise<number> =>
+    page.evaluate<number>(`(() => {
+      const svg = window.__svgOfPage(1);
+      return svg ? svg.querySelectorAll('tspan[fill-opacity]').length : 0;
+    })()`);
+
+  /**
+   * Wait for the page to be redrawn under `scope`. The setting is taken at once,
+   * so the count of faded tspans changing is what says the renderer caught up.
+   */
+  const waitForScope = async (scope: string, before: number): Promise<number> => {
+    await waitUntil(`window.webpdf.viewer().bionicScope === ${JSON.stringify(scope)}`, `the ${scope} scope`);
+    return waitUntil<number>(
+      `(() => {
+        const svg = window.__svgOfPage(1);
+        const faded = svg ? svg.querySelectorAll('tspan[fill-opacity]').length : 0;
+        return faded > 0 && faded !== ${before} ? faded : false;
+      })()`,
+      `the ${scope} render`,
+      60000,
+    );
+  };
+
+  /** The text and every position, which no scope may change. */
+  const samePage = (state: BionicState): boolean =>
+    state.chars === plainText.chars &&
+    state.texts === plainText.texts &&
+    JSON.stringify(state.starts) === JSON.stringify(plainText.starts);
+
+  await chooseBionic('All words');
+  const allFaded = await waitForScope('all', marked.faded);
+  const allWords = await bionicState();
+  console.log('bionic all : ' + JSON.stringify({ scope: allWords.scope, faded: allFaded }));
+  if (allWords.scope !== 'all') fail(`choosing "All words" should set the scope, got ${JSON.stringify(allWords.scope)}`);
+  if (!(allFaded > marked.faded)) {
+    fail(`marking every word should fade more of the page than the dictionary does (${marked.faded} -> ${allFaded})`);
+  }
+  if (!samePage(allWords)) fail('marking every word changed the text or moved a character');
+  const allMenu = await bionicMenu();
+  if (allMenu.chosen.join() !== 'Fade the rest to 50%,All words') fail(`the menu should show "All words" in force, got ${JSON.stringify(allMenu.chosen)}`);
+
+  await chooseBionic('Skip short words');
+  const shortFaded = await waitForScope('short', allFaded);
+  const shortWords = await bionicState();
+  console.log('bionic short: ' + JSON.stringify({ scope: shortWords.scope, faded: shortFaded }));
+  if (shortWords.scope !== 'short') fail(`choosing "Skip short words" should set the scope, got ${JSON.stringify(shortWords.scope)}`);
+  if (!(shortFaded < allFaded)) {
+    fail(`skipping short words should fade less of the page than marking them (${allFaded} -> ${shortFaded})`);
+  }
+  if (!samePage(shortWords)) fail('skipping short words changed the text or moved a character');
+  const shortMenu = await bionicMenu();
+  if (shortMenu.chosen.join() !== 'Fade the rest to 50%,Skip short words') fail(`the menu should show "Skip short words" in force, got ${JSON.stringify(shortMenu.chosen)}`);
+
+  await chooseBionic('Common words only');
+  const commonFaded = await waitForScope('common', shortFaded);
+  const commonWords = await bionicState();
+  console.log('bionic dict : ' + JSON.stringify({ scope: commonWords.scope, faded: commonFaded }));
+  if (commonWords.scope !== 'common') fail(`choosing "Common words only" should set the scope, got ${JSON.stringify(commonWords.scope)}`);
+  if (commonFaded !== marked.faded) {
+    fail(`the dictionary should draw the page it drew before (${marked.faded} -> ${commonFaded})`);
+  }
+  if (!samePage(commonWords)) fail('choosing the dictionary scope changed the text or moved a character');
+  const commonMenu = await bionicMenu();
+  if (commonMenu.chosen.join() !== 'Fade the rest to 50%,Common words only') fail(`the menu should show the dictionary in force, got ${JSON.stringify(commonMenu.chosen)}`);
+  if (await fadedOnScreen() !== marked.faded) fail('the reader is not looking at the dictionary render again');
 
   // The find bar measures the characters it boxes, and those characters are now
   // one tspan deeper in the markup: it has to still find them.

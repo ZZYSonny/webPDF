@@ -67,7 +67,13 @@ import type {
 import { linkTargetOf, type LinkTarget } from './core/links.ts';
 import { debug as DEBUG } from './core/debug.ts';
 import { normalisePatterns, padBox } from './core/crop.ts';
-import { BIONIC_DIM, bionicDim } from './core/bionic.ts';
+import {
+  BIONIC_DIM,
+  BIONIC_SCOPE,
+  bionicDim,
+  bionicScope as scopeOf,
+  type BionicScope,
+} from './core/bionic.ts';
 import {
   computeFitScale,
   PageLayout,
@@ -363,6 +369,8 @@ export class PdfViewer {
   private bionicOn = false;
   /** How much strength the faded part of a word keeps, 0..1. */
   private bionicDimValue = BIONIC_DIM;
+  /** Which words bionic reading marks: the dictionary's, the long ones, or all. */
+  private bionicScopeValue: BionicScope = BIONIC_SCOPE;
   /** Bumped whenever the selection changes, so a running pass gives up. */
   private cropEpoch = 0;
   private cropMeasured = 0;
@@ -934,16 +942,20 @@ export class PdfViewer {
    * `dim` is how much strength the faded part of each word keeps, 0..1, and
    * stays where it is put: passing it without `on` is how a host changes the
    * fade while the mode is already on, and leaving it out keeps the value in
-   * force (`BIONIC_DIM` until one is given). Either way what is on screen was
-   * drawn the other way and is now wrong, so it is re-rendered - never
-   * re-measured, because a fade moves nothing.
+   * force (`BIONIC_DIM` until one is given). `scope` is the same for the words
+   * themselves: `'common'` (the default) marks the dictionary's words,
+   * `'short'` leaves the short ones alone, and `'all'` marks every word. Either
+   * way what is on screen was drawn the other way and is now wrong, so it is
+   * re-rendered - never re-measured, because a fade moves nothing.
    */
-  setBionic(on: boolean, dim?: number): void {
+  setBionic(on: boolean, dim?: number, scope?: BionicScope): void {
     const next = on === true;
     const nextDim = bionicDim(dim ?? this.bionicDimValue);
-    if (next === this.bionicOn && nextDim === this.bionicDimValue) return;
+    const nextScope = scopeOf(scope ?? this.bionicScopeValue);
+    if (next === this.bionicOn && nextDim === this.bionicDimValue && nextScope === this.bionicScopeValue) return;
     this.bionicOn = next;
     this.bionicDimValue = nextDim;
+    this.bionicScopeValue = nextScope;
     this.invalidateAll();
     this.update();
   }
@@ -956,6 +968,11 @@ export class PdfViewer {
   /** The opacity the faded part of a word is drawn at, 0..1. */
   get bionicDim(): number {
     return this.bionicDimValue;
+  }
+
+  /** Which words bionic reading marks. */
+  get bionicScope(): BionicScope {
+    return this.bionicScopeValue;
   }
 
   private measureCrop(): void {
@@ -1260,6 +1277,7 @@ export class PdfViewer {
       cropPadding: this.padding,
       bionic: this.bionicOn,
       bionicDim: this.bionicDimValue,
+      bionicScope: this.bionicScopeValue,
     });
     return rendered.svg;
   }
@@ -1807,6 +1825,7 @@ export class PdfViewer {
       cropPadding: this.padding,
       bionic: this.bionicOn,
       bionicDim: this.bionicDimValue,
+      bionicScope: this.bionicScopeValue,
       // The faces are the document's and the document carries them: a page names
       // the families the plan built, and needs nothing of its own. Before the
       // plan is ready there is nothing to name at all - the page is outlines -

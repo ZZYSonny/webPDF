@@ -106,7 +106,7 @@ test('the settings a document was left with are the ones the next one starts wit
   const settings: Settings = {
     zoom: { level: 1.5, mode: 'custom' },
     crop: { patterns: ['^\\s*[0-9]+\\s*$'], padding: 6 },
-    bionic: { on: true, dim: 0.4 },
+    bionic: { on: true, dim: 0.4, scope: 'short' },
     outline: false,
   };
   const memory = put(memoryOf(['a']), 'url:b', { pos: place(12, 40), settings }, at(9));
@@ -115,6 +115,19 @@ test('the settings a document was left with are the ones the next one starts wit
   // so a document never read before opens at its first page.
   assert.deepEqual(Object.keys(inherited(memory) ?? {}).sort(), ['bionic', 'crop', 'outline', 'zoom']);
   assert.equal(inherited({}), null);
+});
+
+/**
+ * The scope is part of the bionic setting, not a second one: it is written with
+ * the fade and restored with it. An entry written by a version that did not have
+ * it is read as it was - the viewer's own default is the answer for the missing
+ * field, not a guess added to storage.
+ */
+test('the word scope is remembered with the fade', () => {
+  const marked = put({}, 'url:a', { settings: { bionic: { on: true, dim: 0.4, scope: 'all' } } }, at(1));
+  assert.equal(inherited(marked)?.bionic?.scope, 'all');
+  const older = put({}, 'url:b', { settings: { bionic: { on: true, dim: 0.4 } } }, at(2));
+  assert.equal(inherited(older)?.bionic?.scope, undefined);
 });
 
 /**

@@ -264,10 +264,10 @@ at its URI and writes its own URL into the rule, so the document's fonts are a
 handful of `blob:` fetches rather than a stylesheet with every face in it.
 
 `wpdf_render` takes a flag word — responsive, embed the page's fonts, bionic,
-link hit areas, crop — and, when cropping, the `viewBox` to draw into. A crop is
-never a deletion: the page is written at page coordinates and the host shows a
-window onto it, so changing the padding around a crop is a re-render and not a
-re-measure.
+link hit areas, crop — plus bionic reading's strength and word scope, and, when
+cropping, the `viewBox` to draw into. A crop is never a deletion: the page is
+written at page coordinates and the host shows a window onto it, so changing the
+padding around a crop is a re-render and not a re-measure.
 
 `wpdf_measure_crop` takes the marks to leave out as a **newline-joined list of
 regular expressions** — a newline, because any other separator can be part of an
@@ -390,12 +390,20 @@ pages' zoom belongs to the viewer:
   the content. The measurement is the core's, once per page and expression set;
   the padding around it belongs to the page, because the crop is a `viewBox` and
   changing the margin is a re-render rather than a re-measure.
-* **Bionic reading is one choice: off, or a fade at some strength.** The first
-  letters of every word are held at full strength and the rest is faded with
-  `fill-opacity` — the string, the character order and every position are
-  untouched, so copying a page gives the document's own text. A word drawn in
-  more than one run — a font or colour change inside it makes it two — is still
-  marked as one word, by its whole length.
+* **Bionic reading is one mode: off, or a fade at some strength over some set of
+  words.** The first letters of each marked word are held at full strength and
+  the rest is faded with `fill-opacity` — the string, the character order and
+  every position are untouched, so copying a page gives the document's own text.
+  A word drawn in more than one run — a font or colour change inside it makes it
+  two — is still marked as one word, by its whole length. Three word scopes sit
+  under the same menu, separate from the strength: **Common words only** (the
+  default) marks the words an English dictionary knows and leaves an equation's
+  `dx`, `T0` and `2024` as the page set them; **Skip short words** leaves words
+  of three letters or fewer alone; **All words** marks every one. The dictionary
+  is the 10,000 most frequent English words in Google Books, from the
+  [`common-words-all`](https://crates.io/crates/common-words-all) crate (MIT),
+  turned into a sorted list by `build.rs` — the data is a build dependency, not
+  a file in this repository.
 * **Ctrl+F finds, Ctrl+S saves, Ctrl+P prints, Ctrl+O opens — and the card
   writes the keyboard down.** With nothing open there is no bar to look in, so
   the keys this page takes over from the browser are rows in a box under the
@@ -491,6 +499,8 @@ were is the viewer's own storage.
 
 ```
 core/                       the engine: Rust, MuPDF, built to wasm
+  build.rs                  the common-word list for bionic reading, generated
+                            from `common-words-all` at build time
   src/lib.rs                Core: open, info, plan, render, crop, links, save
   src/info.rs               the document: page boxes, labels, outline, metadata
   src/text.rs               the text device: characters, positions, the letters

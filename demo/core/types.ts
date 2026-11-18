@@ -8,6 +8,8 @@
  * the one place that reads it.
  */
 
+import type { BionicScope } from './bionic.ts';
+
 /** Everything a document can be handed to a viewer as. */
 export type PdfSource =
   | ArrayBuffer
@@ -91,6 +93,8 @@ export interface RenderOptions {
   bionic?: boolean;
   /** How much strength the faded part keeps, 0..1. */
   bionicDim?: number;
+  /** Which words bionic reading marks. Default `'common'`. */
+  bionicScope?: BionicScope;
 }
 
 export interface RenderStats {

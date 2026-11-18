@@ -299,6 +299,10 @@ pub extern "C" fn wpdf_fonts(id: u32) -> i32 {
 /// The header carries the page's display size, its crop box (or null), its links
 /// and its statistics; the payload is the SVG.
 ///
+/// `bionic_dim` is the fade's strength (a negative number asks for the default)
+/// and `bionic_scope` is the set of words it marks: 0 the dictionary, 1 the
+/// words of four letters or more, 2 every word.
+///
 /// # Safety
 ///
 /// `prefix` and `class` must each point at as many readable bytes as they are
@@ -314,6 +318,7 @@ pub unsafe extern "C" fn wpdf_render(
     class_len: usize,
     flags: u32,
     bionic_dim: f32,
+    bionic_scope: u32,
     crop_x: f32,
     crop_y: f32,
     crop_w: f32,
@@ -344,6 +349,9 @@ pub unsafe extern "C" fn wpdf_render(
             // a `f32` carries an absent option through a C ABI without a second
             // argument.
             bionic_dim: (bionic_dim >= 0.0).then_some(bionic_dim),
+            // A number this core does not know is the default scope rather than
+            // an error; `Scope::from_code` says why.
+            bionic_scope: crate::bionic::Scope::from_code(bionic_scope),
             links: flags & flag::LINKS != 0,
             view_box,
         };

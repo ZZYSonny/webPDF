@@ -45,6 +45,15 @@ bioneer = "0.1.1"
 # so naming it here costs no build time and no second copy of the engine.
 regex = "1"
 
+[build-dependencies]
+# The common words bionic reading's dictionary scope consults: the 10,000 most
+# frequent English words in Google Books, MIT-licensed. `build.rs` turns them
+# into the sorted list the wasm carries, so no word data is kept in this
+# repository and the page does not carry the crate's records and frequencies.
+# `one` is not used by us, but the crate's `NgramSize` enum does not compile
+# without an n-gram feature enabled.
+common-words-all = { version = "0.0.2", default-features = false, features = ["english", "one"] }
+
 [profile.release]
 opt-level = 3
 

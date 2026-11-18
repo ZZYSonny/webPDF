@@ -397,6 +397,7 @@ export class PdfEngine implements PdfEngineLike {
       embedFonts: opts.embedFonts ?? !ready,
       bionic: opts.bionic,
       bionicDim: opts.bionicDim ?? null,
+      bionicScope: opts.bionicScope,
       links: opts.links ?? true,
       crop,
     });

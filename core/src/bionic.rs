@@ -47,6 +47,8 @@
 //! table, and `LONG_TAIL` says how (`long_words`). A URL is faded the way the
 //! pipeline faded it.
 
+use std::sync::OnceLock;
+
 use bioneer::Bionify;
 
 use crate::font::program::ligature_letters;
@@ -76,6 +78,79 @@ pub fn bionic_dim(value: Option<f32>) -> f32 {
         Some(v) if v.is_finite() => v.clamp(BIONIC_MIN_DIM, 1.0),
         _ => BIONIC_DIM,
     }
+}
+
+/// Which of a page's words bionic reading marks.
+///
+/// The fixation table is about letters, not about meaning, and a page is not
+/// always prose: a formula's `dx`, a table's `2024`, an identifier like `mHC`
+/// are words to the segmenter and not to a reader, and fading part of one makes
+/// it harder to read rather than easier. The scope is what decides.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Scope {
+    /// Only the words the English dictionary knows.
+    ///
+    /// This is the default, because prose is mostly dictionary words and a
+    /// formula is mostly not. A word the list does not know - an identifier, a
+    /// number, a word in a script the list does not cover - is left exactly as
+    /// the document set it. `build.rs` says where the list comes from.
+    #[default]
+    Common,
+    /// Every word long enough to have a tail: four letters or more.
+    ///
+    /// A formula is full of short words - `dx`, `sin`, `log`, a lone `x` - and
+    /// so is prose; this leaves both alone. Three letters or fewer is the cut
+    /// because that is where the fixation point is most of the word already,
+    /// and because `sin` and `log` are words of that length.
+    Short,
+    /// Every word, which is what bionic reading usually means.
+    All,
+}
+
+impl Scope {
+    /// The scope a host's number names.
+    ///
+    /// 0 is [`Scope::Common`], 1 [`Scope::Short`] and 2 [`Scope::All`]; a number
+    /// this core does not know is the default rather than an error, because a
+    /// host newer than the core must not be able to change what a page looks
+    /// like in a way the core cannot describe.
+    pub fn from_code(code: u32) -> Self {
+        match code {
+            1 => Self::Short,
+            2 => Self::All,
+            _ => Self::Common,
+        }
+    }
+
+    /// The scope a name in the environment names: `common`, `short` or `all`.
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "common" => Some(Self::Common),
+            "short" => Some(Self::Short),
+            "all" => Some(Self::All),
+            _ => None,
+        }
+    }
+}
+
+/// The length at which [`Scope::Short`] starts marking: words of three letters
+/// or fewer are left alone.
+const LONG_ENOUGH: usize = 4;
+
+/// The words [`Scope::Common`] knows, one per line and sorted, so a lookup is a
+/// binary search.
+///
+/// The 10,000 most frequent English words in Google Books, from the
+/// `common-words-all` crate (MIT), filtered to the alphabetic entries and
+/// folded to lower case by `build.rs`. The data is a build dependency rather
+/// than a file here: cargo fetches the crate like any other dependency, and the
+/// wasm carries only the sorted words, not the crate's records and frequencies.
+const COMMON_WORDS: &str = include_str!(concat!(env!("OUT_DIR"), "/common-words.txt"));
+
+/// The dictionary, split once: a page asks it about every word it draws.
+fn common_words() -> &'static [&'static str] {
+    static WORDS: OnceLock<Vec<&'static str>> = OnceLock::new();
+    WORDS.get_or_init(|| COMMON_WORDS.lines().collect())
 }
 
 /// One stretch of text, marked as a fixation point or not.
@@ -193,9 +268,12 @@ pub fn ends_in_word(text: &str) -> bool {
     text.chars().next_back().is_some_and(word_char)
 }
 
-/// Put the marks of every word longer than the table back to what the table says.
-fn long_words(text: &str, fixed: &mut [bool]) {
-    let chars: Vec<char> = text.chars().collect();
+/// Walk the words of `chars`, handing each its character range.
+///
+/// The long-word correction and the scope filter have to agree about where a
+/// word begins and ends, which is what this is. The scope filter also needs the
+/// stretches between the words, so it walks those itself.
+fn each_word(chars: &[char], mut each: impl FnMut(usize, usize)) {
     let mut i = 0;
     while i < chars.len() {
         if !word_char(chars[i]) {
@@ -206,13 +284,107 @@ fn long_words(text: &str, fixed: &mut [bool]) {
         while j < chars.len() && word_char(chars[j]) {
             j += 1;
         }
+        each(i, j);
+        i = j;
+    }
+}
+
+/// Put the marks of every word longer than the table back to what the table says.
+fn long_words(text: &str, fixed: &mut [bool]) {
+    let chars: Vec<char> = text.chars().collect();
+    each_word(&chars, |i, j| {
         let len = j - i;
         if len > LONGEST_TABLE_WORD {
             for (n, at) in (i..j).enumerate() {
                 fixed[at] = n < len - LONG_TAIL;
             }
         }
+    });
+}
+
+/// Whether the dictionary knows this word.
+///
+/// The answer is about the word a reader sees, so the comparison is lower-case
+/// and the letters of a ligature have already been spelled out. A token with a
+/// digit in it is not a dictionary word however it is spelled - `Domain2i` and
+/// `T0` are identifiers - which is most of what keeps a formula out of the
+/// marks. A word in a script the list does not cover (Greek in a formula, a
+/// Chinese label) is simply not found, and is left alone for the same reason.
+fn common(word: &[char]) -> bool {
+    if word.is_empty() || word.iter().any(|c| !c.is_alphabetic()) {
+        return false;
+    }
+    let mut lower = String::with_capacity(word.len());
+    for c in word {
+        lower.extend(c.to_lowercase());
+    }
+    common_words().binary_search(&lower.as_str()).is_ok()
+}
+
+/// A stretch of characters that are nothing but white space, the way [`blank`]
+/// asks the question of a string.
+fn blank_chars(chars: &[char]) -> bool {
+    chars.iter().all(|c| c.is_whitespace() || *c == '\u{feff}')
+}
+
+/// Leave the words `scope` does not cover exactly as the page set them.
+///
+/// A fixation point is a part drawn at full strength, so a word whose every
+/// letter is one is the word the document drew: no `fill-opacity`, no change to
+/// the text, and no change to a position - `write_run` only uses the answer to
+/// decide where a `<tspan>` ends.
+///
+/// The stretches *between* words need an answer too, because bionic reading
+/// fades them with the tail of the word before. That is right in prose and
+/// wrong in a formula, where a faded `=` or `+` is a mark bionic reading never
+/// meant to make. A separator takes no fade when either word beside it is left
+/// alone; a blank one is its own `<tspan>` either way and no ink turns on which
+/// way it goes.
+fn scope_words(text: &str, scope: Scope, fixed: &mut [bool]) {
+    if scope == Scope::All {
+        return;
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let mut words: Vec<(usize, usize, bool)> = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        if !word_char(chars[i]) {
+            i += 1;
+            continue;
+        }
+        let mut j = i;
+        while j < chars.len() && word_char(chars[j]) {
+            j += 1;
+        }
+        let keep = match scope {
+            Scope::Common => common(&chars[i..j]),
+            Scope::Short => j - i >= LONG_ENOUGH,
+            Scope::All => true,
+        };
+        if !keep {
+            fixed[i..j].fill(true);
+        }
+        words.push((i, j, keep));
         i = j;
+    }
+    if words.is_empty() {
+        // There is no word to mark: a run of nothing but symbols is not bionic
+        // reading's to fade.
+        fixed.fill(true);
+        return;
+    }
+    let mut at = 0;
+    for (n, &(start, end, keep)) in words.iter().enumerate() {
+        if start > at && !blank_chars(&chars[at..start]) {
+            let before = n == 0 || words[n - 1].2;
+            if !(before && keep) {
+                fixed[at..start].fill(true);
+            }
+        }
+        at = end;
+    }
+    if at < chars.len() && !blank_chars(&chars[at..]) && !words[words.len() - 1].2 {
+        fixed[at..].fill(true);
     }
 }
 
@@ -236,6 +408,15 @@ fn mark(stretch: &str, fixation: bool, at: &mut usize, letters: &mut [bool]) {
 /// a future `bioneer` that marks characters differently degrades to plain text
 /// rather than to fixation points in the wrong places.
 pub fn segments(text: &str) -> Vec<Segment> {
+    segments_with(text, Scope::All)
+}
+
+/// The same, marking only the words `scope` covers.
+///
+/// A word the scope leaves out is not cut out of the output - the text and its
+/// positions are the page's - it is marked as one fixation point from end to
+/// end, which is the same as being drawn exactly as the document set it.
+pub fn segments_with(text: &str, scope: Scope) -> Vec<Segment> {
     if text.is_empty() {
         return Vec::new();
     }
@@ -264,6 +445,9 @@ pub fn segments(text: &str) -> Vec<Segment> {
     }
     mark(&markup[cursor..], false, &mut at, &mut letters);
     long_words(&marked, &mut letters);
+    // After the long-word correction: a word the scope leaves out is left whole
+    // however long it is, and the correction would otherwise fade its tail.
+    scope_words(&marked, scope, &mut letters);
 
     // A glyph the fixation reaches into is marked whole, so a letter of a
     // ligature marks the one character the ligature is.
@@ -302,7 +486,15 @@ mod tests {
     fn fixed(segments: &[Segment]) -> String {
         segments
             .iter()
-            .filter(|s| s.fixation)
+            .filter(|s| s.fixation && !blank(&s.text))
+            .map(|s| s.text.as_str())
+            .collect()
+    }
+
+    fn faded(segments: &[Segment]) -> String {
+        segments
+            .iter()
+            .filter(|s| !s.fixation && !blank(&s.text))
             .map(|s| s.text.as_str())
             .collect()
     }
@@ -310,6 +502,17 @@ mod tests {
     /// A segment covers the input and nothing else, in order, however it is cut.
     fn accounted_for(text: &str) {
         let segs = segments(text);
+        assert_eq!(text_of(&segs), text);
+        assert_eq!(
+            segs.iter().map(|s| s.chars).sum::<usize>(),
+            text.chars().count()
+        );
+    }
+
+    /// The same, for a scope: leaving words alone cuts the text differently, but
+    /// it still covers every character exactly once.
+    fn accounted_for_scope(text: &str, scope: Scope) {
+        let segs = segments_with(text, scope);
         assert_eq!(text_of(&segs), text);
         assert_eq!(
             segs.iter().map(|s| s.chars).sum::<usize>(),
@@ -403,5 +606,119 @@ mod tests {
         assert_eq!(bionic_dim(Some(0.0)), BIONIC_MIN_DIM);
         assert_eq!(bionic_dim(Some(4.0)), 1.0);
         assert_eq!(bionic_dim(Some(0.35)), 0.35);
+    }
+
+    /// The same text, marked three ways. `All` marks every word; `Short` leaves
+    /// the three-letter and shorter ones whole, which is where `dx` and `sin`
+    /// live; `Common` also leaves `2024` whole, because a number is not a
+    /// dictionary word.
+    #[test]
+    fn a_scope_leaves_the_words_it_does_not_cover_alone() {
+        let text = "the 2024 dx coefficient";
+        for scope in [Scope::Common, Scope::Short, Scope::All] {
+            accounted_for_scope(text, scope);
+        }
+        // `bioneer` does not mark a word with no letter in it, so `2024` is
+        // faded whole and its space goes with it; `Common` leaves it, and the
+        // numbers and the space around them are the difference the mode makes.
+        assert_eq!(faded(&segments_with(text, Scope::All)), "e 2024 x nt");
+        assert_eq!(faded(&segments_with(text, Scope::Short)), " 2024 nt");
+        assert_eq!(faded(&segments_with(text, Scope::Common)), "e nt");
+        // The words left alone keep every letter: `2024` and `dx` are a fixation
+        // stretch from end to end, and `the` and `coefficient` are marked around
+        // them.
+        assert_eq!(
+            fixed(&segments_with(text, Scope::Common)),
+            "th2024dxcoefficie"
+        );
+    }
+
+    /// A dictionary is case-insensitive: a word at the start of a sentence, or a
+    /// heading in capitals, is the same word.
+    #[test]
+    fn a_common_word_is_matched_whatever_its_case() {
+        let text = "INCORPORATE incorporate";
+        accounted_for_scope(text, Scope::Common);
+        assert_eq!(faded(&segments_with(text, Scope::Common)), "TE te");
+    }
+
+    /// A digit makes an identifier out of a word: `T0` and `Domain2i` are not
+    /// spellings of anything, so `Common` leaves them alone. `Short` leaves them
+    /// alone too when they are short enough; `All` marks them like any word.
+    #[test]
+    fn a_word_with_a_digit_is_not_a_dictionary_word() {
+        let text = "42 T0 mHC";
+        accounted_for_scope(text, Scope::Common);
+        assert_eq!(faded(&segments_with(text, Scope::Common)), "");
+        // `42` and `T0` are two letters, `mHC` is three: every one of them is in
+        // the fixation stretch, whole.
+        assert_eq!(
+            fixed(&segments_with(text, Scope::Common)),
+            "42T0mHC"
+        );
+        assert_eq!(faded(&segments_with(text, Scope::All)), "42 0 C");
+    }
+
+    /// A word the list does not know is left alone, and the words around it are
+    /// not: `submanifold` is missing from the 10,000 common words while
+    /// `coefficient` is among them, which is exactly the line the scope draws.
+    #[test]
+    fn a_word_the_dictionary_does_not_know_is_left_alone() {
+        let text = "submanifold coefficient";
+        accounted_for_scope(text, Scope::Common);
+        assert_eq!(
+            fixed(&segments_with(text, Scope::Common)),
+            "submanifoldcoefficie"
+        );
+        assert_eq!(faded(&segments_with(text, Scope::Common)), "nt");
+    }
+
+    /// The list is English, so a script it does not cover is not guessed at:
+    /// every character of a Chinese label is left alone rather than marked by a
+    /// table that measures letters it has never seen.
+    #[test]
+    fn a_script_the_dictionary_does_not_cover_is_left_alone() {
+        let text = "内部综合评估";
+        accounted_for_scope(text, Scope::Common);
+        assert_eq!(faded(&segments_with(text, Scope::Common)), "");
+        assert_eq!(fixed(&segments_with(text, Scope::Common)), text);
+        // `All` still marks it, as it always did.
+        assert_eq!(faded(&segments_with(text, Scope::All)), "评估");
+    }
+
+    /// The scope a host names by number, and the one a shell names by name. An
+    /// unknown number is the default rather than an error: a host newer than the
+    /// core must not be able to ask for a page the core cannot describe.
+    #[test]
+    fn a_scope_has_a_number_and_a_name() {
+        assert_eq!(Scope::from_code(0), Scope::Common);
+        assert_eq!(Scope::from_code(1), Scope::Short);
+        assert_eq!(Scope::from_code(2), Scope::All);
+        assert_eq!(Scope::from_code(7), Scope::Common);
+        assert_eq!(Scope::default(), Scope::Common);
+        assert_eq!(Scope::from_name("common"), Some(Scope::Common));
+        assert_eq!(Scope::from_name(" Short "), Some(Scope::Short));
+        assert_eq!(Scope::from_name("ALL"), Some(Scope::All));
+        assert_eq!(Scope::from_name("sometimes"), None);
+    }
+
+    /// The list is sorted, because the lookup is a binary search, and it says
+    /// both yes and no to words that are worth saying it about. A generated list
+    /// that lost a line or gained a blank one would fail here rather than quietly
+    /// marking the wrong words.
+    #[test]
+    fn the_dictionary_is_sorted_and_answers() {
+        let words = common_words();
+        assert!(words.len() > 8_000, "{} words", words.len());
+        assert!(
+            words.windows(2).all(|pair| pair[0] < pair[1]),
+            "sorted and unique"
+        );
+        for known in ["the", "incorporate", "coefficient", "word"] {
+            assert!(words.binary_search(&known).is_ok(), "{known}");
+        }
+        for unknown in ["dx", "mhc", "t0", "domain2i", "submanifold", "eigenvalue"] {
+            assert!(words.binary_search(&unknown).is_err(), "{unknown}");
+        }
     }
 }

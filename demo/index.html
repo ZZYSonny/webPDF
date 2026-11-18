@@ -207,11 +207,20 @@
               aria-expanded="false"
               aria-controls="bionic-menu"
               aria-label="Bionic reading"
-              title="Bionic reading — hold the first letters of every word at full strength"
+              title="Bionic reading — hold the first letters of each marked word at full strength"
             >
               B<span class="caret" aria-hidden="true">▾</span>
             </button>
-            <div id="bionic-menu" class="menu bionic-menu" role="listbox" aria-label="Bionic reading" hidden></div>
+            <!-- Two settings share this list - the fade and the words it marks -
+                 so more than one row can be in force at once. -->
+            <div
+              id="bionic-menu"
+              class="menu bionic-menu"
+              role="listbox"
+              aria-multiselectable="true"
+              aria-label="Bionic reading"
+              hidden
+            ></div>
           </div>
         </div>
       </div>

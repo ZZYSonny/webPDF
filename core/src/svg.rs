@@ -74,6 +74,11 @@ pub struct RenderOptions {
     /// How much of its strength the faded part of a word keeps, 0..1.
     /// `BIONIC_DIM` (a half) when unset; only meaningful while `bionic` is on.
     pub bionic_dim: Option<f32>,
+    /// Which words bionic reading marks: the dictionary's, the ones long enough
+    /// to have a tail, or every one (`bionic::Scope`). Only meaningful while
+    /// `bionic` is on; the default is the dictionary, because a formula is not
+    /// prose.
+    pub bionic_scope: crate::bionic::Scope,
     /// The window onto the page: `(x, y, width, height)` in page units, which
     /// becomes the root's `viewBox` and its size.
     ///
@@ -393,6 +398,8 @@ pub struct SvgDevice {
     /// The strength the faded part of a word is drawn at, or None when bionic
     /// reading is off. `bionic.rs` says why it is a fade rather than a bold.
     bionic: Option<f32>,
+    /// Which words bionic reading marks. Read only while `bionic` is set.
+    bionic_scope: crate::bionic::Scope,
     /// How many definitions are open. While this is not zero the markup belongs
     /// to the innermost one rather than to the page.
     in_defs: usize,
@@ -475,6 +482,7 @@ impl SvgDevice {
             bionic: opts
                 .bionic
                 .then(|| crate::bionic::bionic_dim(opts.bionic_dim)),
+            bionic_scope: opts.bionic_scope,
             in_defs: 0,
             masks: Vec::new(),
             tiles: Vec::new(),
@@ -1023,7 +1031,7 @@ impl SvgDevice {
         }
         let mut held = std::mem::take(&mut self.held);
         if self.bionic.is_some() {
-            mark_held(&mut held);
+            mark_held(&mut held, self.bionic_scope);
         }
         for held in held {
             self.write_run(&held.run);
@@ -1058,7 +1066,10 @@ impl SvgDevice {
         // A held run was marked as part of the stretch it belongs to, and that
         // stretch may be wider than the run: its answer is the one to use.
         let fade: Option<Vec<Option<bool>>> = match self.bionic {
-            Some(_) => run.fade.clone().or_else(|| Self::fades(&run.items)),
+            Some(_) => run
+                .fade
+                .clone()
+                .or_else(|| Self::fades(&run.items, self.bionic_scope)),
             None => None,
         };
         // A glyph that stands for several characters gets a `<tspan>` of its own:
@@ -1140,9 +1151,9 @@ impl SvgDevice {
     /// cannot be drawn half dark. `None` when the segments do not account for
     /// every character of the run, which writes it unfaded - the caller's
     /// concern, and `bionic.rs` says why it is the right fallback.
-    fn fades(items: &[RunItem]) -> Option<Vec<Option<bool>>> {
+    fn fades(items: &[RunItem], scope: crate::bionic::Scope) -> Option<Vec<Option<bool>>> {
         let text: String = items.iter().map(|item| item.text.as_str()).collect();
-        let fades = char_fades(&text)?;
+        let fades = char_fades(&text, scope)?;
         let mut at = 0usize;
         let mut out = Vec::with_capacity(items.len());
         for item in items {
@@ -1225,8 +1236,8 @@ impl SvgDevice {
 /// point next to it. `None` for the whole answer when the segments do not
 /// account for every character, which writes the text plainly rather than faded
 /// in the wrong places.
-fn char_fades(text: &str) -> Option<Vec<Option<bool>>> {
-    let segments = crate::bionic::segments(text);
+fn char_fades(text: &str, scope: crate::bionic::Scope) -> Option<Vec<Option<bool>>> {
+    let segments = crate::bionic::segments_with(text, scope);
     let total = text.chars().count();
     if segments.iter().map(|segment| segment.chars).sum::<usize>() != total {
         return None;
@@ -1250,13 +1261,13 @@ fn char_fades(text: &str) -> Option<Vec<Option<bool>>> {
 /// takes the answer of the character it starts at. That is the point of holding
 /// them: `Incorpora` and `ted` are eleven letters, and the eleven-letter word is
 /// marked `Incorpora`, which neither half could have been marked as on its own.
-fn mark_held(held: &mut [Held]) {
+fn mark_held(held: &mut [Held], scope: crate::bionic::Scope) {
     let text: String = held
         .iter()
         .flat_map(|held| held.run.items.iter())
         .map(|item| item.text.as_str())
         .collect();
-    let Some(fades) = char_fades(&text) else {
+    let Some(fades) = char_fades(&text, scope) else {
         return;
     };
     let mut at = 0usize;
@@ -2203,6 +2214,7 @@ impl SvgDevice {
             page: self.page,
             prefix: std::mem::take(&mut self.prefix),
             bionic: self.bionic,
+            bionic_scope: self.bionic_scope,
             in_defs: self.in_defs,
             masks: std::mem::take(&mut self.masks),
             tiles: std::mem::take(&mut self.tiles),
@@ -2218,6 +2230,7 @@ impl SvgDevice {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bionic::Scope;
 
     /// A device with nothing in it, for the parts that do not need a page.
     fn device(prefix: &str) -> SvgDevice {
@@ -2233,7 +2246,15 @@ mod tests {
     /// characters, one per point, all on one line. That answer is what tells a
     /// word drawn in two runs from two words, so a test that joins or does not
     /// join needs it.
+    ///
+    /// Bionic reading marks every word here: these tests are about the drawing,
+    /// and the scopes have tests of their own below.
     fn device_with_text(prefix: &str, bionic: bool, text: &str) -> SvgDevice {
+        device_scoped(prefix, bionic, Scope::All, text)
+    }
+
+    /// The same, with the scope the reader chose.
+    fn device_scoped(prefix: &str, bionic: bool, scope: Scope, text: &str) -> SvgDevice {
         let chars: Vec<crate::text::TextChar> = text
             .chars()
             .enumerate()
@@ -2247,6 +2268,7 @@ mod tests {
         let opts = RenderOptions {
             id_prefix: prefix.to_string(),
             bionic,
+            bionic_scope: scope,
             ..Default::default()
         };
         SvgDevice::new(
@@ -2446,6 +2468,83 @@ mod tests {
         );
         device.write_run(&run_of("Hello"));
         assert!(device.body.contains("fill-opacity=\"0.2\""), "{}", device.body);
+    }
+
+    /// The scope reaches the drawing and not just the menu: a formula is a run of
+    /// words the dictionary does not know, so `Common` leaves every one of them
+    /// at full strength - the same shapes, in the same places, with no fade at
+    /// all. `All` marks them, which is what the mode used to do.
+    #[test]
+    fn bionic_common_scope_leaves_a_formula_alone() {
+        let text = "T0 = mHC + dx ";
+        let mut all = device_scoped("", true, Scope::All, text);
+        all.write_run(&run_of(text));
+        assert!(all.body.contains("fill-opacity"), "{}", all.body);
+        assert!(all.stats().faded > 0);
+
+        let mut common = device_scoped("", true, Scope::Common, text);
+        common.write_run(&run_of(text));
+        assert!(!common.body.contains("fill-opacity"), "{}", common.body);
+        assert_eq!(common.stats().faded, 0);
+    }
+
+    /// `Skip short words` leaves `the` and `sin` exactly as the page drew them,
+    /// and still marks the four-letter `word` inside them.
+    #[test]
+    fn bionic_short_scope_leaves_the_short_words_alone() {
+        let mut device = device_scoped("", true, Scope::Short, "the word sin");
+        device.write_run(&run_of("the word sin"));
+        assert!(
+            device.body.contains("<tspan x=\"0 1 2\" y=\"0 0 0\">the</tspan>"),
+            "{}",
+            device.body
+        );
+        assert!(
+            device.body.contains("<tspan x=\"9 10 11\" y=\"0 0 0\">sin</tspan>"),
+            "{}",
+            device.body
+        );
+        assert!(
+            device.body.contains("<tspan fill-opacity=\"0.5\" x=\"7 8\" y=\"0 0\">d </tspan>"),
+            "{}",
+            device.body
+        );
+        assert_eq!(device.stats().faded, 2);
+    }
+
+    /// A word split across runs is decided by the whole word's scope: the
+    /// dictionary knows `Incorporate`, so the two runs are marked as the eleven
+    /// letters they are between them.
+    #[test]
+    fn bionic_common_scope_marks_a_split_word_by_the_whole_word() {
+        let mut device = device_scoped("", true, Scope::Common, "Incorporate ");
+        let at = draw_run(&mut device, 0, 0, "Incorpo");
+        draw_run(&mut device, 1, at, "rate ");
+        device.flush_run();
+        assert!(device.body.contains(
+            "<tspan x=\"0 1 2 3 4 5 6\" y=\"0 0 0 0 0 0 0\">Incorpo</tspan>"
+        ), "{}", device.body);
+        assert!(
+            device.body.contains("<tspan x=\"7 8\" y=\"0 0\">ra</tspan>"),
+            "{}",
+            device.body
+        );
+        assert!(device.body.contains(
+            "<tspan fill-opacity=\"0.5\" x=\"9 10 11\" y=\"0 0 0\">te </tspan>"
+        ), "{}", device.body);
+        assert_eq!(device.stats().faded, 3);
+    }
+
+    /// And the other way: `T0` is one word across the two runs, and it is not a
+    /// dictionary word, so neither half is faded.
+    #[test]
+    fn bionic_common_scope_leaves_a_split_identifier_alone() {
+        let mut device = device_scoped("", true, Scope::Common, "T0 ");
+        let at = draw_run(&mut device, 0, 0, "T");
+        draw_run(&mut device, 1, at, "0 ");
+        device.flush_run();
+        assert!(!device.body.contains("fill-opacity"), "{}", device.body);
+        assert_eq!(device.stats().faded, 0);
     }
 
     /// An id from one page inlined into a host page must not collide with the

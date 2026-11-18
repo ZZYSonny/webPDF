@@ -22,6 +22,7 @@
 
 import type { RenderMode } from './viewer.ts';
 import type { ZoomMode } from './layout.ts';
+import type { BionicScope } from './core/bionic.ts';
 
 /** Where the reader is: a page, and a point within it in the document's units. */
 export interface Place {
@@ -47,7 +48,7 @@ export interface Settings {
    * rewritten is one store away from every document.
    */
   crop?: { patterns: string[]; padding: number } | null;
-  bionic?: { on: boolean; dim: number } | null;
+  bionic?: { on: boolean; dim: number; scope?: BionicScope } | null;
   outline?: boolean;
   /**
    * How the pages were drawn for this reader (`RenderMode`).

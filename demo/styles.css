@@ -208,6 +208,32 @@ body {
 }
 
 /**
+ * The bionic list holds two settings - the fade and the words it marks - so it
+ * is taller than a list of values. It may use more of the window before it
+ * scrolls, which keeps all three word scopes in sight on a normal screen.
+ */
+.bionic-menu {
+  max-height: min(80vh, 560px);
+}
+
+/**
+ * A heading inside a dropdown: the rows under it are a second setting of the
+ * same control, not another value of the first. It is not a `.menu-option`, so
+ * the arrow keys walk the choices straight past it, and the rule above it is
+ * the separation a reader sees.
+ */
+.menu-heading {
+  margin: 4px 0 2px;
+  padding: 7px 9px 3px;
+  border-top: 1px solid var(--border);
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+/**
  * One star per list, on the row the list wants to point at: the value in force
  * where the list is a set of values the reader settled on (bionic reading's
  * fade), and the recommended setting where it is a list of modes (the crop

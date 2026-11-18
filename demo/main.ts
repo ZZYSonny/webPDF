@@ -26,7 +26,7 @@
 
 import { PdfEngine } from './core/engine.ts';
 import { createWorkerEngine } from './core/client.ts';
-import { BIONIC_DIM } from './core/bionic.ts';
+import { BIONIC_DIM, BIONIC_SCOPE, type BionicScope } from './core/bionic.ts';
 import type { DocumentInfo, FontPlanProgress, PdfEngineLike } from './core/types.ts';
 import { DEFAULT_ZOOM_STEPS, PdfViewer, type RenderMode, type ViewerEvent } from './viewer.ts';
 import { core } from 'virtual:webpdf/core';
@@ -791,6 +791,37 @@ const BIONIC_CHOICES: ReadonlyArray<{ dim: number; note: string }> = [
   { dim: 0.7, note: 'barely faded at all' },
 ];
 
+/**
+ * Which words the fade is applied to, under the same menu.
+ *
+ * It is a second setting rather than another strength: how faint the rest of a
+ * word goes and which words are marked at all are independent choices, so the
+ * rows are a group of their own. The dictionary is the default because a
+ * formula's `dx`, `T0` and `2024` are words to the segmenter and not to a
+ * reader, and fading part of one only makes the equation harder; the other two
+ * rows are how a reader says "all of them" or "not the short ones".
+ */
+const BIONIC_WORDS: ReadonlyArray<{ scope: BionicScope; label: string; note: string; title: string }> = [
+  {
+    scope: 'common',
+    label: 'Common words only',
+    note: 'the words a common English dictionary knows — identifiers, numbers and formulas are left alone',
+    title: 'dictionary words',
+  },
+  {
+    scope: 'short',
+    label: 'Skip short words',
+    note: 'words of three letters or fewer are left alone',
+    title: 'words of four letters or more',
+  },
+  {
+    scope: 'all',
+    label: 'All words',
+    note: 'every word, as bionic reading usually means',
+    title: 'every word',
+  },
+];
+
 function bionicOption(
   label: string,
   note: string,
@@ -827,7 +858,8 @@ function bionicOption(
 function fillBionicMenu(): void {
   const on = viewer?.bionic ?? false;
   const dim = viewer?.bionicDim ?? BIONIC_DIM;
-  const rows = [
+  const scope = viewer?.bionicScope ?? BIONIC_SCOPE;
+  const rows: HTMLElement[] = [
     bionicOption('Off', 'the pages as the document sets them', { selected: !on, starred: false }, () => setBionic(false)),
   ];
   for (const choice of BIONIC_CHOICES) {
@@ -841,17 +873,39 @@ function fillBionicMenu(): void {
       ),
     );
   }
+  // A heading rather than a row: the three scopes are a second setting, and
+  // "separate from the strength" has to be visible as well as true. It is not a
+  // `.menu-option`, so the arrow keys walk the choices and skip the label.
+  const heading = document.createElement('div');
+  heading.className = 'menu-heading';
+  heading.setAttribute('role', 'presentation');
+  heading.textContent = 'Words to mark';
+  rows.push(heading);
+  for (const choice of BIONIC_WORDS) {
+    rows.push(
+      bionicOption(
+        choice.label,
+        choice.note,
+        // The scope is in force even while the mode is off, so the row is
+        // selected then too - "Off" says the words are not faded, not that the
+        // choice has been forgotten.
+        { selected: choice.scope === scope, starred: false },
+        () => setBionic(true, dim, choice.scope),
+      ),
+    );
+  }
   els.bionicMenu.replaceChildren(...rows);
   els.bionicBtn.dataset.on = String(on);
+  const words = BIONIC_WORDS.find((choice) => choice.scope === scope)?.title ?? 'every word';
   els.bionicBtn.title = on
-    ? `Bionic reading on — the rest of every word at ${Math.round(dim * 100)}%`
-    : 'Bionic reading — hold the first letters of every word at full strength';
+    ? `Bionic reading on — ${words} at ${Math.round(dim * 100)}%`
+    : 'Bionic reading — hold the first letters of each marked word at full strength';
 }
 
-/** The mode, and how faint the rest of a word is drawn. */
-function setBionic(on: boolean, dim?: number): void {
+/** The mode, how faint the rest of a word is drawn, and which words it marks. */
+function setBionic(on: boolean, dim?: number, scope?: BionicScope): void {
   if (!viewer) return;
-  viewer.setBionic(on, dim);
+  viewer.setBionic(on, dim, scope);
   fillBionicMenu();
   rememberHere();
 }
@@ -1372,7 +1426,7 @@ function applySettings(settings: Settings | null): void {
     else if (mode === 'fit-width' || mode === 'fit-page') viewer.setZoom(mode);
   }
   if (settings.crop) ensureCropMenu(viewer).setPatterns(settings.crop.patterns, settings.crop.padding);
-  if (settings.bionic) setBionic(settings.bionic.on, settings.bionic.dim);
+  if (settings.bionic) setBionic(settings.bionic.on, settings.bionic.dim, settings.bionic.scope);
   if (typeof settings.outline === 'boolean') setOutline(settings.outline);
   syncZoomBox();
 }
@@ -1428,7 +1482,7 @@ function hostState(): { pos: Place | null; settings: Settings } {
       // kept is the *expressions*, which is what the viewer is applying and
       // what the menu can name again when the same document comes back.
       crop: viewer && viewer.crop.length ? { patterns: [...viewer.crop], padding: viewer.cropPadding } : null,
-      bionic: viewer ? { on: viewer.bionic, dim: viewer.bionicDim } : null,
+      bionic: viewer ? { on: viewer.bionic, dim: viewer.bionicDim, scope: viewer.bionicScope } : null,
       outline: !els.toc.hidden,
       // Not something the viewer is told; it is what the *next* visit builds the
       // engine and the viewer with (see `requestedMode`).

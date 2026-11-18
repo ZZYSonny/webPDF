@@ -59,6 +59,7 @@ interface CoreModule {
     classLen: number,
     flags: number,
     bionicDim: number,
+    bionicScope: number,
     cropX: number,
     cropY: number,
     cropW: number,
@@ -207,14 +208,27 @@ check('while a pattern that is one is accepted', accepted.ok === true && accepte
 const prefix = put(`p${page}-`);
 const className = put('wpdf-page-svg');
 const flags = 1 | 2 | 4 | 8; // responsive, embed fonts, bionic, links
+// The scope follows the dim: 0 is the dictionary (the viewer's default), 1
+// skips short words, 2 marks every word.
 const rendered = frame(
-  m._wpdf_render(id, page, prefix.ptr, prefix.size, className.ptr, className.size, flags, -1, 0, 0, 0, 0),
+  m._wpdf_render(id, page, prefix.ptr, prefix.size, className.ptr, className.size, flags, -1, 0, 0, 0, 0, 0),
   'render',
+);
+const allWords = frame(
+  m._wpdf_render(id, page, prefix.ptr, prefix.size, className.ptr, className.size, flags, -1, 2, 0, 0, 0, 0),
+  'render every word',
 );
 m._free(prefix.ptr);
 m._free(className.ptr);
 const svg = new TextDecoder().decode(rendered.payload);
+const allSvg = new TextDecoder().decode(allWords.payload);
+const fadedSpans = (markup: string) => (markup.match(/<tspan[^>]*fill-opacity=/g) ?? []).length;
 check('a page renders to an SVG with real text in it', svg.includes('<text') && svg.includes('@font-face'), `${Math.round(svg.length / 1024)} kB`);
+check(
+  'and the bionic scope reaches the core, before or after the crop',
+  allWords.header.stats.faded > rendered.header.stats.faded && fadedSpans(allSvg) > fadedSpans(svg),
+  `${rendered.header.stats.faded} dictionary words, ${allWords.header.stats.faded} all words`,
+);
 // The other half of the contract: a page that has to stand alone - a saved SVG,
 // or one drawn before the plan is ready - carries its own faces, because there
 // is no host to serve the URIs the document's stylesheet names.
@@ -240,7 +254,7 @@ check(
   const namedPrefix = put(`q${page}-`);
   const namedClass = put('wpdf-page-svg');
   const named = frame(
-    m._wpdf_render(id, page, namedPrefix.ptr, namedPrefix.size, namedClass.ptr, namedClass.size, 1 | 4 | 8, -1, 0, 0, 0, 0),
+    m._wpdf_render(id, page, namedPrefix.ptr, namedPrefix.size, namedClass.ptr, namedClass.size, 1 | 4 | 8, -1, 0, 0, 0, 0, 0),
     'render',
   );
   m._free(namedPrefix.ptr);
@@ -268,7 +282,7 @@ check('and the document is written out again', new TextDecoder().decode(saved.pa
 frame(m._wpdf_close(id), 'close');
 let gone = false;
 try {
-  frame(m._wpdf_render(id, page, 0, 0, 0, 0, 1, -1, 0, 0, 0, 0), 'render after close');
+  frame(m._wpdf_render(id, page, 0, 0, 0, 0, 1, -1, 0, 0, 0, 0, 0), 'render after close');
 } catch {
   gone = true;
 }

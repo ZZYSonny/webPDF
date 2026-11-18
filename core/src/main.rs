@@ -8,6 +8,8 @@
 //!
 //!   WPDF_BIONIC=1            bionic reading
 //!   WPDF_BIONIC_DIM=0.35     how faint the rest of each word goes
+//!   WPDF_BIONIC_SCOPE=all    which words to mark: common (the default), short
+//!                            (four letters or more), or all
 //!   WPDF_LINKS=1             append link hit areas
 //!   WPDF_CROP='^arXiv:;^\s*[0-9]+\s*$'   crop to the content minus these marks
 //!   WPDF_CROP_PADDING=6      points of margin around the crop
@@ -81,6 +83,10 @@ fn main() {
         // probe asks for it the way a host would.
         bionic: env::var("WPDF_BIONIC").is_ok_and(|v| v != "0"),
         bionic_dim: env::var("WPDF_BIONIC_DIM").ok().and_then(|v| v.parse().ok()),
+        bionic_scope: env::var("WPDF_BIONIC_SCOPE")
+            .ok()
+            .and_then(|v| webpdf_core::bionic::Scope::from_name(&v))
+            .unwrap_or_default(),
         links: env::var("WPDF_LINKS").is_ok_and(|v| v != "0"),
         ..Default::default()
     };

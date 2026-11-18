@@ -28,6 +28,8 @@
  * can move under it.
  */
 
+import type { BionicScope } from './bionic.ts';
+
 /** The Emscripten module, as far as this file is concerned. */
 export interface CoreModule {
   readonly HEAPU8: Uint8Array;
@@ -51,6 +53,8 @@ export interface CoreModule {
     classLen: number,
     flags: number,
     bionicDim: number,
+    /** 0 dictionary words, 1 four letters or more, 2 every word. */
+    bionicScope: number,
     cropX: number,
     cropY: number,
     cropW: number,
@@ -99,6 +103,15 @@ const FLAG = {
   links: 8,
   crop: 16,
 } as const;
+
+/**
+ * Bionic reading's word scope, as the number the core reads.
+ *
+ * The core's default is the dictionary, and `BIONIC_SCOPE` in `bionic.ts` is
+ * the same default; a host that says nothing here gets the one the viewer opens
+ * with rather than an accident of the wire.
+ */
+const SCOPE: Record<BionicScope, number> = { common: 0, short: 1, all: 2 };
 
 /**
  * Load the core.
@@ -236,6 +249,7 @@ export class Core {
       embedFonts?: boolean;
       bionic?: boolean;
       bionicDim?: number | null;
+      bionicScope?: BionicScope;
       links?: boolean;
       crop?: { x: number; y: number; width: number; height: number } | null;
     },
@@ -259,6 +273,7 @@ export class Core {
             classLen,
             flags,
             opts.bionicDim ?? -1,
+            SCOPE[opts.bionicScope ?? 'common'],
             crop?.x ?? 0,
             crop?.y ?? 0,
             crop?.width ?? 0,
