@@ -13,6 +13,7 @@ type Command = [string, ...number[]];
 interface Face {
   file: string;
   glyphs: { gid: number; codes: number[]; advance: number | null; cmds: Command[] }[];
+  ligatures: { gid: number; letters: string }[];
 }
 const dir = process.argv[2];
 assert.ok(dir, 'usage: node tests/core/font-outlines.ts <dump-directory>');
@@ -41,6 +42,24 @@ for (const face of faces) {
       assert.equal(font.glyphForCodePoint(code).id, i + 1, `${face.file} U+${code.toString(16)}`);
     }
     checked++;
+  }
+  // A ligature glyph is written as its letters, not as Unicode's one character
+  // for it, so the face has to join them through `liga`. Shape them the way a
+  // browser will and hold the result to the glyph the page drew: a `GSUB` whose
+  // offsets are wrong still parses as a table, it just silently draws `f` and
+  // `i` apart.
+  const byGid = new Map(face.glyphs.map((g, i) => [g.gid, i]));
+  for (const { gid, letters } of face.ligatures) {
+    const index = byGid.get(gid);
+    assert.ok(index !== undefined, `${face.file} ligature gid ${gid} is in the face`);
+    let shaped;
+    try {
+      shaped = font.layout(letters).glyphs;
+    } catch (error) {
+      assert.fail(`${face.file} ${JSON.stringify(letters)} could not be shaped: ${error}`);
+    }
+    assert.equal(shaped.length, 1, `${face.file} ${JSON.stringify(letters)} shapes as one ligature glyph`);
+    assert.equal(shaped[0].id, index + 1, `${face.file} ${JSON.stringify(letters)} draws ligature gid ${gid}`);
   }
 }
 assert.ok(checked > 0);

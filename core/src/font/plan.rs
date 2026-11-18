@@ -101,6 +101,9 @@ pub struct CompiledFace {
     /// (source gid, the codes it is reachable under, its outline in em units,
     /// the advance the source declared).
     pub glyphs: Vec<(u32, Vec<u32>, Vec<Cmd>, Option<f32>)>,
+    /// (output gid, the letters it draws together) for every ligature the face
+    /// has a `liga` rule for. Sorted by gid, so a dump's manifest is stable.
+    pub ligatures: Vec<(u32, String)>,
 }
 
 /// A font a page drew with, as the display list sees it.
@@ -289,10 +292,17 @@ impl Plan {
                     ))
                 })
                 .collect();
+            let mut ligatures: Vec<(u32, String)> = entry
+                .letters_of
+                .iter()
+                .map(|(gid, text)| (*gid, text.clone()))
+                .collect();
+            ligatures.sort_unstable_by_key(|(gid, _)| *gid);
             out.push(CompiledFace {
                 family: face.family.clone(),
                 data: face.data.clone(),
                 glyphs,
+                ligatures,
             });
         }
         out

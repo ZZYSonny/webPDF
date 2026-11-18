@@ -564,7 +564,12 @@ fn cmap_table(codes: &[(u32, u32)]) -> Vec<u8> {
 fn offset_list(children: &[(Vec<u8>, Vec<u8>)]) -> Vec<u8> {
     let mut out = Vec::new();
     u16be(&mut out, children.len() as u16);
-    let base = 2 + 8 * children.len(); // tag(4) + offset(2), kept even
+    // A record is tag(4) + offset(2), and the count is two bytes: the child
+    // data starts after exactly those. Counting eight bytes a record - what an
+    // early version did - puts every offset two bytes past its child, and a
+    // shaper that reads the table that way finds a `liga` feature that points
+    // into the middle of nothing and draws `fi` as `f` and `i`.
+    let base = 2 + 6 * children.len();
     let mut at = base;
     for (tag, child) in children {
         out.extend_from_slice(tag);
@@ -594,9 +599,15 @@ fn lang_sys() -> Vec<u8> {
 
 /// The `GSUB` table carrying one `liga` feature, or an empty table when there is
 /// nothing to substitute.
+///
+/// Each rule is the glyph that draws the letters and the component glyphs in
+/// order. The first component is what the coverage lists; the ligature table
+/// then carries the output glyph and the components *after* the first.
 fn gsub_table(ligatures: &[(u32, Vec<u32>)]) -> Vec<u8> {
-    // ligatures: (first glyph, [rest of the glyphs]) with the output first.
-    let mut firsts: Vec<u32> = ligatures.iter().map(|(f, _)| *f).collect();
+    let mut firsts: Vec<u32> = ligatures
+        .iter()
+        .filter_map(|(_, components)| components.first().copied())
+        .collect();
     firsts.sort_unstable();
     firsts.dedup();
 
@@ -605,14 +616,8 @@ fn gsub_table(ligatures: &[(u32, Vec<u32>)]) -> Vec<u8> {
     for first in &firsts {
         let mut rules: Vec<(u32, Vec<u32>)> = ligatures
             .iter()
-            .filter(|(f, _)| f == first)
-            .map(|(_f, r)| {
-                // The rule carries the glyph to draw first, then the components
-                // after the first - the first is what the coverage matched.
-                let mut rest = r.clone();
-                let by = rest.remove(0);
-                (by, rest)
-            })
+            .filter(|(_, components)| components.first() == Some(first))
+            .map(|(by, components)| (*by, components[1..].to_vec()))
             .collect();
         // Longest first: a shaper stops at the first rule that matches, and a
         // three-letter ligature shares its first two letters with a two-letter
@@ -669,7 +674,11 @@ fn gsub_table(ligatures: &[(u32, Vec<u32>)]) -> Vec<u8> {
     u16be(&mut lookup, 4); // lookupType: ligature substitution
     u16be(&mut lookup, 0); // lookupFlag
     u16be(&mut lookup, 1); // subTableCount
-    u16be(&mut lookup, 6); // subtable offset, from the start of the lookup
+    // The subtable begins after the lookup's own header - type, flag, count and
+    // this offset, eight bytes - and the offset is from the start of the lookup.
+    // Six lands on this field itself, and the shaper reads the offset as a
+    // version it does not know.
+    u16be(&mut lookup, 8);
     lookup.extend_from_slice(&subtable);
 
     let lookup_list = {
@@ -1021,15 +1030,15 @@ pub fn build_font(
         .iter()
         .filter_map(|l| {
             let by = *index.get(&l.by)?;
-            let mut sub = Vec::with_capacity(l.letters.len() + 1);
-            sub.push(by);
-            for gid in &l.letters {
-                sub.push(*index.get(gid)?);
-            }
-            if sub.len() < 3 {
+            let components: Vec<u32> = l
+                .letters
+                .iter()
+                .map(|gid| index.get(gid).copied())
+                .collect::<Option<_>>()?;
+            if components.len() < 2 {
                 return None;
             }
-            Some((sub[0], sub))
+            Some((by, components))
         })
         .collect();
 

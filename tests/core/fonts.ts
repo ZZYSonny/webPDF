@@ -3,10 +3,12 @@
  */
 import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { mkdtemp, writeFile, rm } from 'node:fs/promises';
+import { mkdtemp, writeFile, rm, readFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import assert from 'node:assert/strict';
+import { create } from 'fontkit';
 import { ensurePapers } from '../pdf-cache.ts';
 import { textPdf } from '../helpers/pdf.ts';
 
@@ -20,9 +22,19 @@ const run = (command: string, args: string[]) => new Promise<void>((resolve, rej
   child.on('error', reject);
   child.on('exit', (code) => code === 0 ? resolve() : reject(new Error(`${command} exited ${code}`)));
 });
-await run('cargo', ['build', '--release', '--manifest-path', 'core/Cargo.toml', '--target-dir', 'core/target', '--bin', 'dump']);
+await run('cargo', ['build', '--release', '--manifest-path', 'core/Cargo.toml', '--target-dir', 'core/target', '--bin', 'dump', '--bin', 'tiny']);
 const dir = await mkdtemp(path.join(os.tmpdir(), 'webpdf-fonts-'));
 try {
+  // The builder's own ligature, with no PDF and no corpus in the way: a browser
+  // draws `fi` through this table, so a table whose offsets miss its lookup
+  // reads as a face that has no `liga` rule at all. Shape two letters through
+  // the compiled face and hold the result to the glyph the builder was given.
+  const tiny = path.join(dir, 'tiny-liga.otf');
+  await run(path.join(root, 'core/target/release/tiny'), [tiny, 'liga']);
+  const shaped = create(await readFile(tiny)).layout('AB').glyphs;
+  assert.equal(shaped.length, 1, 'a ligature rule joins its components into one glyph');
+  assert.equal(shaped[0].id, 2, 'the joined glyph is the one the builder was given');
+
   const generated = path.join(dir, 'text.pdf');
   await writeFile(generated, textPdf(2, 'Helvetica', 'office efficient & reading'));
   const files = [generated];

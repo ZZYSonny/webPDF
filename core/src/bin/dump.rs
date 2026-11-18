@@ -6,6 +6,7 @@ use std::fmt::Write as _;
 use std::fs;
 
 use webpdf_core::font::build::Cmd;
+use webpdf_core::json::quote;
 use webpdf_core::Core;
 
 fn cmds_json(cmds: &[Cmd]) -> String {
@@ -63,6 +64,17 @@ fn main() {
                 codes.join(","),
                 advance.map(|a| a.to_string()).unwrap_or_else(|| "null".into()),
                 cmds_json(cmds)
+            );
+        }
+        manifest.push_str("],\"ligatures\":[");
+        for (k, (gid, letters)) in face.ligatures.iter().enumerate() {
+            if k > 0 {
+                manifest.push(',');
+            }
+            let _ = write!(
+                manifest,
+                "{{\"gid\":{gid},\"letters\":{}}}",
+                quote(letters)
             );
         }
         manifest.push_str("]}");
