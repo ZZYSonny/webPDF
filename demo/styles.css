@@ -210,10 +210,10 @@ body {
 /**
  * The bionic list holds two settings - the fade and the words it marks - so it
  * is taller than a list of values. It may use more of the window before it
- * scrolls, which keeps all three word scopes in sight on a normal screen.
+ * scrolls, which keeps all four word scopes in sight on a normal screen.
  */
 .bionic-menu {
-  max-height: min(80vh, 560px);
+  max-height: min(80vh, 640px);
 }
 
 /**

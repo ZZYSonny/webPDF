@@ -369,7 +369,7 @@ export class PdfViewer {
   private bionicOn = false;
   /** How much strength the faded part of a word keeps, 0..1. */
   private bionicDimValue = BIONIC_DIM;
-  /** Which words bionic reading marks: the dictionary's, the long ones, or all. */
+  /** Which words bionic reading marks: prose, the dictionary's, the long ones, or all. */
   private bionicScopeValue: BionicScope = BIONIC_SCOPE;
   /** Bumped whenever the selection changes, so a running pass gives up. */
   private cropEpoch = 0;
@@ -943,10 +943,12 @@ export class PdfViewer {
    * stays where it is put: passing it without `on` is how a host changes the
    * fade while the mode is already on, and leaving it out keeps the value in
    * force (`BIONIC_DIM` until one is given). `scope` is the same for the words
-   * themselves: `'common'` (the default) marks the dictionary's words,
-   * `'short'` leaves the short ones alone, and `'all'` marks every word. Either
-   * way what is on screen was drawn the other way and is now wrong, so it is
-   * re-rendered - never re-measured, because a fade moves nothing.
+   * themselves: `'prose'` (the default) marks the dictionary's words but not
+   * the ones an equation is made of, `'common'` marks the dictionary's words
+   * including those, `'short'` leaves the short ones alone, and `'all'` marks
+   * every word. Either way what is on screen was drawn the other way and is now
+   * wrong, so it is re-rendered - never re-measured, because a fade moves
+   * nothing.
    */
   setBionic(on: boolean, dim?: number, scope?: BionicScope): void {
     const next = on === true;

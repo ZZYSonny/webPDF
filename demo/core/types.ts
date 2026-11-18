@@ -93,7 +93,7 @@ export interface RenderOptions {
   bionic?: boolean;
   /** How much strength the faded part keeps, 0..1. */
   bionicDim?: number;
-  /** Which words bionic reading marks. Default `'common'`. */
+  /** Which words bionic reading marks. Default `'prose'`. */
   bionicScope?: BionicScope;
 }
 

@@ -74,10 +74,10 @@ pub struct RenderOptions {
     /// How much of its strength the faded part of a word keeps, 0..1.
     /// `BIONIC_DIM` (a half) when unset; only meaningful while `bionic` is on.
     pub bionic_dim: Option<f32>,
-    /// Which words bionic reading marks: the dictionary's, the ones long enough
-    /// to have a tail, or every one (`bionic::Scope`). Only meaningful while
-    /// `bionic` is on; the default is the dictionary, because a formula is not
-    /// prose.
+    /// Which words bionic reading marks: the dictionary's, the dictionary's
+    /// without equation vocabulary, the ones long enough to have a tail, or
+    /// every one (`bionic::Scope`). Only meaningful while `bionic` is on; the
+    /// default leaves equation words alone, because a formula is not prose.
     pub bionic_scope: crate::bionic::Scope,
     /// The window onto the page: `(x, y, width, height)` in page units, which
     /// becomes the root's `viewBox` and its size.
@@ -2486,6 +2486,22 @@ mod tests {
         common.write_run(&run_of(text));
         assert!(!common.body.contains("fill-opacity"), "{}", common.body);
         assert_eq!(common.stats().faded, 0);
+    }
+
+    /// The default scope takes the equation words out of the dictionary: `min`
+    /// is a word in both, so `Common` fades its tail and `Prose` leaves it
+    /// exactly as the page drew it. The prose around it is still marked.
+    #[test]
+    fn bionic_prose_scope_leaves_equation_words_alone() {
+        let mut prose = device_scoped("", true, Scope::Prose, "min ");
+        prose.write_run(&run_of("min "));
+        assert!(!prose.body.contains("fill-opacity"), "{}", prose.body);
+        assert_eq!(prose.stats().faded, 0);
+
+        let mut common = device_scoped("", true, Scope::Common, "min ");
+        common.write_run(&run_of("min "));
+        assert!(common.body.contains("fill-opacity"), "{}", common.body);
+        assert!(common.stats().faded > 0);
     }
 
     /// `Skip short words` leaves `the` and `sin` exactly as the page drew them,

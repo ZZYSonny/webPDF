@@ -301,7 +301,8 @@ pub extern "C" fn wpdf_fonts(id: u32) -> i32 {
 ///
 /// `bionic_dim` is the fade's strength (a negative number asks for the default)
 /// and `bionic_scope` is the set of words it marks: 0 the dictionary, 1 the
-/// words of four letters or more, 2 every word.
+/// words of four letters or more, 2 every word, 3 the dictionary without the
+/// vocabulary of equations. A number the core does not know is 3, the default.
 ///
 /// # Safety
 ///

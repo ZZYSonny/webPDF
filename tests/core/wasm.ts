@@ -208,8 +208,9 @@ check('while a pattern that is one is accepted', accepted.ok === true && accepte
 const prefix = put(`p${page}-`);
 const className = put('wpdf-page-svg');
 const flags = 1 | 2 | 4 | 8; // responsive, embed fonts, bionic, links
-// The scope follows the dim: 0 is the dictionary (the viewer's default), 1
-// skips short words, 2 marks every word.
+// The scope follows the dim: 0 is the dictionary, 1 skips short words, 2 marks
+// every word, and 3 is the dictionary minus equation words - the viewer's
+// default.
 const rendered = frame(
   m._wpdf_render(id, page, prefix.ptr, prefix.size, className.ptr, className.size, flags, -1, 0, 0, 0, 0, 0),
   'render',
@@ -228,6 +229,31 @@ check(
   'and the bionic scope reaches the core, before or after the crop',
   allWords.header.stats.faded > rendered.header.stats.faded && fadedSpans(allSvg) > fadedSpans(svg),
   `${rendered.header.stats.faded} dictionary words, ${allWords.header.stats.faded} all words`,
+);
+// The new default is not a different filter over the same words: it takes the
+// dictionary's equation words out. Page 4 of the corpus has `max` in a formula
+// and `mean` in a footnote, so the two scopes differ there; page 0 would not
+// show it.
+const equationPage = Math.min(page + 4, info.pageCount - 1);
+const scopePrefix = put(`s${equationPage}-`);
+const scopeClass = put('wpdf-page-svg');
+const proseWords = frame(
+  m._wpdf_render(id, equationPage, scopePrefix.ptr, scopePrefix.size, scopeClass.ptr, scopeClass.size, 1 | 4 | 8, -1, 3, 0, 0, 0, 0),
+  'render prose',
+);
+const commonWords = frame(
+  m._wpdf_render(id, equationPage, scopePrefix.ptr, scopePrefix.size, scopeClass.ptr, scopeClass.size, 1 | 4 | 8, -1, 0, 0, 0, 0, 0),
+  'render dictionary',
+);
+m._free(scopePrefix.ptr);
+m._free(scopeClass.ptr);
+const proseSvg = new TextDecoder().decode(proseWords.payload);
+const commonSvg = new TextDecoder().decode(commonWords.payload);
+check(
+  'and the equation-free scope leaves the dictionary’s equation words alone',
+  proseWords.header.stats.faded < commonWords.header.stats.faded &&
+    fadedSpans(proseSvg) < fadedSpans(commonSvg),
+  `${proseWords.header.stats.faded} equation-free, ${commonWords.header.stats.faded} dictionary words`,
 );
 // The other half of the contract: a page that has to stand alone - a saved SVG,
 // or one drawn before the plan is ready - carries its own faces, because there

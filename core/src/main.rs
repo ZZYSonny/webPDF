@@ -8,8 +8,9 @@
 //!
 //!   WPDF_BIONIC=1            bionic reading
 //!   WPDF_BIONIC_DIM=0.35     how faint the rest of each word goes
-//!   WPDF_BIONIC_SCOPE=all    which words to mark: common (the default), short
-//!                            (four letters or more), or all
+//!   WPDF_BIONIC_SCOPE=prose  which words to mark: prose (the default; common
+//!                            words minus equation words), common, short (four
+//!                            letters or more), or all
 //!   WPDF_LINKS=1             append link hit areas
 //!   WPDF_CROP='^arXiv:;^\s*[0-9]+\s*$'   crop to the content minus these marks
 //!   WPDF_CROP_PADDING=6      points of margin around the crop

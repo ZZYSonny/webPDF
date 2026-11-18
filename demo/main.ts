@@ -796,12 +796,19 @@ const BIONIC_CHOICES: ReadonlyArray<{ dim: number; note: string }> = [
  *
  * It is a second setting rather than another strength: how faint the rest of a
  * word goes and which words are marked at all are independent choices, so the
- * rows are a group of their own. The dictionary is the default because a
- * formula's `dx`, `T0` and `2024` are words to the segmenter and not to a
- * reader, and fading part of one only makes the equation harder; the other two
- * rows are how a reader says "all of them" or "not the short ones".
+ * rows are a group of their own. The first row is the default: a formula's `i`,
+ * `min`, `max`, `sin` and `log` are dictionary words too, and fading the tail of
+ * one only makes the equation harder, so they are left out of the words a
+ * sentence is made of. The other rows are how a reader says "the dictionary
+ * after all", "all of them" or "not the short ones".
  */
 const BIONIC_WORDS: ReadonlyArray<{ scope: BionicScope; label: string; note: string; title: string }> = [
+  {
+    scope: 'prose',
+    label: 'Common words, no equations',
+    note: 'leaves i, min, max, sin, log and other equation words alone',
+    title: 'dictionary words, minus equations',
+  },
   {
     scope: 'common',
     label: 'Common words only',
@@ -873,8 +880,8 @@ function fillBionicMenu(): void {
       ),
     );
   }
-  // A heading rather than a row: the three scopes are a second setting, and
-  // "separate from the strength" has to be visible as well as true. It is not a
+  // A heading rather than a row: the scopes are a second setting, and "separate
+  // from the strength" has to be visible as well as true. It is not a
   // `.menu-option`, so the arrow keys walk the choices and skip the label.
   const heading = document.createElement('div');
   heading.className = 'menu-heading';

@@ -88,13 +88,22 @@ pub fn bionic_dim(value: Option<f32>) -> f32 {
 /// it harder to read rather than easier. The scope is what decides.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Scope {
+    /// The dictionary's words, without the vocabulary of equations.
+    ///
+    /// This is the default, because an equation is mostly symbols but its
+    /// function names and variables are often English words too - `min`, `max`,
+    /// `sin`, `log`, a lone `i` - and fading the tail of one makes the equation
+    /// harder to read. This is [`Scope::Common`] with [`EQUATION_WORDS`] and
+    /// single letters taken out. An identifier, a number or a word in another
+    /// script is left alone for the same reason it is under `Common`.
+    #[default]
+    Prose,
     /// Only the words the English dictionary knows.
     ///
-    /// This is the default, because prose is mostly dictionary words and a
-    /// formula is mostly not. A word the list does not know - an identifier, a
-    /// number, a word in a script the list does not cover - is left exactly as
-    /// the document set it. `build.rs` says where the list comes from.
-    #[default]
+    /// Prose is mostly dictionary words and a formula is mostly not. A word the
+    /// list does not know - an identifier, a number, a word in a script the list
+    /// does not cover - is left exactly as the document set it. `build.rs` says
+    /// where the list comes from.
     Common,
     /// Every word long enough to have a tail: four letters or more.
     ///
@@ -110,21 +119,26 @@ pub enum Scope {
 impl Scope {
     /// The scope a host's number names.
     ///
-    /// 0 is [`Scope::Common`], 1 [`Scope::Short`] and 2 [`Scope::All`]; a number
-    /// this core does not know is the default rather than an error, because a
-    /// host newer than the core must not be able to change what a page looks
-    /// like in a way the core cannot describe.
+    /// 0 is [`Scope::Common`], 1 [`Scope::Short`], 2 [`Scope::All`] and 3
+    /// [`Scope::Prose`] - the numbers the wire has always used for the first
+    /// three, and a new one for the scope that became the default. A number this
+    /// core does not know is the default rather than an error, because a host
+    /// newer than the core must not be able to change what a page looks like in
+    /// a way the core cannot describe.
     pub fn from_code(code: u32) -> Self {
         match code {
+            0 => Self::Common,
             1 => Self::Short,
             2 => Self::All,
-            _ => Self::Common,
+            _ => Self::Prose,
         }
     }
 
-    /// The scope a name in the environment names: `common`, `short` or `all`.
+    /// The scope a name in the environment names: `prose`, `common`, `short` or
+    /// `all`.
     pub fn from_name(name: &str) -> Option<Self> {
         match name.trim().to_ascii_lowercase().as_str() {
+            "prose" => Some(Self::Prose),
             "common" => Some(Self::Common),
             "short" => Some(Self::Short),
             "all" => Some(Self::All),
@@ -136,6 +150,35 @@ impl Scope {
 /// The length at which [`Scope::Short`] starts marking: words of three letters
 /// or fewer are left alone.
 const LONG_ENOUGH: usize = 4;
+
+/// The dictionary words [`Scope::Prose`] takes out: the vocabulary a formula
+/// spells out rather than one a sentence uses.
+///
+/// This is a judgement about a domain and not a corpus, so it is a short list in
+/// code rather than another dependency. It holds the function and operator names
+/// a formula writes (`min`, `max`, `sin`, `log`, `det`), the Greek letters it
+/// writes by name when it has no glyph, and the machine-learning names written as
+/// words (`softmax`, `relu`). It deliberately does not hold mathematics in
+/// general: `attention`, `gradient` and `matrix` are prose words in a paper about
+/// them, while `min` and `max` are marks inside its formulas. A single letter is
+/// always an equation word - it is a variable, and it has no tail to fade anyway.
+const EQUATION_WORDS: &[&str] = &[
+    // The functions and operators a formula spells out.
+    "abs", "acos", "acosh", "arg", "argmax", "argmin", "asin", "asinh", "atan", "atan2", "atanh",
+    "ceil", "corr", "cos", "cosh", "cot", "coth", "cov", "csc", "csch", "curl", "deg", "det",
+    "diag", "dim", "div", "dot", "erf", "erfc", "exp", "floor", "frac", "gcd", "grad", "hypot",
+    "im", "inf", "int", "ker", "lcm", "lim", "ln", "log", "max", "mean", "median",
+    "min", "mod", "norm", "oint", "prod", "rank", "re", "relu", "round", "sec", "sech", "sgn",
+    "sigmoid", "sin", "sinh", "softmax", "sqrt", "std", "sum", "sup", "tan", "tanh", "tr",
+    "trace", "var", "vec",
+    // The Greek letters, which a formula writes by name when it has no glyph.
+    "alpha", "beta", "chi", "delta", "epsilon", "eta", "gamma", "iota", "kappa", "lambda", "mu",
+    "nu", "omega", "omicron", "phi", "pi", "psi", "rho", "sigma", "tau", "theta", "upsilon",
+    "xi", "zeta",
+    // Machine-learning names that are written as words inside an equation.
+    "bce", "ce", "cnn", "elu", "gan", "gelu", "gru", "kl", "knn", "lda", "lstm", "mae", "mi",
+    "mlp", "mse", "nll", "pca", "ppl", "rnn", "selu", "svm", "topk", "vae",
+];
 
 /// The words [`Scope::Common`] knows, one per line and sorted, so a lookup is a
 /// binary search.
@@ -302,7 +345,8 @@ fn long_words(text: &str, fixed: &mut [bool]) {
     });
 }
 
-/// Whether the dictionary knows this word.
+/// The word in the form the lists are in, or `None` when the lists cannot know
+/// it: an empty word, or one with a character that is not a letter.
 ///
 /// The answer is about the word a reader sees, so the comparison is lower-case
 /// and the letters of a ligature have already been spelled out. A token with a
@@ -310,15 +354,33 @@ fn long_words(text: &str, fixed: &mut [bool]) {
 /// `T0` are identifiers - which is most of what keeps a formula out of the
 /// marks. A word in a script the list does not cover (Greek in a formula, a
 /// Chinese label) is simply not found, and is left alone for the same reason.
-fn common(word: &[char]) -> bool {
+fn folded(word: &[char]) -> Option<String> {
     if word.is_empty() || word.iter().any(|c| !c.is_alphabetic()) {
-        return false;
+        return None;
     }
     let mut lower = String::with_capacity(word.len());
     for c in word {
         lower.extend(c.to_lowercase());
     }
-    common_words().binary_search(&lower.as_str()).is_ok()
+    Some(lower)
+}
+
+/// Whether the generated list knows this word.
+fn known(word: &str) -> bool {
+    common_words().binary_search(&word).is_ok()
+}
+
+/// Whether the dictionary knows this word.
+fn common(word: &[char]) -> bool {
+    folded(word).is_some_and(|word| known(&word))
+}
+
+/// Whether a word is one a formula is made of rather than one a sentence uses.
+///
+/// `word` is folded to lower case already. Single letters are variables, and a
+/// variable has no tail to hold back - the fixation point is the letter itself.
+fn equation_word(word: &str) -> bool {
+    word.chars().count() == 1 || EQUATION_WORDS.contains(&word)
 }
 
 /// A stretch of characters that are nothing but white space, the way [`blank`]
@@ -357,6 +419,8 @@ fn scope_words(text: &str, scope: Scope, fixed: &mut [bool]) {
             j += 1;
         }
         let keep = match scope {
+            Scope::Prose => folded(&chars[i..j])
+                .is_some_and(|word| known(&word) && !equation_word(&word)),
             Scope::Common => common(&chars[i..j]),
             Scope::Short => j - i >= LONG_ENOUGH,
             Scope::All => true,
@@ -608,14 +672,15 @@ mod tests {
         assert_eq!(bionic_dim(Some(0.35)), 0.35);
     }
 
-    /// The same text, marked three ways. `All` marks every word; `Short` leaves
+    /// The same text, marked four ways. `All` marks every word; `Short` leaves
     /// the three-letter and shorter ones whole, which is where `dx` and `sin`
     /// live; `Common` also leaves `2024` whole, because a number is not a
-    /// dictionary word.
+    /// dictionary word; `Prose` also leaves the dictionary's equation words
+    /// whole.
     #[test]
     fn a_scope_leaves_the_words_it_does_not_cover_alone() {
         let text = "the 2024 dx coefficient";
-        for scope in [Scope::Common, Scope::Short, Scope::All] {
+        for scope in [Scope::Prose, Scope::Common, Scope::Short, Scope::All] {
             accounted_for_scope(text, scope);
         }
         // `bioneer` does not mark a word with no letter in it, so `2024` is
@@ -624,12 +689,37 @@ mod tests {
         assert_eq!(faded(&segments_with(text, Scope::All)), "e 2024 x nt");
         assert_eq!(faded(&segments_with(text, Scope::Short)), " 2024 nt");
         assert_eq!(faded(&segments_with(text, Scope::Common)), "e nt");
+        assert_eq!(faded(&segments_with(text, Scope::Prose)), "e nt");
         // The words left alone keep every letter: `2024` and `dx` are a fixation
         // stretch from end to end, and `the` and `coefficient` are marked around
         // them.
         assert_eq!(
             fixed(&segments_with(text, Scope::Common)),
             "th2024dxcoefficie"
+        );
+        assert_eq!(
+            fixed(&segments_with(text, Scope::Prose)),
+            "th2024dxcoefficie"
+        );
+    }
+
+    /// The new scope is the dictionary minus the words a formula is made of: the
+    /// same sentence marks its prose and leaves `I`, `min`, `max`, `sin` and
+    /// `log` whole, where `Common` fades their tails.
+    #[test]
+    fn prose_scope_leaves_equation_words_alone() {
+        let text = "I min max sin log coefficient";
+        accounted_for_scope(text, Scope::Prose);
+        assert_eq!(faded(&segments_with(text, Scope::Prose)), "nt");
+        assert_eq!(
+            fixed(&segments_with(text, Scope::Prose)),
+            "Iminmaxsinlogcoefficie"
+        );
+        // The difference is exactly the equation words: the dictionary marks
+        // their tails, and this scope leaves them to the document.
+        assert_eq!(
+            faded(&segments_with(text, Scope::Common)),
+            "I n x n g nt"
         );
     }
 
@@ -694,8 +784,10 @@ mod tests {
         assert_eq!(Scope::from_code(0), Scope::Common);
         assert_eq!(Scope::from_code(1), Scope::Short);
         assert_eq!(Scope::from_code(2), Scope::All);
-        assert_eq!(Scope::from_code(7), Scope::Common);
-        assert_eq!(Scope::default(), Scope::Common);
+        assert_eq!(Scope::from_code(3), Scope::Prose);
+        assert_eq!(Scope::from_code(7), Scope::Prose);
+        assert_eq!(Scope::default(), Scope::Prose);
+        assert_eq!(Scope::from_name("prose"), Some(Scope::Prose));
         assert_eq!(Scope::from_name("common"), Some(Scope::Common));
         assert_eq!(Scope::from_name(" Short "), Some(Scope::Short));
         assert_eq!(Scope::from_name("ALL"), Some(Scope::All));

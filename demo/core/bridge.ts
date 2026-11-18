@@ -53,7 +53,10 @@ export interface CoreModule {
     classLen: number,
     flags: number,
     bionicDim: number,
-    /** 0 dictionary words, 1 four letters or more, 2 every word. */
+    /**
+     * 0 dictionary words, 1 four letters or more, 2 every word, 3 the
+     * dictionary minus equation words.
+     */
     bionicScope: number,
     cropX: number,
     cropY: number,
@@ -107,11 +110,13 @@ const FLAG = {
 /**
  * Bionic reading's word scope, as the number the core reads.
  *
- * The core's default is the dictionary, and `BIONIC_SCOPE` in `bionic.ts` is
- * the same default; a host that says nothing here gets the one the viewer opens
- * with rather than an accident of the wire.
+ * Number 3 is the newer scope, and the one that is the default; 0 is still the
+ * dictionary, so a host written before the new scope keeps the behaviour it
+ * asked for. `BIONIC_SCOPE` in `bionic.ts` is the same default; a host that says
+ * nothing here gets the one the viewer opens with rather than an accident of the
+ * wire.
  */
-const SCOPE: Record<BionicScope, number> = { common: 0, short: 1, all: 2 };
+const SCOPE: Record<BionicScope, number> = { prose: 3, common: 0, short: 1, all: 2 };
 
 /**
  * Load the core.
@@ -273,7 +278,7 @@ export class Core {
             classLen,
             flags,
             opts.bionicDim ?? -1,
-            SCOPE[opts.bionicScope ?? 'common'],
+            SCOPE[opts.bionicScope ?? 'prose'],
             crop?.x ?? 0,
             crop?.y ?? 0,
             crop?.width ?? 0,

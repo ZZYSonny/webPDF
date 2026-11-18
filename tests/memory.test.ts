@@ -126,7 +126,9 @@ test('the settings a document was left with are the ones the next one starts wit
 test('the word scope is remembered with the fade', () => {
   const marked = put({}, 'url:a', { settings: { bionic: { on: true, dim: 0.4, scope: 'all' } } }, at(1));
   assert.equal(inherited(marked)?.bionic?.scope, 'all');
-  const older = put({}, 'url:b', { settings: { bionic: { on: true, dim: 0.4 } } }, at(2));
+  const prose = put({}, 'url:b', { settings: { bionic: { on: true, dim: 0.4, scope: 'prose' } } }, at(2));
+  assert.equal(inherited(prose)?.bionic?.scope, 'prose');
+  const older = put({}, 'url:c', { settings: { bionic: { on: true, dim: 0.4 } } }, at(3));
   assert.equal(inherited(older)?.bionic?.scope, undefined);
 });
 

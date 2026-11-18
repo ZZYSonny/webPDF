@@ -395,15 +395,19 @@ pages' zoom belongs to the viewer:
   the rest is faded with `fill-opacity` — the string, the character order and
   every position are untouched, so copying a page gives the document's own text.
   A word drawn in more than one run — a font or colour change inside it makes it
-  two — is still marked as one word, by its whole length. Three word scopes sit
-  under the same menu, separate from the strength: **Common words only** (the
-  default) marks the words an English dictionary knows and leaves an equation's
-  `dx`, `T0` and `2024` as the page set them; **Skip short words** leaves words
-  of three letters or fewer alone; **All words** marks every one. The dictionary
-  is the 10,000 most frequent English words in Google Books, from the
+  two — is still marked as one word, by its whole length. Four word scopes sit
+  under the same menu, separate from the strength: **Common words, no equations**
+  (the default) marks the words an English dictionary knows but not the
+  vocabulary a formula is made of — `i`, `min`, `max`, `sin`, `log`, `det`, the
+  Greek letters and the machine-learning names written as words — so an
+  equation's function names stay as the page set them; **Common words only** is
+  the dictionary after all; **Skip short words** leaves words of three letters or
+  fewer alone; **All words** marks every one. The dictionary is the 10,000 most
+  frequent English words in Google Books, from the
   [`common-words-all`](https://crates.io/crates/common-words-all) crate (MIT),
   turned into a sorted list by `build.rs` — the data is a build dependency, not
-  a file in this repository.
+  a file in this repository. The equation vocabulary is a short list in
+  `bionic.rs`, because it is a judgement about a domain rather than a corpus.
 * **Ctrl+F finds, Ctrl+S saves, Ctrl+P prints, Ctrl+O opens — and the card
   writes the keyboard down.** With nothing open there is no bar to look in, so
   the keys this page takes over from the browser are rows in a box under the
@@ -511,7 +515,7 @@ core/                       the engine: Rust, MuPDF, built to wasm
   src/font/woff.rs          sfnt → WOFF
   src/crop.rs               the box a list of regular expressions leaves
   src/links.rs              link annotations → hit areas, and where they point
-  src/bionic.rs             bioneer: the fixation points, as fill-opacity
+  src/bionic.rs             bioneer: the fixation points and the word scopes
   src/wasm.rs               the bridge: frames, exports, the document table
   src/bin/engine.rs         the wasm main module (keeps the exports alive)
   src/main.rs               the native probe and its WPDF_* options
