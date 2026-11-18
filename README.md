@@ -505,6 +505,11 @@ zip is signed into a `.crx`. Keep the private key (`ext/key.pem`, or
 `$WEBPDF_EXT_KEY` in the environment) out of the repository; the public key is
 not a secret. A crx is not accepted by the Chrome Web Store.
 
+The listing around the package — the copy for every field, the icon, the
+screenshots and the two promotional tiles — is `ext/store/`; `ext/store/listing.md`
+is the field-by-field version to paste into the store, and `ext/store/shoot.ts`
+and `ext/store/assets.py` regenerate the images from the real viewer.
+
 ---
 
 ## Layout
@@ -554,6 +559,7 @@ demo/                       the viewer (the Vite root, and the site)
   host.ts                   the bridge to a host page (the extension)
 
 ext/                        the browser extension: a shell around the viewer
+  store/                    the store listing: copy, icon, screenshots, tiles
 scripts/build-core-wasm.ts  the wasm build: two profiles, and why the flags
 scripts/build-extension.ts  staging and packing, from the compiled extension
 scripts/crx.ts              CRX3: the signing, the header, and reading one back
