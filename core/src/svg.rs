@@ -323,6 +323,27 @@ struct Run {
     /// The glyph matrix's linear part: the run only holds glyphs that share it.
     linear: (f32, f32, f32, f32),
     items: Vec<RunItem>,
+    /// Bionic reading's answer for every item, when the run was marked as part
+    /// of a stretch that spans runs; `None` when the run's own text decides,
+    /// which is what `write_run` does for a run written on its own.
+    fade: Option<Vec<Option<bool>>>,
+}
+
+/// A run that is not written yet, with the markup that followed it.
+///
+/// Bionic reading marks a word's first letters by the word's whole length, and a
+/// word is not always drawn in one run: a font or colour change inside it is a
+/// second text object, and the two are as much one word to a reader as to the
+/// page's own text. The run waits here until the word it ends in is over, and
+/// `markup` - drawn after the run's glyphs and before anything that could
+/// continue the word - goes out in the same place, after the run.
+///
+/// Nothing is held across markup or across a sink: `emit` and the definition
+/// boundaries release the held runs first, so the output stays in drawing order
+/// and a held word never lands inside a `<g>` or a `<mask>` it was not drawn in.
+struct Held {
+    run: Run,
+    markup: String,
 }
 
 /// A MuPDF device that writes the page's SVG.
@@ -346,6 +367,9 @@ pub struct SvgDevice {
     /// glyph became text.
     placed: HashMap<(i64, i64), Vec<(f32, f32, bool)>>,
     run: Option<Run>,
+    /// Runs held back because the word their text ends in may go on in the next
+    /// run; [`Held`] says why. Empty unless bionic reading is on.
+    held: Vec<Held>,
     /// Markup written while a run was open: it waits behind the run's text.
     ///
     /// The text device reports a space before the character that follows it, and
@@ -442,6 +466,7 @@ impl SvgDevice {
             mark_cells,
             placed: HashMap::new(),
             run: None,
+            held: Vec::new(),
             pending: String::new(),
             run_gap: false,
             used: Vec::new(),
@@ -586,11 +611,26 @@ impl SvgDevice {
 
     /// Write markup: straight out when nothing is open, and behind the open run
     /// when one is, so that the run is written where its first glyph was.
+    ///
+    /// Markup also ends a held word. It is drawn after the glyphs the word is
+    /// made of, so the word cannot go on across it, and the run that ran into
+    /// it is closed with the markup written where it was drawn.
     fn emit(&mut self, text: &str) {
         if self.run.is_some() {
             self.pending.push_str(text);
             self.run_gap = true;
-        } else if self.in_defs > 0 {
+        } else {
+            self.release();
+            self.put(text);
+        }
+    }
+
+    /// Write markup to the sink the page is currently filling.
+    fn put(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        if self.in_defs > 0 {
             self.defs.push_str(text);
         } else {
             self.body.push_str(text);
@@ -606,12 +646,14 @@ impl SvgDevice {
         if self.in_defs == 0 {
             self.flush_run();
         }
+        self.release();
         self.in_defs += 1;
     }
 
     /// End the innermost definition. A run opened inside it is written inside it.
     fn end_defs(&mut self) {
         self.flush_run();
+        self.release();
         self.in_defs = self.in_defs.saturating_sub(1);
     }
 
@@ -873,6 +915,19 @@ impl SvgDevice {
     /// two glyphs is two drawings however alike the rest of the geometry is. So
     /// is anything the page drew in between: those glyphs are not adjacent in
     /// the output however close they are on the page.
+    ///
+    /// A change of font or colour can also happen in the middle of a word, and
+    /// then the two runs are one word to a reader. Whether they are is the page's
+    /// own text's to say (`CharGrid::joins`), and when it says yes the run that
+    /// ends is held instead of written: bionic reading cannot mark its first
+    /// letters until it knows the whole word, which may be finished in a run that
+    /// has not arrived yet.
+    ///
+    /// Only a run at the same size and in the same direction is a candidate. A
+    /// change of either is how a subscript or a superscript is set, and those are
+    /// letters of a formula rather than a word continuing - joining them would
+    /// mark `R` and its two little indices as one word, which is not what a
+    /// reader reads.
     fn start_run(&mut self, entry: usize, paint: &str, m: &Matrix) {
         let linear = (m.a, m.b, m.c, m.d);
         if let Some(run) = &self.run {
@@ -880,7 +935,9 @@ impl SvgDevice {
                 return;
             }
         }
-        self.flush_run();
+        let same_geometry = self.run.as_ref().is_some_and(|run| run.linear == linear);
+        let hold = self.bionic.is_some() && same_geometry && self.joins_next(m.e, m.f);
+        self.close_run(hold);
         if !self.used.contains(&entry) {
             self.used.push(entry);
         }
@@ -895,7 +952,25 @@ impl SvgDevice {
             paint: paint.to_string(),
             linear,
             items: Vec::new(),
+            fade: None,
         });
+    }
+
+    /// Whether the glyph at a point continues the word the open run ends in.
+    ///
+    /// Both halves have to be there: the run's text has to end in a word
+    /// character - a run ending in a separator ends its word - and the page's own
+    /// text has to read the two origins as consecutive characters of one line
+    /// with nothing between them. The second is what keeps two words that merely
+    /// look adjacent apart.
+    fn joins_next(&self, x: f32, y: f32) -> bool {
+        let Some(run) = &self.run else {
+            return false;
+        };
+        let Some(last) = run.items.last() else {
+            return false;
+        };
+        crate::bionic::ends_in_word(&last.text) && self.chars.joins((last.x, last.y), (x, y))
     }
 
     fn push_item(&mut self, item: RunItem) {
@@ -905,20 +980,55 @@ impl SvgDevice {
     }
 
     /// Write the run that is open, if there is one, and then the markup that was
-    /// written while it was open.
+    /// written while it was open. Anything held behind it goes out first.
     fn flush_run(&mut self) {
-        if let Some(run) = self.run.take() {
+        self.close_run(false);
+    }
+
+    /// Close the open run: held back when its last word may go on in the next
+    /// run, and written - with everything already held ahead of it - when it does
+    /// not.
+    fn close_run(&mut self, hold: bool) {
+        let markup = std::mem::take(&mut self.pending);
+        // Markup written while the run was open comes after its glyphs, so the
+        // word cannot have gone on across it however it was asked to hold.
+        let interrupted = std::mem::replace(&mut self.run_gap, false);
+        let Some(run) = self.run.take() else {
+            self.put(&markup);
+            return;
+        };
+        if hold && !interrupted {
+            self.held.push(Held { run, markup });
+        } else if self.held.is_empty() {
             self.write_run(&run);
+            self.put(&markup);
+        } else {
+            // This run is part of the stretch the held ones are in, so it is
+            // marked with them: `Incorpora` and the `te` in this run are eleven
+            // letters between them.
+            self.held.push(Held { run, markup });
+            self.release();
         }
-        if !self.pending.is_empty() {
-            let pending = std::mem::take(&mut self.pending);
-            if self.in_defs > 0 {
-                self.defs.push_str(&pending);
-            } else {
-                self.body.push_str(&pending);
-            }
+    }
+
+    /// Write the held runs and the markup that followed each of them.
+    ///
+    /// The stretch they make ends here - at the word that closed it, or where the
+    /// markup or the page did - so this is where bionic reading marks it: the
+    /// runs are segmented as the one text they are, because a word that straddles
+    /// two of them is decided by its whole length.
+    fn release(&mut self) {
+        if self.held.is_empty() {
+            return;
         }
-        self.run_gap = false;
+        let mut held = std::mem::take(&mut self.held);
+        if self.bionic.is_some() {
+            mark_held(&mut held);
+        }
+        for held in held {
+            self.write_run(&held.run);
+            self.put(&held.markup);
+        }
     }
 
     /// Write one run as a `<text>` element.
@@ -945,8 +1055,10 @@ impl SvgDevice {
         // What bionic reading fades, one answer per item; None when it is off,
         // and also when the segments do not account for every character of the
         // run, which writes it plainly rather than faded in the wrong places.
+        // A held run was marked as part of the stretch it belongs to, and that
+        // stretch may be wider than the run: its answer is the one to use.
         let fade: Option<Vec<Option<bool>>> = match self.bionic {
-            Some(_) => Self::fades(&run.items),
+            Some(_) => run.fade.clone().or_else(|| Self::fades(&run.items)),
             None => None,
         };
         // A glyph that stands for several characters gets a `<tspan>` of its own:
@@ -1023,39 +1135,18 @@ impl SvgDevice {
 
     /// Whether bionic reading fades each item of a run.
     ///
-    /// `bionic::segments` marks *letters*, and an item can stand for several of
-    /// them: a ligature is one outline and cannot be drawn half dark, so it takes
-    /// the answer of the stretch its *first* letter is in. `None` when the
-    /// segments do not account for every character of the run, which writes it
-    /// unfaded - the caller's concern, and `bionic.rs` says why it is the right
-    /// fallback.
-    ///
-    /// A stretch of nothing but whitespace answers `None` rather than a fade: it
-    /// is between two words rather than in one, and fading it would be an
-    /// attribute that draws no pixel. It still gets its own `<tspan>`, which is
-    /// what keeps a space out of the fixation point next to it.
+    /// An item takes the answer of the stretch its *first* character is in: a
+    /// glyph that stands for several letters - a ligature - is one outline and
+    /// cannot be drawn half dark. `None` when the segments do not account for
+    /// every character of the run, which writes it unfaded - the caller's
+    /// concern, and `bionic.rs` says why it is the right fallback.
     fn fades(items: &[RunItem]) -> Option<Vec<Option<bool>>> {
         let text: String = items.iter().map(|item| item.text.as_str()).collect();
-        let segments = crate::bionic::segments(&text);
-        let total: usize = items.iter().map(|item| item.len).sum();
-        if segments.iter().map(|segment| segment.chars).sum::<usize>() != total {
-            return None;
-        }
-
-        let mut out = Vec::with_capacity(items.len());
+        let fades = char_fades(&text)?;
         let mut at = 0usize;
-        let mut seg = 0usize;
-        let mut start = 0usize;
+        let mut out = Vec::with_capacity(items.len());
         for item in items {
-            while seg < segments.len() && at >= start + segments[seg].chars {
-                start += segments[seg].chars;
-                seg += 1;
-            }
-            out.push(match segments.get(seg) {
-                None => Some(false),
-                Some(segment) if crate::bionic::blank(&segment.text) => None,
-                Some(segment) => Some(!segment.fixation),
-            });
+            out.push(fades.get(at).copied().flatten());
             at += item.len;
         }
         Some(out)
@@ -1064,6 +1155,9 @@ impl SvgDevice {
     /// What the page has so far, wrapped in a root the host can put in a frame.
     pub fn finish(&mut self, width: f32, height: f32, opts: &RenderOptions) -> String {
         self.flush_run();
+        // The page ends the last word like anything else does, so whatever is
+        // still held is released before the markup around it is closed.
+        self.release();
         // Whatever the page left open is closed here: an SVG with a group left
         // hanging is one no browser will load, and drawing the whole page is a
         // worse failure than drawing it with one clip too few.
@@ -1119,6 +1213,60 @@ impl SvgDevice {
         svg.push_str(&self.body);
         svg.push_str("</svg>");
         svg
+    }
+}
+
+/// Bionic reading's answer for each character of `text`.
+///
+/// `Some(true)` is faded, `Some(false)` is a fixation point, and `None` is a
+/// stretch of nothing but whitespace: it is between two words rather than in
+/// one, and fading it would be an attribute that draws no pixel - but it still
+/// gets a `<tspan>` of its own, which is what keeps a space out of the fixation
+/// point next to it. `None` for the whole answer when the segments do not
+/// account for every character, which writes the text plainly rather than faded
+/// in the wrong places.
+fn char_fades(text: &str) -> Option<Vec<Option<bool>>> {
+    let segments = crate::bionic::segments(text);
+    let total = text.chars().count();
+    if segments.iter().map(|segment| segment.chars).sum::<usize>() != total {
+        return None;
+    }
+    let mut out = Vec::with_capacity(total);
+    for segment in &segments {
+        let fade = if crate::bionic::blank(&segment.text) {
+            None
+        } else {
+            Some(!segment.fixation)
+        };
+        out.extend(std::iter::repeat_n(fade, segment.chars));
+    }
+    Some(out)
+}
+
+/// Mark the held runs for bionic reading.
+///
+/// The runs are one stretch of the page's text - a word drawn in two of them is
+/// partly in each - so the stretch is segmented once, as a whole, and an item
+/// takes the answer of the character it starts at. That is the point of holding
+/// them: `Incorpora` and `ted` are eleven letters, and the eleven-letter word is
+/// marked `Incorpora`, which neither half could have been marked as on its own.
+fn mark_held(held: &mut [Held]) {
+    let text: String = held
+        .iter()
+        .flat_map(|held| held.run.items.iter())
+        .map(|item| item.text.as_str())
+        .collect();
+    let Some(fades) = char_fades(&text) else {
+        return;
+    };
+    let mut at = 0usize;
+    for held in held.iter_mut() {
+        let mut items = Vec::with_capacity(held.run.items.len());
+        for item in &held.run.items {
+            items.push(fades.get(at).copied().flatten());
+            at += item.len;
+        }
+        held.run.fade = Some(items);
     }
 }
 
@@ -2048,6 +2196,7 @@ impl SvgDevice {
             mark_cells: std::mem::take(&mut self.mark_cells),
             placed: std::mem::take(&mut self.placed),
             run: self.run.take(),
+            held: std::mem::take(&mut self.held),
             pending: std::mem::take(&mut self.pending),
             run_gap: self.run_gap,
             used: std::mem::take(&mut self.used),
@@ -2077,6 +2226,24 @@ mod tests {
 
     /// The same, with bionic reading on at the default strength.
     fn device_with(prefix: &str, bionic: bool) -> SvgDevice {
+        device_with_text(prefix, bionic, "")
+    }
+
+    /// The same, with the text device's answer for the page as well: the page's
+    /// characters, one per point, all on one line. That answer is what tells a
+    /// word drawn in two runs from two words, so a test that joins or does not
+    /// join needs it.
+    fn device_with_text(prefix: &str, bionic: bool, text: &str) -> SvgDevice {
+        let chars: Vec<crate::text::TextChar> = text
+            .chars()
+            .enumerate()
+            .map(|(i, text)| crate::text::TextChar {
+                text,
+                x: i as f32,
+                y: 0.0,
+                line: 1,
+            })
+            .collect();
         let opts = RenderOptions {
             id_prefix: prefix.to_string(),
             bionic,
@@ -2085,11 +2252,31 @@ mod tests {
         SvgDevice::new(
             Rc::new(Plan::new()),
             Rc::new(HashMap::new()),
-            Rc::new(CharGrid::new(&[])),
+            Rc::new(CharGrid::new(&chars)),
             &[],
             (400.0, 300.0),
             &opts,
         )
+    }
+
+    /// Draw one run's worth of characters at their own offsets, in a run of its
+    /// own: the entry is what makes `start_run` close the previous one. Returns
+    /// the offset the next run starts at.
+    fn draw_run(device: &mut SvgDevice, entry: usize, at: usize, text: &str) -> usize {
+        device.start_run(
+            entry,
+            " fill=\"#000000\"",
+            &Matrix::new_translate(at as f32, 0.0),
+        );
+        for (i, c) in text.chars().enumerate() {
+            device.push_item(RunItem {
+                x: (at + i) as f32,
+                y: 0.0,
+                text: c.to_string(),
+                len: 1,
+            });
+        }
+        at + text.chars().count()
     }
 
     /// A run of one character per item, each at its own offset, for the parts of
@@ -2117,6 +2304,7 @@ mod tests {
             paint: " fill=\"#000000\"".into(),
             linear: (1.0, 0.0, 0.0, 1.0),
             items,
+            fade: None,
         }
     }
 
@@ -2158,6 +2346,85 @@ mod tests {
              <tspan fill-opacity=\"0.5\" x=\"2\" y=\"0\">ce</tspan>"
         ), "{}", device.body);
         assert_eq!(device.stats().faded, 1);
+    }
+
+    /// A font change inside a word makes two runs of one word, and bionic
+    /// reading marks it as one: `Incorporate` is eleven letters, so its fixation
+    /// point is `Incorpora` - nine - and neither run had the whole word to count.
+    #[test]
+    fn bionic_marks_a_word_split_across_runs_as_one_word() {
+        let mut device = device_with_text("", true, "Incorporate ");
+        let at = draw_run(&mut device, 0, 0, "Incorpora");
+        draw_run(&mut device, 1, at, "te ");
+        device.flush_run();
+        assert!(device.body.contains(
+            "<tspan x=\"0 1 2 3 4 5 6 7 8\" y=\"0 0 0 0 0 0 0 0 0\">Incorpora</tspan>"
+        ), "{}", device.body);
+        assert!(device.body.contains(
+            "<tspan fill-opacity=\"0.5\" x=\"9 10 11\" y=\"0 0 0\">te </tspan>"
+        ), "{}", device.body);
+        assert_eq!(device.stats().faded, 3);
+    }
+
+    /// The word can be drawn in as many runs as the page likes: each one waits
+    /// for the run that ends the word, and the marks are made once, over all of
+    /// them.
+    #[test]
+    fn bionic_marks_a_word_split_across_three_runs() {
+        let mut device = device_with_text("", true, "Incorporate ");
+        let at = draw_run(&mut device, 0, 0, "Incorpo");
+        let at = draw_run(&mut device, 1, at, "ra");
+        draw_run(&mut device, 2, at, "te ");
+        device.flush_run();
+        assert!(device.body.contains(
+            "<tspan x=\"0 1 2 3 4 5 6\" y=\"0 0 0 0 0 0 0\">Incorpo</tspan>"
+        ), "{}", device.body);
+        assert!(device.body.contains(
+            "<tspan x=\"7 8\" y=\"0 0\">ra</tspan>"
+        ), "{}", device.body);
+        assert!(device.body.contains(
+            "<tspan fill-opacity=\"0.5\" x=\"9 10 11\" y=\"0 0 0\">te </tspan>"
+        ), "{}", device.body);
+        assert_eq!(device.stats().faded, 3);
+    }
+
+    /// Two words drawn one after the other are not one word, even with nothing
+    /// drawn between them: the page's own text has the space, and the join is
+    /// only made where it does not.
+    #[test]
+    fn bionic_does_not_join_two_words_the_text_device_separates() {
+        let mut device = device_with_text("", true, "Incorpora te ");
+        let at = draw_run(&mut device, 0, 0, "Incorpora");
+        draw_run(&mut device, 1, at + 1, "te ");
+        device.flush_run();
+        // `Incorpora` alone is a nine-letter word: `Incorpo` stays and `ra` goes.
+        assert!(device.body.contains(
+            "<tspan x=\"0 1 2 3 4 5 6\" y=\"0 0 0 0 0 0 0\">Incorpo</tspan>"
+        ), "{}", device.body);
+        assert!(device.body.contains(
+            "<tspan fill-opacity=\"0.5\" x=\"7 8\" y=\"0 0\">ra</tspan>"
+        ), "{}", device.body);
+    }
+
+    /// Markup drawn between two halves of a word ends the word: it is drawn
+    /// after the glyphs the first half is made of, and nothing can continue the
+    /// word across it. The held run is written where it was drawn, before that
+    /// markup, and each half is marked as the fragment it is.
+    #[test]
+    fn bionic_does_not_join_a_word_across_markup() {
+        let mut device = device_with_text("", true, "Incorporate ");
+        draw_run(&mut device, 0, 0, "Incorpora");
+        device.emit("<g>");
+        draw_run(&mut device, 1, 9, "te ");
+        device.flush_run();
+        let first = device.body.find("Incorpo").expect("first half written");
+        let group = device.body.find("<g>").expect("markup written");
+        let second = device.body.find("e </tspan>").expect("second half written");
+        assert!(first < group && group < second, "{}", device.body);
+        // The first half was marked as the nine-letter word it is on its own.
+        assert!(device.body.contains(
+            "<tspan fill-opacity=\"0.5\" x=\"7 8\" y=\"0 0\">ra</tspan>"
+        ), "{}", device.body);
     }
 
     /// The strength is the caller's, not a constant: the same page can be drawn

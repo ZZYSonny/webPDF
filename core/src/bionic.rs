@@ -182,6 +182,17 @@ fn word_char(c: char) -> bool {
     c.is_alphabetic() || c.is_numeric()
 }
 
+/// Whether the last character of `text` is one a word can go on from.
+///
+/// The caller holds back a run whose text ends in one of these, because that
+/// word may be finished in the next run - a font or colour change inside a word
+/// is a second text object - and how much of *this* run is a fixation point
+/// depends on the whole word's length. A run ending in a separator or a space
+/// ends its word, so it needs no holding.
+pub fn ends_in_word(text: &str) -> bool {
+    text.chars().next_back().is_some_and(word_char)
+}
+
 /// Put the marks of every word longer than the table back to what the table says.
 fn long_words(text: &str, fixed: &mut [bool]) {
     let chars: Vec<char> = text.chars().collect();
@@ -345,6 +356,19 @@ mod tests {
         let text = "x <b>hello</b> y";
         accounted_for(text);
         assert_eq!(fixed(&segments(text)), "hel");
+    }
+
+    /// A run that ends in one of these may be a word's first half, and the
+    /// caller holds it back until the rest arrives. A separator ends the word
+    /// there and then, so nothing can follow it.
+    #[test]
+    fn a_word_can_go_on_from_a_letter_or_a_digit() {
+        assert!(ends_in_word("Incorpora"));
+        assert!(ends_in_word("2"));
+        assert!(!ends_in_word("Incorpora-"));
+        assert!(!ends_in_word("word "));
+        assert!(!ends_in_word(", "));
+        assert!(!ends_in_word(""));
     }
 
     /// A ligature is one glyph and two letters. `office` is six letters, so the

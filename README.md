@@ -393,7 +393,9 @@ pages' zoom belongs to the viewer:
 * **Bionic reading is one choice: off, or a fade at some strength.** The first
   letters of every word are held at full strength and the rest is faded with
   `fill-opacity` — the string, the character order and every position are
-  untouched, so copying a page gives the document's own text.
+  untouched, so copying a page gives the document's own text. A word drawn in
+  more than one run — a font or colour change inside it makes it two — is still
+  marked as one word, by its whole length.
 * **Ctrl+F finds, Ctrl+S saves, Ctrl+P prints, Ctrl+O opens — and the card
   writes the keyboard down.** With nothing open there is no bar to look in, so
   the keys this page takes over from the browser are rows in a box under the

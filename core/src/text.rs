@@ -139,7 +139,12 @@ pub fn space_marks(chars: &[TextChar]) -> Vec<SpaceMark> {
 /// glyph would put a character into the text that the page does not have, which
 /// is exactly how the space between two lines comes out twice.
 pub struct CharGrid {
-    cells: HashMap<(i64, i64), Vec<(f32, f32, u32)>>,
+    cells: HashMap<(i64, i64), Vec<(f32, f32, usize)>>,
+    /// The characters themselves, in the order they were read.
+    ///
+    /// A cell answers what one point is; [`CharGrid::joins`] asks what lies
+    /// *between* two points, and that is a question about the stream.
+    order: Vec<TextChar>,
 }
 
 fn cell(v: f32) -> i64 {
@@ -148,14 +153,64 @@ fn cell(v: f32) -> i64 {
 
 impl CharGrid {
     pub fn new(chars: &[TextChar]) -> Self {
-        let mut cells: HashMap<(i64, i64), Vec<(f32, f32, u32)>> = HashMap::new();
-        for char_ in chars {
+        let mut cells: HashMap<(i64, i64), Vec<(f32, f32, usize)>> = HashMap::new();
+        for (index, char_) in chars.iter().enumerate() {
             cells
                 .entry((cell(char_.x), cell(char_.y)))
                 .or_default()
-                .push((char_.x, char_.y, char_.text as u32));
+                .push((char_.x, char_.y, index));
         }
-        Self { cells }
+        Self {
+            cells,
+            order: chars.to_vec(),
+        }
+    }
+
+    /// The index in the text stream of the character read at a point, when one
+    /// character is read there and only one.
+    fn index_at(&self, x: f32, y: f32) -> Option<usize> {
+        let (cx, cy) = (cell(x), cell(y));
+        let mut found: Option<usize> = None;
+        for dx in -1..=1 {
+            for dy in -1..=1 {
+                let Some(bucket) = self.cells.get(&(cx + dx, cy + dy)) else {
+                    continue;
+                };
+                for (px, py, index) in bucket {
+                    if (px - x).abs() <= ANCHOR_EPSILON && (py - y).abs() <= ANCHOR_EPSILON {
+                        // Two characters read at one point are ambiguous, and an
+                        // ambiguous point is not a join.
+                        if found.is_some_and(|found| found != *index) {
+                            return None;
+                        }
+                        found = Some(*index);
+                    }
+                }
+            }
+        }
+        found
+    }
+
+    /// Whether the glyphs at two origins are consecutive characters of one line
+    /// of the page's text, with nothing between them.
+    ///
+    /// This is what tells one word drawn in two runs from two words drawn one
+    /// after the other: the page's own text has the space inside the second and
+    /// none inside the first. A point that names no character, or two, is not a
+    /// join, and neither is a pair out of reading order - the conservative
+    /// answer, because a wrong join marks a word by the wrong length.
+    pub fn joins(&self, from: (f32, f32), to: (f32, f32)) -> bool {
+        let (Some(from), Some(to)) = (self.index_at(from.0, from.1), self.index_at(to.0, to.1))
+        else {
+            return false;
+        };
+        if to <= from {
+            return false;
+        }
+        let line = self.order[from].line;
+        self.order[from..=to]
+            .iter()
+            .all(|char_| char_.line == line && !is_space_char(char_.text))
     }
 
     /// Whether the device read a character *other* than this one at a point.
@@ -174,10 +229,10 @@ impl CharGrid {
                 let Some(bucket) = self.cells.get(&(cx + dx, cy + dy)) else {
                     continue;
                 };
-                for (px, py, read) in bucket {
+                for (px, py, index) in bucket {
                     if (px - x).abs() <= ANCHOR_EPSILON
                         && (py - y).abs() <= ANCHOR_EPSILON
-                        && *read != code
+                        && self.order[*index].text as u32 != code
                     {
                         return true;
                     }
@@ -238,4 +293,67 @@ pub fn is_simple_code(code: u32) -> bool {
     !UNSAFE_RANGES
         .iter()
         .any(|(lo, hi)| code >= *lo && code <= *hi)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A line of text, one character per point.
+    fn line(text: &str, line: usize) -> Vec<TextChar> {
+        text.chars()
+            .enumerate()
+            .map(|(i, text)| TextChar {
+                text,
+                x: i as f32,
+                y: 0.0,
+                line,
+            })
+            .collect()
+    }
+
+    /// Consecutive characters of one line are what one word drawn in two runs
+    /// looks like from here.
+    #[test]
+    fn consecutive_characters_of_one_line_join() {
+        let grid = CharGrid::new(&line("Incorporate", 1));
+        assert!(grid.joins((8.0, 0.0), (9.0, 0.0)));
+        assert!(grid.joins((0.0, 0.0), (1.0, 0.0)));
+    }
+
+    /// A space between them is a word boundary, however little is drawn between
+    /// the two glyphs.
+    #[test]
+    fn a_space_between_characters_is_not_a_join() {
+        let grid = CharGrid::new(&line("Incorpora ted", 1));
+        assert!(!grid.joins((8.0, 0.0), (10.0, 0.0)));
+    }
+
+    /// So is the end of a line, and a point the text device has nothing to say
+    /// about: a join is only made where the page's text puts the characters
+    /// together.
+    #[test]
+    fn a_line_end_or_nothing_is_not_a_join() {
+        let grid = CharGrid::new(&[
+            TextChar { text: 'a', x: 0.0, y: 0.0, line: 1 },
+            TextChar { text: 'b', x: 1.0, y: 10.0, line: 2 },
+        ]);
+        assert!(!grid.joins((0.0, 0.0), (1.0, 10.0)));
+
+        let grid = CharGrid::new(&line("Incorpora", 1));
+        assert!(!grid.joins((8.0, 0.0), (40.0, 0.0)));
+        // Out of reading order: the second point is behind the first.
+        assert!(!grid.joins((4.0, 0.0), (2.0, 0.0)));
+    }
+
+    /// Two characters read at one point are ambiguous, and a join needs an
+    /// answer rather than a guess.
+    #[test]
+    fn an_ambiguous_point_is_not_a_join() {
+        let grid = CharGrid::new(&[
+            TextChar { text: 'a', x: 0.0, y: 0.0, line: 1 },
+            TextChar { text: 'b', x: 0.0, y: 0.0, line: 1 },
+        ]);
+        assert!(!grid.joins((0.0, 0.0), (1.0, 0.0)));
+    }
 }
