@@ -89,13 +89,37 @@ Read PDFs in the browser as SVG pages with real, selectable text.
 
 **Permission justification**
 
-| Permission | Why it is needed |
-| --- | --- |
-| `storage` | Keeps one random handover token and the address and title of the last PDF, locally, so the toolbar button can reopen that document and a redirect still works after the service worker is stopped. Nothing in it leaves the browser. |
-| `declarativeNetRequestWithHostAccess` | Installs one dynamic rule: a URL whose path ends in `.pdf` is redirected to the extension's viewer page before the document is requested. |
-| `webRequest` | Reads response headers only, so a PDF served from a URL without a `.pdf` ending (for example `arxiv.org/pdf/1706.03762v7`) is recognised by its content type and opened in the viewer. |
-| `webNavigation` | Notices a tab that has committed to a PDF (a local file, or a URL the redirect rule could not take) and hands that tab to the viewer. |
-| Host permission `<all_urls>` | PDFs can be hosted anywhere. When the reader opens one, the extension page fetches that one document from the site they chose, so the viewer can draw it; there is no proxy and nothing is sent anywhere else. The extension does not read pages that are not PDFs. |
+Paste each block into its own field. Each one is written to stand alone.
+
+`storage`
+
+```
+Saves two small values in chrome.storage.local, both local and never transmitted: (1) a random handover token made at install, so a tab redirected to the viewer can prove which document it was opened for, and (2) the URL and title of the last PDF opened, so the toolbar button can reopen it. No history, no settings, and no document content.
+```
+
+`declarativeNetRequestWithHostAccess`
+
+```
+Adds exactly one dynamic rule and no static rules: a main-frame navigation whose URL path ends in .pdf (http, https or file) is redirected to the extension's own viewer page. This is how a PDF replaces Chrome's built-in viewer before the document is downloaded. The rule is replaced on every start, and it never blocks or modifies a request.
+```
+
+`webRequest`
+
+```
+Observes response headers for main-frame navigations only, to recognise a PDF served from a URL that does not end in .pdf (for example arxiv.org/pdf/1706.03762v7) by its Content-Type: application/pdf. It does not read request bodies, does not modify headers, does not inspect subresources, and leaves responses sent as attachments alone.
+```
+
+`webNavigation`
+
+```
+Observes top-frame commits only (frameId 0), and only to take over a navigation that has already committed as a PDF but was not caught by the redirect rule: a local file:// PDF, or a navigation where Chrome refused the dynamic rule. The tab is then handed to the viewer.
+```
+
+Host permission `<all_urls>`
+
+```
+PDFs can be published on any domain, so the extension must be able to fetch the one document the reader opened from its own origin. A web page cannot do this: PDF servers generally do not send Access-Control-Allow-Origin. The bytes are fetched by the extension page for display only; nothing is proxied, stored remotely, or sent anywhere else. There are no content scripts, so the extension does not read or modify pages that are not PDFs. Access to file:// PDFs stays off unless the reader enables "Allow access to file URLs".
+```
 
 **Remote code**
 
@@ -106,6 +130,50 @@ reading surface is the project's public web page,
 https://zzysonny.github.io/webPDF/, displayed in an iframe — the same page
 anyone can open in a tab, with no extension APIs.
 ```
+
+**Reviewer notes**
+
+If the form offers a notes field, this is the short version of the argument:
+
+```
+webPDF requests a strict subset of the permissions the Store's PDF.js viewer (PDF Viewer, oemmndcbldboiebfnladdacbdfmadadm, 4.6.129) declares for the same job. It does not request tabs, alarms, or content scripts on any page, and its extension-page CSP does not enable wasm-unsafe-eval. All five permissions it does share are used only to recognise a PDF navigation, take the tab over, and fetch that one document for display.
+```
+
+### Compared with the PDF.js viewer
+
+The Store's [PDF Viewer](https://chromewebstore.google.com/detail/pdf-viewer/oemmndcbldboiebfnladdacbdfmadadm)
+(Rob Wu, v4.6.129) is the closest well-known equivalent: it also replaces Chrome's
+viewer with an HTML5/PDF.js one. Its published manifest declares:
+
+```
+permissions: alarms, declarativeNetRequestWithHostAccess, webRequest, tabs,
+             webNavigation, storage
+host_permissions: <all_urls>
+content_scripts: http://*/*, https://*/*, file://*/*, all_frames, document_start
+CSP: script-src 'self' 'wasm-unsafe-eval'
+```
+
+webPDF declares only the shared core, with no content scripts at all:
+
+| | PDF Viewer 4.6.129 | webPDF 0.1.0 |
+| --- | --- | --- |
+| `<all_urls>` host permission | yes | yes |
+| `declarativeNetRequestWithHostAccess` | yes | yes |
+| `webRequest` | yes | yes |
+| `webNavigation` | yes | yes |
+| `storage` | yes | yes |
+| `tabs` | yes | **no** |
+| `alarms` | yes | **no** |
+| Content script in every page, all frames | yes | **none** |
+| `wasm-unsafe-eval` in the extension page CSP | yes | **no** |
+
+Every permission webPDF asks for is one that viewer asks for as well; the reverse
+is not true. The four API permissions plus `<all_urls>` are standard for the job of
+intercepting a PDF navigation: `declarativeNetRequestWithHostAccess` rewrites a `.pdf` URL before it
+is fetched, `webRequest` catches a PDF whose URL has no extension, `webNavigation`
+is the fallback for a navigation that already committed, and `<all_urls>` is what
+lets the extension page fetch the document across origins. `storage` keeps only
+the token and the last document.
 
 **Data usage**
 
